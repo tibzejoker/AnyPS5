@@ -180,6 +180,7 @@ private:
         append(key, value.orderedPixelShader);
         append(key, value.alphaToCoverage);
         append(key, value.stencilRefExportEnable);
+        append(key, value.quadPixelMask);
         append(key, value.targetOutputMode);
     }
 
