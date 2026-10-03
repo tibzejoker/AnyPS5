@@ -177,6 +177,7 @@ struct ShaderPixelInputInfo {
     ConservativeZExport psConservativeZExport = ConservativeZExport::AnyZ;
     bool psOrderedPixelShader = false;
     bool psAlphaToCoverage = false;
+    std::uint8_t quadPixelMask = 0xf;
     ShaderStageRuntime stage;
 
     bool HasPositionInput() const {

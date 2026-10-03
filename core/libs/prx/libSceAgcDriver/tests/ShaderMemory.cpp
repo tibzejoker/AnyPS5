@@ -1506,6 +1506,22 @@ void verifyMeshConfiguration() {
         RecompileCacheKey::Build(vertex, unclipped);
         require(clipped != unclipped, "PA_CL_VS_OUT_CNTL is not part of the recompile cache key");
     }
+    {
+        RecompileRequest fragment{};
+        fragment.shader = {ShaderStage::Fragment, 0x10000u, code, 0, {}};
+        fragment.context.waveSize = 64;
+        ShaderPixelStageInfo info{};
+        info.quadPixelMask = 0x2u;
+        fragment.context.pixel = info;
+        const auto back = RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(fragment));
+        require(back.request.context.pixel.has_value() && back.request.context.pixel->quadPixelMask == 0x2u, "the quad pixel mask was lost in serialization");
+        std::vector<std::uint64_t> masked;
+        RecompileCacheKey::Build(fragment, masked);
+        fragment.context.pixel->quadPixelMask = 0xfu;
+        std::vector<std::uint64_t> full;
+        RecompileCacheKey::Build(fragment, full);
+        require(masked != full, "the quad pixel mask is not part of the recompile cache key");
+    }
     std::vector<std::uint64_t> key;
     RecompileCacheKey::Build(request, key);
     const auto first = key;
@@ -1683,12 +1699,12 @@ void verifyPixelRequestSerialization() {
     minimal.context.waveSize = 64;
     minimal.context.pixel = ShaderPixelStageInfo{};
     const auto encoded = serializer.Serialize(minimal);
-    require(requestPrefix(encoded, 8u) == "NVNQQRQAAAA=", "new requests did not use serialization version 20");
+    require(requestPrefix(encoded, 8u) == "NVNQQRUAAAA=", "new requests did not use serialization version 21");
     constexpr std::size_t mappingOffset = 8u + 37u + 18u + 163u;
     for (std::size_t bytes = 0; bytes < 19u; ++bytes) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source, alpha-to-coverage or stencil reference export flag was accepted");
     }
-    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRUAAAA="}) {
+    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRYAAAA="}) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(unsupported)); }, "serialization version", "an unsupported request version was accepted");
     }
 }
