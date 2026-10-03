@@ -140,6 +140,7 @@ struct ShaderPixelStageInfo {
     std::array<std::uint8_t, 8> targetExportMapping;
     std::array<ColorExportPacking, 8> targetExportPacking;
     bool dualSourceBlend;
+    std::uint8_t quadPixelMask = 0xf;
 };
 
 struct ShaderVertexBufferResource {
