@@ -13,7 +13,15 @@ enum class TessellationAttribute {
     ControlOutput,
     EvaluationInput,
     PatchOutput,
-    Factor
+    Factor,
+    PatchInput
+};
+
+enum class TessellationBaseKind {
+    OffChip,
+    Factor,
+    RelativeIndex,
+    PassthroughPrimitive
 };
 
 enum class StageInputKind {
