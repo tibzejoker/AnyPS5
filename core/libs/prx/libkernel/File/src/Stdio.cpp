@@ -585,6 +585,13 @@ int64_t APS5_VABI sceKernelPread(int d, void* buf, size_t nbytes, int64_t offset
     if (File::ReadRandomDevice(d, buf, nbytes)) return static_cast<int64_t>(nbytes);
     char empty = 0;
     const auto result = NativePread(d, nbytes == 0 && buf == nullptr ? &empty : buf, nbytes, offset);
+    static const bool trace = std::getenv("GTAV_TRACE_PREAD") != nullptr;
+    if (trace && result > 0) {
+        std::uint64_t hash = 1469598103934665603ull;
+        for (std::int64_t i = 0; i < result; ++i) hash = (hash ^ static_cast<const unsigned char*>(buf)[i]) * 1099511628211ull;
+        const auto path = NativeDescriptorPath(d);
+        std::fprintf(stderr, "[pread] tid=%lu fd=%d buf=%p off=0x%llx n=0x%llx got=0x%llx hash=%016llx %s\n", static_cast<unsigned long>(::GetCurrentThreadId()), d, buf,static_cast<unsigned long long>(offset), static_cast<unsigned long long>(nbytes), static_cast<unsigned long long>(result), static_cast<unsigned long long>(hash), path ? path->string().c_str() : "?");
+    }
     return result < 0 ? SceErrorFromErrno(errno) : result;
 }
 

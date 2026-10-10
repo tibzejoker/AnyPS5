@@ -285,6 +285,22 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
             Report("  [%s] %016llx %016llx %016llx %016llx %016llx %016llx %016llx %016llx\n", name, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
         }
     }
+    // LOCAL GTAV HACK (never upstream): GTAV_DUMP_ON_FATAL=1 writes the memory around each register.
+    if (std::getenv("GTAV_DUMP_ON_FATAL") != nullptr) {
+        const std::pair<const char*, std::uint64_t> windows[] = {{"rsp", context->Rsp}, {"rax", context->Rax}, {"rcx", context->Rcx}, {"rdx", context->Rdx}, {"r8", context->R8}, {"r9", context->R9}, {"r10", context->R10}, {"r11", context->R11}, {"rbx", context->Rbx}, {"rsi", context->Rsi}, {"rdi", context->Rdi}, {"rbp", context->Rbp}, {"r12", context->R12}, {"r13", context->R13}, {"r14", context->R14}, {"r15", context->R15}};
+        for (const auto& [name, value] : windows) {
+            if (value < 0x100000) continue;
+            const std::uint64_t first = (value - 0x20000) & ~0xfffull;
+            const std::uint64_t last = (value + 0x90000) & ~0xfffull;
+            char path[96];
+            std::snprintf(path, sizeof(path), "fatal_%s_%llx.bin", name, static_cast<unsigned long long>(first));
+            if (std::FILE* file = std::fopen(path, "wb")) {
+                static const std::uint8_t zero[0x1000] = {};
+                for (std::uint64_t page = first; page < last; page += 0x1000) std::fwrite(IsReadable(page) && IsReadable(page + 0xff8) ? reinterpret_cast<const void*>(page) : zero, 1, 0x1000, file);
+                std::fclose(file);
+            }
+        }
+    }
     Report("  frame pointer chain:\n");
     std::uint64_t frame = context->Rbp;
     for (int depth = 0; depth < 32 && frame != 0 && (frame & 7) == 0 && IsReadable(frame) && IsReadable(frame + 8); ++depth) {
