@@ -223,6 +223,9 @@ function(add_shader_recompiler target runtimeTarget)
             DebugProbeActive
             DepthBitsTextureWidth
             HashBytes
+            ImageTableAbi::PoisonCode
+            ImageTableAbi::PoisonReasonName
+            ImageTableAbi::TableHeader
             PixelInput
             PixelInputBit
             RayTracingStrict
@@ -242,6 +245,7 @@ function(add_shader_recompiler target runtimeTarget)
             ResourceMaterializer::SpecializationNanoseconds
             RuntimeAbi::RequireVersion
             RuntimeAbi::HeapCapacity
+            SampledTextureNumericClass
             SetDebugProbeActive
             ShaderCacheDirectory
             SrgbDecodeBit
