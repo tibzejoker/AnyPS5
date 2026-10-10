@@ -1,4 +1,9 @@
 #include "prx/libkernel/File/include/FileFlags.hpp"
+#ifdef _WIN32
+#include <windows.h>
+#include <io.h>
+#endif
+#include <cstdio>
 #include "prx/libkernel/File/include/NativeStat.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -159,10 +164,21 @@ std::int64_t APS5_VABI sceKernelRead(int d, void* buf, std::size_t nbytes) {
     const GuestArena::HostWrite destination(buf, nbytes);
     if (!destination.Open()) errno = EFAULT;
     else if (File::ReadRandomDevice(d, buf, nbytes)) return static_cast<std::int64_t>(nbytes);
+    static const bool trace = std::getenv("GTAV_TRACE_PREAD") != nullptr;
+    const auto before = trace ? NativeLseek(d, 0, SEEK_CUR) : 0;
     auto n = destination.Open() ? NativeRead(d, buf, nbytes) : -1;
     if (n < 0) {
         throw std::runtime_error(std::string(__func__) + ": read failed, fd=" + std::to_string(d) + ", errno=" + std::to_string(errno));
     }
+#ifdef _WIN32
+    if (trace && n > 0) {
+        std::uint64_t hash = 1469598103934665603ull;
+        for (std::int64_t i = 0; i < static_cast<std::int64_t>(n); ++i) hash = (hash ^ static_cast<const unsigned char*>(buf)[i]) * 1099511628211ull;
+        wchar_t path[1024] = {};
+        const auto length = ::GetFinalPathNameByHandleW(reinterpret_cast<HANDLE>(::_get_osfhandle(d)), path, 1023, 0);
+        std::fprintf(stderr, "[read] tid=%lu fd=%d off=0x%llx n=0x%llx got=0x%llx hash=%016llx %ls\n", static_cast<unsigned long>(::GetCurrentThreadId()), d, static_cast<unsigned long long>(before), static_cast<unsigned long long>(nbytes), static_cast<unsigned long long>(n), static_cast<unsigned long long>(hash), length ? path : L"?");
+    }
+#endif
     return static_cast<std::int64_t>(n);
 }
 
