@@ -508,6 +508,8 @@ ShaderStages DecodeShaderStages(const QueueState& queue) {
         const auto maxLevel = readFloat(queue.context, 0x286);
         Require(readFloat(queue.context, 0x287) <= 1.0f && maxLevel >= 1.0f, "a minimum tessellation level above 1 or a maximum below 1 is unsupported");
         tess.maxLevel = std::min(maxLevel, 63.0f);
+        tess.patchesPerGroup = config & 0xffu;
+        validate(tess.patchesPerGroup != 0, "VGT_LS_HS_CONFIG has no patches in a hull group");
         result.tessellation = tess;
     } else {
         validate((value & ~0x0047ec30u) == 0, "unsupported geometry routing, fast launch or wave-ID state");

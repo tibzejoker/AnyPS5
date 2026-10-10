@@ -271,6 +271,7 @@ struct TessellationConfiguration {
     std::uint32_t partitioning;
     std::uint32_t outputTopology;
     float maxLevel = 63.0f;
+    std::uint32_t patchesPerGroup = 0;
 };
 
 inline constexpr std::uint32_t MeshDrawPushOffsetBytes = 104;

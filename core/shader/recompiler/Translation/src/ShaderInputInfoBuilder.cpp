@@ -184,6 +184,7 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
             target.partitioning = tessellation->partitioning;
             target.outputTopology = tessellation->outputTopology;
             target.maxLevel = tessellation->maxLevel;
+            target.patchesPerGroup = tessellation->patchesPerGroup;
         }
         if (stage == ShaderStageKind::Mesh) {
             if (mesh == nullptr) throw std::runtime_error("ShaderInputInfoBuilder: a mesh-stage program has no mesh configuration");
