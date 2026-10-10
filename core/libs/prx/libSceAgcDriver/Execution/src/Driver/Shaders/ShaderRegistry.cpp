@@ -403,7 +403,7 @@ std::optional<ShaderRecompiler::ShaderFloatMode> RegisteredFloatMode(const Shade
     case 0: rsrc1 = 0x212; fp16OverflowBit = 26; break;
     case 1: rsrc1 = 0x00a; fp16OverflowBit = 29; break;
     case 2: case 4: case 6: rsrc1 = 0x08a; fp16OverflowBit = 31; break;
-    case 5: case 7: rsrc1 = 0x10a; fp16OverflowBit = 30; break;
+    case 3: case 5: case 7: rsrc1 = 0x10a; fp16OverflowBit = 30; break;
     default: return std::nullopt;
     }
     const auto found = snapshot.registeredState->shader.find(rsrc1);
@@ -508,7 +508,7 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     case 4: stage = Stage::Mesh; programRegister = 0x0c8; resourceRegister = 0x08b; break;
     case 5: return {};
     case 6: stage = Stage::Mesh; programRegister = 0x088; resourceRegister = 0x08b; break;
-    case 7: stage = Stage::TessellationControl; programRegister = 0x108; resourceRegister = 0x10b; break;
+    case 3: case 7: stage = Stage::TessellationControl; programRegister = 0x108; resourceRegister = 0x10b; break;
     default:
         if (registration) {
             APS5_LOG_ERR("Shader 0x%llx has unsupported registered shader type %u; it is not prepared at registration", static_cast<unsigned long long>(snapshot.codeAddress), static_cast<unsigned>(snapshot.type));
@@ -581,7 +581,7 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
         if (firstUser == 0) userCount += 8;
     }
     plan->userData.resize(userCount);
-    if (stage != Stage::Compute && stage != Stage::Fragment && snapshot.type != 6) vertex = Graphics::DecodeVertexStageInfo(snapshot.header, snapshot.headerAddress, plan->userData, nullptr, true);
+    if (stage != Stage::Compute && stage != Stage::Fragment && snapshot.type != 6) vertex =Graphics::DecodeVertexStageInfo(snapshot.header, snapshot.headerAddress, plan->userData, nullptr, true);
     plan->swappc = {vertex.has_value(), firstUser, userCount};
     if (deferred != nullptr) {
         if (const auto counter = ShaderRecompiler::UnresolvableSwappcTarget(plan->decoded, &plan->swappc)) {
@@ -783,7 +783,7 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
         bool replaced;
         {
             std::lock_guard lock(mutex);
-            replaced = shaders != nullptr && shaders->contains(address) && !SameHeader(*shaders->at(address), shader);
+            replaced = shaders != nullptr && shaders->contains(address) && !SameHeader(*shaders->at(address), shader) && !(shader->type == 3 && shaders->at(address)->type == 7);
         }
         if (replaced) RegisterShader(shader);
     }
@@ -799,6 +799,13 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
             require(registry != nullptr && registry->contains(address), "graphics ABI refers to an unregistered shader");
             if (owner == nullptr) owner = registry->at(address);
             const auto& snapshot = *registry->at(address);
+            if (shader->type == 3 && snapshot.type == 7 && !SameHeader(snapshot, shader)) {
+                ShaderSnapshot bundle{address, reinterpret_cast<std::uintptr_t>(shader), 3, {}, {}};
+                bundle.header.resize(shader->header_size);
+                std::memcpy(bundle.header.data(), static_cast<const void*>(shader), shader->header_size);
+                MergeRegisteredStage(state, DecodeRegisteredState(bundle), shader == stages.front());
+                continue;
+            }
             RequireSameHeader(snapshot, shader, "graphics");
             require(snapshot.registeredState != nullptr, "registered shader state is missing");
             MergeRegisteredStage(state, *snapshot.registeredState, shader == stages.front());

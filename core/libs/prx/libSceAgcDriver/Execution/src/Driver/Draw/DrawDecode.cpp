@@ -34,7 +34,7 @@ void DecodeGraphicsPrograms(DrawDecode& decoded, const QueueState& queue, const 
         const auto& snapshot = *it->second;
         require(address - snapshot.codeAddress < snapshot.code.size() * sizeof(std::uint32_t), "graphics program is outside registered shader code");
         require((address - snapshot.codeAddress) % sizeof(std::uint32_t) == 0, "graphics entry point is not dword aligned");
-        require(snapshot.type == type, "graphics program refers to an incompatible shader binary type");
+        require(snapshot.type == type || (type == 7 && snapshot.type == 3), "graphics program refers to an incompatible shader binary type");
         if (!nullPixel) Graphics::NoteRegisterRead(Graphics::RegisterBank::Shader, rsrc2);
         const auto resources = nullPixel ? 0u : ReadGraphicsRegister(queue.shader, rsrc2);
         const auto userCount = ((resources >> 1u) & 0x1fu) | (((resources >> 27u) & 1u) << 5u);
