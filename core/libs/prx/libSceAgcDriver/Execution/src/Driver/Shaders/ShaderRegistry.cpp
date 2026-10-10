@@ -207,6 +207,67 @@ bool SameHeader(const ShaderSnapshot& snapshot, const Shader* shader) {
     return std::memcmp(&used, &registered, offsetof(Shader, num_sh_registers) + sizeof(Shader::num_sh_registers)) == 0;
 }
 
+namespace {
+
+constexpr std::size_t ComparedHeaderBytes = offsetof(Shader, num_sh_registers) + sizeof(Shader::num_sh_registers);
+
+struct HeaderField {
+    const char* name;
+    std::size_t offset;
+    std::size_t size;
+};
+
+constexpr HeaderField HeaderFields[] = {
+    {"file_header", offsetof(Shader, file_header), sizeof(Shader::file_header)},
+    {"version", offsetof(Shader, version), sizeof(Shader::version)},
+    {"code", offsetof(Shader, code), sizeof(Shader::code)},
+    {"cx_registers", offsetof(Shader, cx_registers), sizeof(Shader::cx_registers)},
+    {"sh_registers", offsetof(Shader, sh_registers), sizeof(Shader::sh_registers)},
+    {"specials", offsetof(Shader, specials), sizeof(Shader::specials)},
+    {"input_semantics", offsetof(Shader, input_semantics), sizeof(Shader::input_semantics)},
+    {"output_semantics", offsetof(Shader, output_semantics), sizeof(Shader::output_semantics)},
+    {"header_size", offsetof(Shader, header_size), sizeof(Shader::header_size)},
+    {"shader_size", offsetof(Shader, shader_size), sizeof(Shader::shader_size)},
+    {"embedded_constant_buffer_size_dqw", offsetof(Shader, embedded_constant_buffer_size_dqw), sizeof(Shader::embedded_constant_buffer_size_dqw)},
+    {"target", offsetof(Shader, target), sizeof(Shader::target)},
+    {"num_input_semantics", offsetof(Shader, num_input_semantics), sizeof(Shader::num_input_semantics)},
+    {"scratch_size_dw_per_thread", offsetof(Shader, scratch_size_dw_per_thread), sizeof(Shader::scratch_size_dw_per_thread)},
+    {"num_output_semantics", offsetof(Shader, num_output_semantics), sizeof(Shader::num_output_semantics)},
+    {"special_sizes_bytes", offsetof(Shader, special_sizes_bytes), sizeof(Shader::special_sizes_bytes)},
+    {"type", offsetof(Shader, type), sizeof(Shader::type)},
+    {"num_cx_registers", offsetof(Shader, num_cx_registers), sizeof(Shader::num_cx_registers)},
+    {"num_sh_registers", offsetof(Shader, num_sh_registers), sizeof(Shader::num_sh_registers)},
+};
+
+std::string DescribeHeaderMismatch(const ShaderSnapshot& snapshot, const Shader* shader) {
+    if (snapshot.headerAddress == reinterpret_cast<std::uintptr_t>(shader)) return {};
+    if (snapshot.header.size() < sizeof(Shader)) return "the registered snapshot is shorter than a shader header";
+    Shader used;
+    Shader registered;
+    std::memcpy(&used, static_cast<const void*>(shader), sizeof(Shader));
+    std::memcpy(&registered, snapshot.header.data(), sizeof(Shader));
+    const auto* usedBytes = reinterpret_cast<const std::byte*>(&used);
+    const auto* registeredBytes = reinterpret_cast<const std::byte*>(&registered);
+    std::string changed;
+    for (const auto& field : HeaderFields) {
+        if (field.offset + field.size > ComparedHeaderBytes) continue;
+        if (std::memcmp(usedBytes + field.offset, registeredBytes + field.offset, field.size) == 0) continue;
+        if (!changed.empty()) changed += ", ";
+        changed += field.name;
+    }
+    if (changed.empty()) return "bytes outside the named fields differ";
+    return "changed: " + changed;
+}
+
+void RequireSameHeader(const ShaderSnapshot& snapshot, const Shader* shader, const char* operation) {
+    if (SameHeader(snapshot, shader)) return;
+    char reason[320];
+    std::snprintf(reason, sizeof(reason), "%s ABI refers to a replaced shader header (%s)", operation, DescribeHeaderMismatch(snapshot, shader).c_str());
+    require(false, reason);
+}
+
+}
+
 void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const std::shared_ptr<const ShaderSnapshot>& snapshot) {
     ShaderPreparationTransaction transaction;
     if (registry != nullptr) {
@@ -695,7 +756,7 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
             require(registry != nullptr && registry->contains(address), "graphics ABI refers to an unregistered shader");
             if (owner == nullptr) owner = registry->at(address);
             const auto& snapshot = *registry->at(address);
-            require(SameHeader(snapshot, shader), "graphics ABI refers to a replaced shader header");
+            RequireSameHeader(snapshot, shader, "graphics");
             require(snapshot.registeredState != nullptr, "registered shader state is missing");
             MergeRegisteredStage(state, *snapshot.registeredState, shader == stages.front());
         }
@@ -757,7 +818,7 @@ void Driver::ResolveShaderAbi(const Shader* shader, std::span<const ShaderRegist
         const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(shader->code));
         require(shaders != nullptr && shaders->contains(address), "static ABI refers to an unregistered shader");
         snapshot = shaders->at(address);
-        require(SameHeader(*snapshot, shader), "static ABI refers to a replaced shader header");
+        RequireSameHeader(*snapshot, shader, "static");
     }
     require(snapshot->registeredState != nullptr, "registered shader state is missing");
     QueueState state{};
@@ -819,7 +880,7 @@ void Driver::ResolveGraphicsAbi(const Shader* vertex, const Shader* pixel, std::
             const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(shader->code));
             require(shaders != nullptr && shaders->contains(address), "rectangle ABI refers to an unregistered shader");
             const auto snapshot = shaders->at(address);
-            require(SameHeader(*snapshot, shader), "rectangle ABI refers to a replaced shader header");
+            RequireSameHeader(*snapshot, shader, "rectangle");
             return snapshot;
         };
         front = lookup(vertex);
