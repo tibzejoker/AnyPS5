@@ -365,6 +365,8 @@ public:
                     for (const auto alias : view.page->aliases) {
                         auto& other = views.at(alias);
                         if (!writable(other.protection) || other.armed || other.hostWrites != 0) continue;
+                        static const bool noSharedArm = std::getenv("GTAV_NO_SHARED_ARM") != nullptr;
+                        if (noSharedArm) continue;
                         DWORD previous;
                         const DWORD protection = other.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
                         if (!VirtualProtect(reinterpret_cast<void*>(alias), pageBytes, protection, &previous)) fail("arm shared memory write tracking");
