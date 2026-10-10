@@ -2656,7 +2656,11 @@ std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words
     Require(words.size() == 4, "buffer descriptor must contain four DWORDs");
     Require((words[1] & 0x40000000u) == 0, "buffer descriptor has reserved bits set");
     const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
-    Require(descriptor.Type() == 0u, "buffer descriptor uses an unsupported type");
+    if (descriptor.Type() != 0u) {
+        char text[160];
+        std::snprintf(text, sizeof(text), "buffer descriptor uses an unsupported type: %08x %08x %08x %08x", words[0], words[1], words[2], words[3]);
+        Require(false, text);
+    }
     const auto address = descriptor.Base48();
     const auto byteSize = descriptor.GetSize();
     if (byteSize == 0 || address == 0) {

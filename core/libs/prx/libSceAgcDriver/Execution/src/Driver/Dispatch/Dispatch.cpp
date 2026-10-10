@@ -7,6 +7,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <cstring>
+#include <thread>
+#include <chrono>
+#include <cstdio>
 #include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
@@ -268,6 +272,31 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (profile && elapsed > 200) std::fprintf(stderr, "[gpu] compute shader 0x%llx recompile took %.0f ms (%zu SPIR-V words, %zu captured regions, total %.1f s)\n", static_cast<unsigned long long>(address), elapsed, compiledResult->spirv.size(), captured.size(), totalMs / 1000);
         } catch (const std::exception& error) {
             const auto dump = dumpShaders ? dumpRequest(address, request) : std::string{};
+            if (std::getenv("GTAV_DESC_PROBE") != nullptr && request.context.userData.size() >= 6) {
+                const auto& user = request.context.userData;
+                const std::uint64_t table = user[0] | (static_cast<std::uint64_t>(user[1] & 0xffffu) << 32u);
+                const std::uint64_t pointer = user[4] | (static_cast<std::uint64_t>(user[5]) << 32u);
+                const auto hex = [](const char* label, std::uint64_t at, std::size_t bytes) {
+                    std::fprintf(stderr, "[gtav-probe] %s 0x%llx:", label, static_cast<unsigned long long>(at));
+                    for (std::size_t i = 0; i < bytes; i += 4) {
+                        std::uint32_t word = 0;
+                        std::memcpy(&word, reinterpret_cast<const void*>(at + i), 4);
+                        std::fprintf(stderr, "%s%08x", i % 32 == 0 ? "\n   " : " ", word);
+                    }
+                    std::fprintf(stderr, "\n");
+                };
+                std::fprintf(stderr, "[gtav-probe] compute 0x%llx queue %u user", static_cast<unsigned long long>(address), static_cast<unsigned>(submission.queue));
+                for (const auto word : user) std::fprintf(stderr, " %08x", word);
+                std::fprintf(stderr, "\n");
+                for (int round = 0; round < 3; ++round) {
+                    char label[32];
+                    std::snprintf(label, sizeof(label), "t+%dms table", round * 100);
+                    hex(label, table, 0x80);
+                    std::snprintf(label, sizeof(label), "t+%dms ptr", round * 100);
+                    hex(label, pointer, 0x40);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+            }
 
             std::string reason = error.what();
             if (const auto newline = reason.find('\n'); newline != std::string::npos) reason.resize(newline);
