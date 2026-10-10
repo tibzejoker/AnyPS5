@@ -535,6 +535,26 @@ void testRegisteredFloatMode() {
     }
 }
 
+void testRegisteredStageMerge() {
+    using AgcDriver::DriverDetail::MergeRegisteredStage;
+    using AgcDriver::DriverDetail::RegisteredShaderState;
+    const auto stage = [](AgcDriver::Registers header, AgcDriver::Registers userConfig) {
+        RegisteredShaderState state{{}, AgcDriver::InitialContextRegisters(), {{0x24a, 0}, {0x24b, 0}}, header, userConfig};
+        for (const auto& [offset, value] : header) state.context.insert_or_assign(offset, value);
+        for (const auto& [offset, value] : userConfig) state.userConfig.insert_or_assign(offset, value);
+        return state;
+    };
+    const auto hull = stage({{0x2d6, 0xc338}, {0x2db, 0x40049}}, {{0x24a, 7}});
+    const auto domain = stage({{0x2db, 0x49}}, {});
+    AgcDriver::QueueState state{};
+    MergeRegisteredStage(state, hull, true);
+    MergeRegisteredStage(state, domain, false);
+    check(state.context.at(0x2d6) == 0xc338, "a later stage's default VGT_LS_HS_CONFIG replaced the hull shader's");
+    check(state.userConfig.at(0x24a) == 7, "a later stage's default user config replaced an earlier stage's");
+    check(state.context.at(0x2db) == 0x49, "a later stage's own register did not replace an earlier stage's");
+    check(state.context.at(0x2dc) == 0xaa00, "the first stage did not bring the initial context");
+}
+
 void testWorkerFailure() {
     std::array<std::uint32_t, 5> words{0xc0031500, 1, 1, 1, 0x41};
     Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
@@ -644,6 +664,7 @@ int main() {
         testShaderHeaderAlignment();
         testHeaderWithoutProgramAddress();
         testRegisteredFloatMode();
+        testRegisteredStageMerge();
         testWorkerFailure();
         check(expectFailure([] { LibcRunShutdown_nid_postfix(); }).find("required shader register") != std::string::npos, "shutdown lost worker failure");
         std::puts("AGC driver submit tests passed");
