@@ -356,22 +356,34 @@ Shader ReadHeader(const ShaderSnapshot& snapshot) {
 
 RegisteredShaderState DecodeRegisteredState(const ShaderSnapshot& snapshot) {
     const auto header = ReadHeader(snapshot);
-    RegisteredShaderState state{{}, InitialContextRegisters(), {{0x24a, 0}, {0x24b, 0}}};
+    RegisteredShaderState state{{}, InitialContextRegisters(), {{0x24a, 0}, {0x24b, 0}}, {}, {}};
     for (const auto reg : ReadHeaderArray(snapshot, header.sh_registers, header.num_sh_registers)) {
         state.shader.insert_or_assign(reg.offset, reg.value);
     }
     for (const auto reg : ReadHeaderArray(snapshot, header.cx_registers, header.num_cx_registers)) {
-        state.context.insert_or_assign(reg.offset, reg.value);
+        state.headerContext.insert_or_assign(reg.offset, reg.value);
     }
     if (header.specials != nullptr) {
         const auto special = ReadHeaderArray(snapshot, header.specials, 1).front();
-        state.context[special.vgt_shader_stages_en.offset] = special.vgt_shader_stages_en.value;
-        if (special.vgt_gs_out_prim_type.offset != 0) state.context[special.vgt_gs_out_prim_type.offset] = special.vgt_gs_out_prim_type.value;
-        state.userConfig[special.ge_cntl.offset] = special.ge_cntl.value;
-        state.userConfig[special.ge_user_vgpr_en.offset] = special.ge_user_vgpr_en.value;
+        state.headerContext[special.vgt_shader_stages_en.offset] = special.vgt_shader_stages_en.value;
+        if (special.vgt_gs_out_prim_type.offset != 0) state.headerContext[special.vgt_gs_out_prim_type.offset] = special.vgt_gs_out_prim_type.value;
+        state.headerUserConfig[special.ge_cntl.offset] = special.ge_cntl.value;
+        state.headerUserConfig[special.ge_user_vgpr_en.offset] = special.ge_user_vgpr_en.value;
     }
+    for (const auto& [offset, value] : state.headerContext) state.context.insert_or_assign(offset, value);
+    for (const auto& [offset, value] : state.headerUserConfig) state.userConfig.insert_or_assign(offset, value);
     return state;
 }
+
+}
+
+void MergeRegisteredStage(QueueState& state, const RegisteredShaderState& registered, bool first) {
+    for (const auto& [offset, value] : registered.shader) state.shader.insert_or_assign(offset, value);
+    for (const auto& [offset, value] : first ? registered.context : registered.headerContext) state.context.insert_or_assign(offset, value);
+    for (const auto& [offset, value] : first ? registered.userConfig : registered.headerUserConfig) state.userConfig.insert_or_assign(offset, value);
+}
+
+namespace {
 
 std::uint32_t RegisterValue(const Registers& registers, std::uint32_t offset) {
     const auto found = registers.find(offset);
@@ -685,10 +697,7 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
             const auto& snapshot = *registry->at(address);
             require(SameHeader(snapshot, shader), "graphics ABI refers to a replaced shader header");
             require(snapshot.registeredState != nullptr, "registered shader state is missing");
-            const auto& registered = *snapshot.registeredState;
-            for (const auto& [offset, value] : registered.shader) state.shader.insert_or_assign(offset, value);
-            for (const auto& [offset, value] : registered.context) state.context.insert_or_assign(offset, value);
-            for (const auto& [offset, value] : registered.userConfig) state.userConfig.insert_or_assign(offset, value);
+            MergeRegisteredStage(state, *snapshot.registeredState, shader == stages.front());
         }
     }
     for (const auto reg : context) state.context.insert_or_assign(reg.offset, reg.value);

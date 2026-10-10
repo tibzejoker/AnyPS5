@@ -69,6 +69,8 @@ struct RegisteredShaderState {
     Registers shader;
     Registers context;
     Registers userConfig;
+    Registers headerContext;
+    Registers headerUserConfig;
 };
 
 struct ShaderSnapshot {
@@ -89,6 +91,7 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnosti
 std::uint64_t NullPixelProgramAddress();
 ShaderSnapshot PrepareNullPixelProgram(const VulkanDevice& device);
 std::optional<ShaderRecompiler::ShaderFloatMode> RegisteredFloatMode(const ShaderSnapshot& snapshot);
+void MergeRegisteredStage(QueueState& state, const RegisteredShaderState& registered, bool first);
 void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const std::shared_ptr<const ShaderSnapshot>& snapshot);
 
 void ResolvePreparedGraphics(const ShaderSnapshot& front, const std::shared_ptr<const ShaderSnapshot>& fragment, std::uint32_t primitiveType, const ShaderRecompiler::SpirvTarget& target);
