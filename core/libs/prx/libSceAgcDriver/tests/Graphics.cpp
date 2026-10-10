@@ -462,10 +462,15 @@ void ShaderStageTests() {
         expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, reason);
     }
     queue.context[0x2db] = 0x40049;
-    for (const auto [maximum, minimum] : {std::pair{0x41100000u, 0x3f800000u}, std::pair{0x42800000u, 0x40000000u}}) {
+    queue.context[0x287] = 0x3f800000;
+    for (const auto [maximum, level] : {std::pair{0x41100000u, 9.0f}, std::pair{0x41700000u, 15.0f}, std::pair{0x42800000u, 63.0f}}) {
+        queue.context[0x286] = maximum;
+        Require(AgcDriver::Graphics::DecodeState(queue).stages.tessellation->maxLevel == level, "VGT_HOS_MAX_TESS_LEVEL is not the factor clamp");
+    }
+    for (const auto [maximum, minimum] : {std::pair{0x3f000000u, 0x3f800000u}, std::pair{0x42800000u, 0x40000000u}}) {
         queue.context[0x286] = maximum;
         queue.context[0x287] = minimum;
-        expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "tessellation level clamps");
+        expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "minimum tessellation level above 1 or a maximum below 1");
     }
     queue.context[0x286] = 0x42800000;
     queue.context[0x287] = 0x3f800000;
