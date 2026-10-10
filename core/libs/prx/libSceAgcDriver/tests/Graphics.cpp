@@ -21,6 +21,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
+#include "ImageTableAbi.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <array>
@@ -1977,6 +1978,7 @@ struct MockDescriptorWrite {
     std::uint32_t count;
     VkDescriptorType type;
     std::vector<VkDescriptorBufferInfo> buffers;
+    std::vector<VkDescriptorImageInfo> images;
 };
 
 struct MockVulkan {
@@ -1995,6 +1997,7 @@ struct MockVulkan {
     std::vector<VkDescriptorSetLayoutBinding> layoutBindings;
     VkDescriptorSetLayoutCreateFlags layoutFlags = 0;
     std::vector<VkDescriptorBindingFlags> layoutBindingFlags;
+    std::map<VkDescriptorSetLayout, std::uint32_t> variableLayoutCounts;
     std::vector<VkDescriptorPoolSize> poolSizes;
     std::uint32_t poolMaxSets = 0;
     VkDescriptorPoolCreateFlags poolFlags = 0;
@@ -2008,7 +2011,10 @@ struct MockVulkan {
     std::map<VkDescriptorPool, DescriptorPool> descriptorPools;
     std::uint32_t descriptorPoolLimit = 1000000;
     VkResult descriptorResetResult = VK_SUCCESS;
+    std::optional<std::uint32_t> variableDescriptorCount;
     std::vector<MockDescriptorWrite> writes;
+    std::map<VkSampler, VkSamplerCreateFlags> samplerFlags;
+    std::uint32_t samplerCreateCount = 0;
     std::vector<VkCopyDescriptorSet> copies;
     bool allowCopies = false;
     std::uint32_t boundSets = 0;
@@ -2098,11 +2104,15 @@ VKAPI_ATTR VkResult VKAPI_CALL mockCreateDescriptorSetLayout(VkDevice, const VkD
     const auto* bindingFlags = static_cast<const VkDescriptorSetLayoutBindingFlagsCreateInfo*>(info->pNext);
     if (bindingFlags != nullptr) mock.layoutBindingFlags.assign(bindingFlags->pBindingFlags, bindingFlags->pBindingFlags + bindingFlags->bindingCount);
     else mock.layoutBindingFlags.clear();
+    for (std::size_t index = 0; index < mock.layoutBindingFlags.size(); ++index) {
+        if ((mock.layoutBindingFlags[index] & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0) mock.variableLayoutCounts[*layout] = info->pBindings[index].descriptorCount;
+    }
     ++mock.live;
     return VK_SUCCESS;
 }
 
-VKAPI_ATTR void VKAPI_CALL mockDestroyDescriptorSetLayout(VkDevice, VkDescriptorSetLayout, const VkAllocationCallbacks*) {
+VKAPI_ATTR void VKAPI_CALL mockDestroyDescriptorSetLayout(VkDevice, VkDescriptorSetLayout layout, const VkAllocationCallbacks*) {
+    mock.variableLayoutCounts.erase(layout);
     --mock.live;
 }
 
@@ -2127,6 +2137,13 @@ VKAPI_ATTR VkResult VKAPI_CALL mockAllocateDescriptorSets(VkDevice, const VkDesc
     ++pool.attempts;
     if (pool.allocated == pool.maxSets) return VK_ERROR_OUT_OF_POOL_MEMORY;
     ++pool.allocated;
+    mock.variableDescriptorCount.reset();
+    if (info->pNext != nullptr) {
+        const auto* variable = static_cast<const VkDescriptorSetVariableDescriptorCountAllocateInfo*>(info->pNext);
+        Require(variable->sType == VK_STRUCTURE_TYPE_DESCRIPTOR_SET_VARIABLE_DESCRIPTOR_COUNT_ALLOCATE_INFO && variable->descriptorSetCount == 1, "variable descriptor allocation is malformed");
+        mock.variableDescriptorCount = variable->pDescriptorCounts[0];
+        Require(*mock.variableDescriptorCount <= mock.variableLayoutCounts.at(info->pSetLayouts[0]), "variable descriptor count exceeds its layout binding");
+    }
     sets[0] = makeHandle<VkDescriptorSet>();
     return VK_SUCCESS;
 }
@@ -2141,12 +2158,26 @@ VKAPI_ATTR VkResult VKAPI_CALL mockResetDescriptorPool(VkDevice, VkDescriptorPoo
     return VK_SUCCESS;
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL mockCreateSampler(VkDevice, const VkSamplerCreateInfo* info, const VkAllocationCallbacks*, VkSampler* sampler) {
+    *sampler = makeHandle<VkSampler>();
+    mock.samplerFlags[*sampler] = info->flags;
+    ++mock.samplerCreateCount;
+    ++mock.live;
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL mockDestroySampler(VkDevice, VkSampler sampler, const VkAllocationCallbacks*) {
+    mock.samplerFlags.erase(sampler);
+    --mock.live;
+}
+
 VKAPI_ATTR void VKAPI_CALL mockUpdateDescriptorSets(VkDevice, std::uint32_t count, const VkWriteDescriptorSet* writes, std::uint32_t copyCount, const VkCopyDescriptorSet* copies) {
     Require(copyCount == 0 || mock.allowCopies, "descriptor copies are not expected");
     if (copyCount != 0) mock.copies.insert(mock.copies.end(), copies, copies + copyCount);
     for (std::uint32_t i = 0; i < count; ++i) {
-        MockDescriptorWrite write{writes[i].dstBinding, writes[i].dstArrayElement, writes[i].descriptorCount, writes[i].descriptorType, {}};
-        write.buffers.assign(writes[i].pBufferInfo, writes[i].pBufferInfo + writes[i].descriptorCount);
+        MockDescriptorWrite write{writes[i].dstBinding, writes[i].dstArrayElement, writes[i].descriptorCount, writes[i].descriptorType, {}, {}};
+        if (writes[i].pBufferInfo != nullptr) write.buffers.assign(writes[i].pBufferInfo, writes[i].pBufferInfo + writes[i].descriptorCount);
+        if (writes[i].pImageInfo != nullptr) write.images.assign(writes[i].pImageInfo, writes[i].pImageInfo + writes[i].descriptorCount);
         mock.writes.push_back(write);
     }
 }
@@ -2284,6 +2315,8 @@ PFN_vkVoidFunction VKAPI_CALL mockProc(VkDevice, const char* name) {
         {"vkDestroyDescriptorPool", reinterpret_cast<PFN_vkVoidFunction>(mockDestroyDescriptorPool)},
         {"vkAllocateDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockAllocateDescriptorSets)},
         {"vkResetDescriptorPool", reinterpret_cast<PFN_vkVoidFunction>(mockResetDescriptorPool)},
+        {"vkCreateSampler", reinterpret_cast<PFN_vkVoidFunction>(mockCreateSampler)},
+        {"vkDestroySampler", reinterpret_cast<PFN_vkVoidFunction>(mockDestroySampler)},
         {"vkUpdateDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockUpdateDescriptorSets)},
         {"vkCmdBindDescriptorSets", reinterpret_cast<PFN_vkVoidFunction>(mockCmdBindDescriptorSets)},
         {"vkCreatePipelineLayout", reinterpret_cast<PFN_vkVoidFunction>(mockCreatePipelineLayout)},
@@ -2832,6 +2865,249 @@ void descriptorCacheTests() {
         expectFailure([&] { cache.Allocate(large, uniformBuffers); }, "descriptor set uses an unsupported descriptor type 6");
     }
     Require(mock.live == 0, "the descriptor cache leaked a pool or layout");
+    mock = MockVulkan{};
+    context.limits.maxDescriptorSetStorageBuffers = 16;
+    context.descriptorIndexingLimits.maxDescriptorSetUpdateAfterBindStorageBuffers = 8192;
+    context.descriptorIndexingLimits.maxPerStageUpdateAfterBindResources = 16384;
+    context.limits.maxPerStageDescriptorSampledImages = 2048;
+    {
+        AgcDriver::Graphics::DescriptorCache cache(context);
+        const std::array<VkDescriptorSetLayoutBinding, 2> bindings{{{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4097, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}, {1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 32, VK_SHADER_STAGE_FRAGMENT_BIT, nullptr}}};
+        constexpr auto tableFlags = VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT;
+        const std::array<VkDescriptorBindingFlags, 2> flags{VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT, tableFlags};
+        const std::array<std::uint32_t, 9> key{0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4097, VK_SHADER_STAGE_FRAGMENT_BIT, 1, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 32, VK_SHADER_STAGE_FRAGMENT_BIT, VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT};
+        const auto layout = cache.Layout(key, bindings, true, flags);
+        Require(mock.layoutFlags == VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT && mock.layoutBindingFlags == std::vector<VkDescriptorBindingFlags>{VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT, tableFlags}, "a variable image table lost its flags when the storage binding used update-after-bind");
+        Require(cache.Layout(key, bindings, true, flags) == layout && cache.Counters().layoutHits == 1, "the combined descriptor layout was not reused");
+        const std::array<VkDescriptorPoolSize, 2> oversized{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4097}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3}}};
+        const auto dedicated = cache.Allocate(layout, oversized, true, 3u);
+        Require(mock.poolMaxSets == 1 && mock.poolFlags == VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT && mock.variableDescriptorCount == 3u, "a dedicated update-after-bind pool lost the variable image count");
+        cache.Free(dedicated);
+        auto fittingBindings = bindings;
+        fittingBindings[0].descriptorCount = 17;
+        auto fittingKey = key;
+        fittingKey[2] = 17;
+        const auto fittingLayout = cache.Layout(fittingKey, fittingBindings, true, flags);
+        const std::array<VkDescriptorPoolSize, 2> fitting{{{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 17}, {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 3}}};
+        const auto chained = cache.Allocate(fittingLayout, fitting, true, 3u);
+        Require(mock.poolMaxSets == 1024 && mock.poolFlags == VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT && mock.variableDescriptorCount == 3u, "a chained update-after-bind pool lost the variable image count");
+        cache.Free(chained);
+        const auto reused = cache.Allocate(fittingLayout, fitting, true, 0u);
+        Require(reused.pool == chained.pool && mock.variableDescriptorCount == 0u, "reusing an update-after-bind pool lost an empty variable image table");
+        cache.Free(reused);
+        expectFailure([&] { cache.Allocate(fittingLayout, fitting, false, 3u); }, "descriptor set exceeds the device's per-set descriptor limit");
+    }
+    Require(mock.live == 0, "the combined descriptor cache leaked a pool or layout");
+}
+
+void imageTableAllocationTests() {
+    namespace Abi = ShaderRecompiler::ImageTableAbi;
+    for (const bool cached : {false, true}) {
+        for (const std::uint32_t count : {0u, 2u, 3u}) {
+            mock = MockVulkan{};
+            auto context = mockContext();
+            context.imageTableCapacity = 2;
+            context.limits.maxDescriptorSetSampledImages = 2;
+            context.limits.maxPerStageDescriptorSampledImages = 2;
+            {
+                AgcDriver::Graphics::DescriptorCache cache(context);
+                if (cached) context.descriptorCache = &cache;
+                ShaderRecompiler::RecompileResult program;
+                auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::vector<std::uint32_t>(Abi::HeaderWords + count));
+                map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
+                map.guestDescriptor[Abi::HeaderElementCount] = count;
+                map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
+                map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords + count;
+                program.bindings.push_back(map);
+                auto images = makeBinding(Role::ImageTable, ShaderRecompiler::RuntimeAbi::ImageTableBinding, count, std::vector<std::uint32_t>(count * 8u));
+                images.kind = Kind::SampledImage;
+                images.imageShapes.resize(count);
+                images.imageDepthCompare.resize(count);
+                images.imageSamplers.resize(count);
+                program.bindings.push_back(std::move(images));
+                const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+                {
+                    AgcDriver::Graphics::ShaderResources resources(context, shader, {}, true);
+                    Require(findLayoutBinding(ShaderRecompiler::RuntimeAbi::ImageTableBinding).descriptorCount == 2u, "the image table layout changed its device capacity");
+                    const auto physicalCount = std::max(1u, std::min(count, 2u));
+                    Require(mock.variableDescriptorCount == physicalCount, "image table allocation did not reserve its bounded physical descriptor count");
+                    const auto sampled = std::find_if(mock.poolSizes.begin(), mock.poolSizes.end(), [](const auto& size) { return size.type == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE; });
+                    Require(sampled != mock.poolSizes.end() && sampled->descriptorCount >= physicalCount && (cached || sampled->descriptorCount == physicalCount), "the image table pool did not cover its bounded allocation");
+                    resources.Complete();
+                    const auto& bytes = bufferBytes(findWrite(map.binding).buffers.at(0).buffer);
+                    std::vector<std::uint32_t> actual(bytes.size() / sizeof(std::uint32_t));
+                    std::memcpy(actual.data(), bytes.data(), bytes.size());
+                    Require(actual[Abi::HeaderElementCount] == count, "bounding the Vulkan allocation truncated the guest table domain");
+                    if (count > context.imageTableCapacity) Require((actual[Abi::HeaderWords + 2u] & Abi::PoisonFlag) != 0u, "an image beyond Vulkan capacity lost its deferred fault");
+                }
+            }
+            Require(mock.live == 0, "the bounded image table leaked Vulkan objects");
+        }
+    }
+}
+
+void imageTableSnapshotAllocationTests() {
+    namespace Abi = ShaderRecompiler::ImageTableAbi;
+    using namespace AgcDriver::Graphics;
+    mock = MockVulkan{};
+    auto context = mockContext();
+    context.imageTableCapacity = 2;
+    context.limits.maxDescriptorSetSampledImages = 2;
+    context.limits.maxPerStageDescriptorSampledImages = 2;
+    {
+        DescriptorCache cache(context);
+        context.descriptorCache = &cache;
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Recorder recorder(context);
+        ShaderRecompiler::RecompileResult vertex, fragment;
+        auto buffer = makeBinding(Role::GuestBuffers, 0, 1, vsharp(guestFirst.data(), 16));
+        buffer.bufferWritten = {false};
+        vertex.bindings.push_back(buffer);
+        auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::vector<std::uint32_t>(Abi::HeaderWords));
+        map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
+        map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
+        map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords;
+        vertex.bindings.push_back(map);
+        auto images = makeBinding(Role::ImageTable, ShaderRecompiler::RuntimeAbi::ImageTableBinding, 0, {});
+        images.kind = Kind::SampledImage;
+        vertex.bindings.push_back(images);
+        const auto state = DecodeState(makeState());
+        ShaderResources resources(context, vertex, fragment, state.color, 0, 0);
+        const auto originalMap = findWrite(map.binding).buffers.at(0);
+        const std::array<ShaderResources::MovedBuffer, 1> moved{{{0, 0, 16, {11, 22, 33, 44}}}};
+        const auto sets = cache.Counters().sets;
+        mock.writes.clear();
+        mock.variableDescriptorCount.reset();
+        const auto snapshots = resources.PrepareDrawBindings(recorder, moved);
+        Require(snapshots != nullptr && snapshots->snapshots.size() == 1 && cache.Counters().sets == sets + 1, "an empty image table prevented draw snapshot allocation");
+        Require(mock.variableDescriptorCount == 1u, "an empty draw snapshot table did not reserve one physical image descriptor");
+        Require(sameBytes(bufferBytes(snapshots->snapshots[0].buffer->Handle()), moved[0].words.data(), moved[0].size), "an empty image table changed draw snapshot contents");
+        const auto& currentMap = findWrite(map.binding).buffers.at(0);
+        Require(currentMap.buffer == originalMap.buffer && currentMap.offset == originalMap.offset && currentMap.range == originalMap.range, "draw snapshots replaced the empty image table map");
+        std::array<std::uint32_t, Abi::HeaderWords> header{};
+        std::memcpy(header.data(), bufferBytes(currentMap.buffer).data() + currentMap.offset, sizeof(header));
+        Require(header[Abi::HeaderElementCount] == 0u, "draw snapshots changed the empty guest table domain");
+        Require(std::none_of(mock.writes.begin(), mock.writes.end(), [](const auto& write) { return write.binding == ShaderRecompiler::RuntimeAbi::ImageTableBinding; }), "an empty draw snapshot table wrote an image descriptor");
+        recorder.Sync();
+    }
+    Require(mock.live == 0, "the empty image table draw snapshot leaked Vulkan objects");
+}
+
+void samplerTableNonSeamlessCubeTests() {
+    namespace Abi = ShaderRecompiler::ImageTableAbi;
+    constexpr auto count = 2u * Abi::SamplerEntryElements;
+    for (const bool supported : {false, true}) {
+        for (const std::uint32_t flaggedEntry : {0u, 1u}) {
+            mock = MockVulkan{};
+            auto context = mockContext();
+            context.nonSeamlessCubeMap = supported;
+            context.samplerTableCapacity = count;
+            context.limits.maxDescriptorSetSamplers = count;
+            context.limits.maxPerStageDescriptorSamplers = count;
+            context.limits.maxSamplerAnisotropy = 1.0f;
+            ShaderRecompiler::RecompileResult program;
+            auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::vector<std::uint32_t>(Abi::HeaderWords + 2u));
+            map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
+            map.guestDescriptor[Abi::HeaderSamplerCount] = count;
+            map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
+            map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords;
+            program.bindings.push_back(map);
+            auto samplers = makeBinding(Role::SamplerTable, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::SamplerTable), count, {});
+            samplers.kind = Kind::Sampler;
+            for (std::uint32_t entry = 0; entry < 2u; ++entry) {
+                const std::array<std::uint32_t, 4> words{0x92u | (entry == flaggedEntry ? 1u << 28u : 0u), (4u * 256u) << 12u, 0u, 0u};
+                for (std::uint32_t variant = 0; variant < Abi::SamplerEntryElements; ++variant) {
+                    samplers.guestDescriptor.insert(samplers.guestDescriptor.end(), words.begin(), words.end());
+                    samplers.samplerDepthCompare.push_back(variant >= 2u);
+                }
+            }
+            const auto samplerBinding = samplers.binding;
+            program.bindings.push_back(std::move(samplers));
+            const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+            {
+                AgcDriver::Graphics::ShaderResources resources(context, shader, {}, true);
+                resources.Complete();
+                const auto& bytes = bufferBytes(findWrite(map.binding).buffers.at(0).buffer);
+                std::vector<std::uint32_t> actual(bytes.size() / sizeof(std::uint32_t));
+                std::memcpy(actual.data(), bytes.data(), bytes.size());
+                Require(actual[Abi::HeaderSamplerCount] == count, "non-seamless sampler rejection changed the guest table domain");
+                Require(actual[Abi::HeaderPoisonCount] == (supported ? 0u : 1u), "non-seamless sampler table has the wrong deferred poison count");
+                for (std::uint32_t entry = 0; entry < 2u; ++entry) {
+                    const auto expected = !supported && entry == flaggedEntry ? Abi::PoisonCode(0u) : 0u;
+                    Require(actual[Abi::HeaderWords + entry] == expected, "non-seamless sampler rejection poisoned the wrong entry");
+                }
+                const auto& write = findWrite(samplerBinding);
+                const auto first = supported ? 0u : (1u - flaggedEntry) * Abi::SamplerEntryElements;
+                const auto written = supported ? count : Abi::SamplerEntryElements;
+                Require(findLayoutBinding(samplerBinding).descriptorCount == count && write.type == VK_DESCRIPTOR_TYPE_SAMPLER && write.arrayElement == first && write.count == written && write.images.size() == written, "non-seamless sampler rejection compacted or truncated descriptor indices");
+                Require(mock.samplerFlags.size() == written, "a rejected sampler table entry allocated a Vulkan sampler");
+                for (std::uint32_t index = 0; index < written; ++index) {
+                    const auto expected = supported && (first + index) / Abi::SamplerEntryElements == flaggedEntry ? VK_SAMPLER_CREATE_NON_SEAMLESS_CUBE_MAP_BIT_EXT : 0u;
+                    Require(mock.samplerFlags.at(write.images[index].sampler) == expected, "a sampler table variant has the wrong non-seamless cube creation flag");
+                }
+            }
+            Require(mock.live == 0 && mock.samplerFlags.empty(), "the non-seamless sampler table leaked Vulkan objects");
+        }
+    }
+}
+
+void samplerTableDeviceLimitTests(std::optional<std::uint32_t> selected = std::nullopt) {
+    namespace Abi = ShaderRecompiler::ImageTableAbi;
+    constexpr auto count = 2u * Abi::SamplerEntryElements;
+    const std::array<std::uint32_t, 4> valid{0x92u, (4u * 256u) << 12u, 0u, 0u};
+    const std::array<std::array<std::uint32_t, 4>, 3> invalid{{
+        {0x92u, valid[1], 256u, 0u},
+        {0x92u | (2u << 9u), valid[1], (2u << 20u) | (2u << 22u), 0u},
+        {0x92u | (1u << 29u), valid[1], 0u, 0u}
+    }};
+    for (std::uint32_t kind = 0; kind < invalid.size(); ++kind) {
+        if (selected.has_value() && kind != *selected) continue;
+        for (const std::uint32_t badEntry : {0u, 1u}) {
+            mock = MockVulkan{};
+            auto context = mockContext();
+            context.samplerTableCapacity = count;
+            context.limits.maxDescriptorSetSamplers = count;
+            context.limits.maxPerStageDescriptorSamplers = count;
+            context.samplerAnisotropy = true;
+            context.samplerFilterMinmax = true;
+            context.limits.maxSamplerAnisotropy = 2.0f;
+            context.limits.maxSamplerLodBias = 0.5f;
+            ShaderRecompiler::RecompileResult program;
+            auto map = makeBinding(Role::ImageTableMap, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::ImageTableMap), 1, std::vector<std::uint32_t>(Abi::HeaderWords + 2u));
+            map.guestDescriptor[Abi::HeaderVersion] = Abi::Version;
+            map.guestDescriptor[Abi::HeaderSamplerCount] = count;
+            map.guestDescriptor[Abi::HeaderElementFaults] = Abi::HeaderWords;
+            map.guestDescriptor[Abi::HeaderSamplerFaults] = Abi::HeaderWords;
+            program.bindings.push_back(map);
+            auto samplers = makeBinding(Role::SamplerTable, static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::SamplerTable), count, {});
+            samplers.kind = Kind::Sampler;
+            for (std::uint32_t entry = 0; entry < 2u; ++entry) {
+                const auto& words = entry == badEntry ? invalid[kind] : valid;
+                for (std::uint32_t variant = 0; variant < Abi::SamplerEntryElements; ++variant) {
+                    samplers.guestDescriptor.insert(samplers.guestDescriptor.end(), words.begin(), words.end());
+                    samplers.samplerDepthCompare.push_back(variant >= 2u);
+                }
+            }
+            const auto samplerBinding = samplers.binding;
+            program.bindings.push_back(std::move(samplers));
+            const AgcDriver::Graphics::CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+            {
+                AgcDriver::Graphics::ShaderResources resources(context, shader, {}, true);
+                resources.Complete();
+                const auto& bytes = bufferBytes(findWrite(map.binding).buffers.at(0).buffer);
+                std::vector<std::uint32_t> actual(bytes.size() / sizeof(std::uint32_t));
+                std::memcpy(actual.data(), bytes.data(), bytes.size());
+                Require(actual[Abi::HeaderSamplerCount] == count && actual[Abi::HeaderPoisonCount] == 1u, "sampler device validation changed the domain or deferred poison count");
+                for (std::uint32_t entry = 0; entry < 2u; ++entry) {
+                    Require(actual[Abi::HeaderWords + entry] == (entry == badEntry ? Abi::PoisonCode(0u) : 0u), "sampler device validation poisoned the valid entry");
+                }
+                const auto& write = findWrite(samplerBinding);
+                Require(write.type == VK_DESCRIPTOR_TYPE_SAMPLER && write.arrayElement == (1u - badEntry) * Abi::SamplerEntryElements && write.count == Abi::SamplerEntryElements && write.images.size() == Abi::SamplerEntryElements, "sampler device validation changed valid descriptor indices");
+                Require(mock.samplerCreateCount == Abi::SamplerEntryElements && mock.samplerFlags.size() == Abi::SamplerEntryElements, "a rejected sampler table entry created a Vulkan sampler");
+            }
+            Require(mock.live == 0 && mock.samplerFlags.empty(), "sampler device validation leaked Vulkan objects");
+        }
+    }
 }
 
 void textureCacheBudgetTests() {
@@ -4551,6 +4827,21 @@ int main(int argc, char** argv) {
             std::cout << "Descriptor layout native and captured binding flags passed\n";
             return 0;
         }
+        if (argc == 2 && std::string_view(argv[1]) == "--image-table-allocation") {
+            imageTableAllocationTests();
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--image-table-snapshot") {
+            imageTableSnapshotAllocationTests();
+            return 0;
+        }
+        const std::array<std::string_view, 3> samplerCases{"--sampler-table-lod-bias", "--sampler-table-anisotropy", "--sampler-table-reduction-compare"};
+        for (std::uint32_t index = 0; index < samplerCases.size(); ++index) {
+            if (argc == 2 && std::string_view(argv[1]) == samplerCases[index]) {
+                samplerTableDeviceLimitTests(index);
+                return 0;
+            }
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--descriptor-pool-reset-failure") {
             descriptorPoolResetFailureTest();
             std::cerr << "descriptor pool reset failure did not terminate\n";
@@ -4632,6 +4923,10 @@ int main(int argc, char** argv) {
         resourceTests();
         descriptorSnapshotTests();
         descriptorCacheTests();
+        imageTableAllocationTests();
+        imageTableSnapshotAllocationTests();
+        samplerTableNonSeamlessCubeTests();
+        samplerTableDeviceLimitTests();
         misalignedShaderDataTests();
         debugBranchTests();
         textureCacheBudgetTests();
