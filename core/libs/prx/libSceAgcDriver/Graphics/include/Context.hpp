@@ -158,6 +158,7 @@ struct Context {
     bool sampleRateShading = false;
     bool nullDescriptors = false;
     bool bufferInt64Atomics = false;
+    bool demoteToHelperInvocation = false;
     bool primitiveListRestart = false;
     bool imageViewMinLod = false;
     bool pipelineExecutableInfo = false;
