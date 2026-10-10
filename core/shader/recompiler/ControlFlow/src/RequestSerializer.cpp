@@ -1,4 +1,5 @@
 #include "ControlFlow/RequestSerializer.hpp"
+#include <bit>
 #include <stdexcept>
 
 namespace ShaderRecompiler {
@@ -504,6 +505,8 @@ void writeTessellationConfiguration(Writer& writer, const TessellationConfigurat
     writer.WriteU32(configuration.domain);
     writer.WriteU32(configuration.partitioning);
     writer.WriteU32(configuration.outputTopology);
+    writer.WriteU32(std::bit_cast<std::uint32_t>(configuration.maxLevel));
+    writer.WriteU32(configuration.patchesPerGroup);
 }
 
 TessellationConfiguration readTessellationConfiguration(Reader& reader) {
@@ -513,6 +516,8 @@ TessellationConfiguration readTessellationConfiguration(Reader& reader) {
     configuration.domain = reader.ReadU32();
     configuration.partitioning = reader.ReadU32();
     configuration.outputTopology = reader.ReadU32();
+    configuration.maxLevel = std::bit_cast<float>(reader.ReadU32());
+    configuration.patchesPerGroup = reader.ReadU32();
     return configuration;
 }
 
