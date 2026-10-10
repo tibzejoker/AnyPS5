@@ -383,6 +383,7 @@ public:
         deadCodeEliminator.Eliminate(program);
         program.Metadata().tessellationLocalStride = localStride;
         program.Metadata().tessellationControlStride = controlStride;
+        program.Metadata().tessellationPatchStride = patchRecordStride;
     }
 
 private:
@@ -444,13 +445,18 @@ private:
     void derive() {
         const auto inputs = static_cast<std::int64_t>(tessellation.inputControlPoints);
         const auto outputs = static_cast<std::int64_t>(tessellation.outputControlPoints);
-        for (const auto& access : accesses) {
+        for (auto& access : accesses) {
             if (access.kind == TessellationAttribute::LocalOutput) agree(localStride, access.address.relative, access.pc);
             if (access.kind == TessellationAttribute::ControlInput && access.address.vertex != 0) agree(localStride, access.address.vertex, access.pc);
             if (access.kind == TessellationAttribute::ControlOutput && access.address.vertex != 0) agree(controlStride, access.address.vertex, access.pc);
             if (access.kind == TessellationAttribute::EvaluationInput) {
-                if (access.address.relative <= 0 || access.address.relative % outputs != 0) Fail("domain shader reads of patch constants or other patches are unsupported", access.pc);
-                agree(controlStride, access.address.relative / outputs, access.pc);
+                if (access.address.relative > 0 && access.address.relative % outputs == 0) {
+                    agree(controlStride, access.address.relative / outputs, access.pc);
+                } else if (access.address.vertex != 0 || access.address.relative == 0) {
+                    Fail("domain shader reads of other patches are unsupported", access.pc);
+                } else {
+                    access.kind = TessellationAttribute::PatchInput;
+                }
             }
         }
         std::optional<std::int64_t> patchStride;
@@ -487,11 +493,18 @@ private:
                 if (tessellation.domain != 1u || address.vertex != 0 || address.relative != TriangleFactorBytes || address.constant < 0 || end > TriangleFactorBytes) Fail("the hull shader writes tessellation factors outside its patch's triangle factors", access.pc);
                 requireFirstInvocation(access);
                 break;
+            case TessellationAttribute::PatchInput:
+                if (patchStride && *patchStride != address.relative) Fail("inconsistent patch-constant stride", access.pc);
+                patchStride = address.relative;
+                patchLowest = std::min(patchLowest, address.constant);
+                patchHighest = std::max(patchHighest, end);
+                break;
             case TessellationAttribute::PatchOutput:
                 break;
             }
         }
         if (patchStride && (*patchStride == 0 || std::abs(*patchStride) < patchHighest - patchLowest)) Fail("patch-constant records of neighbouring patches overlap", 0u);
+        if (patchStride) patchRecordStride = static_cast<std::uint32_t>(std::abs(*patchStride));
     }
 
     void requireRelativeIndependence(const std::vector<IrValue*>& bases) {
@@ -604,6 +617,7 @@ private:
     IrProgram& program;
     const ShaderTessellationInputInfo& tessellation;
     IrShaderStage stage;
+    std::uint32_t patchRecordStride = 0;
     AddressEvaluator evaluator;
     std::vector<Access> accesses;
     std::uint32_t localStride = 0;
