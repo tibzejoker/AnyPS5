@@ -287,6 +287,10 @@ void lowerPackedAncillary(IrProgram& program, IrBuilder& builder, IrValue& ancil
         collectExtracts(collectExtracts, ancillary);
         direct = std::move(extracts);
         forwarded.clear();
+        // LOCAL GTAV HACK (never upstream): other readers get sampleId<<8 | layer<<16, bits 0-7 and 29-31 read as 0.
+        for (const IrUse& use : ancillary.OperandUses()) {
+            if (!extractsField(use)) forwarded.push_back(use);
+        }
     }
     std::array<IrValue*, 2> fields {};
     const auto field = [&](std::size_t index) -> IrValue& {

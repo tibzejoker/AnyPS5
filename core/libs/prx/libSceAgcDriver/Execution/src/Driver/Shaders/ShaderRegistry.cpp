@@ -98,6 +98,14 @@ std::shared_ptr<const ShaderSnapshot> ReadRawComputeShader(std::uint64_t address
             return result;
         } catch (const std::out_of_range&) {
             if (snapshot.code.size() == available) break;
+        } catch (const std::invalid_argument&) {
+            char name[64];
+            std::snprintf(name, sizeof(name), "rawcode_%llx.bin", static_cast<unsigned long long>(address));
+            if (std::FILE* file = std::fopen(name, "wb")) {
+                std::fwrite(snapshot.code.data(), sizeof(std::uint32_t), snapshot.code.size(), file);
+                std::fclose(file);
+            }
+            throw;
         }
     }
     throw std::runtime_error("AGC driver: raw compute program has no reachable end within mapped code or the size limit");
@@ -410,7 +418,13 @@ template<typename TValue>
 std::vector<TValue> ReadHeaderArray(const ShaderSnapshot& snapshot, const TValue* pointer, std::size_t count) {
     if (count == 0) return {};
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
-    if (address < snapshot.headerAddress || address - snapshot.headerAddress > snapshot.header.size()) throw std::runtime_error("AGC driver: shader metadata is outside the registered header");
+    if (address < snapshot.headerAddress || address - snapshot.headerAddress > snapshot.header.size()) {
+        // LOCAL GTAV HACK (never upstream): metadata outside the header is read from guest memory as registered.
+        GuestMemory::CheckRange(pointer, count * sizeof(TValue), 1);
+        std::vector<TValue> outside(count);
+        std::memcpy(outside.data(), static_cast<const void*>(pointer), count * sizeof(TValue));
+        return outside;
+    }
     const auto offset = static_cast<std::size_t>(address - snapshot.headerAddress);
     if (count > (snapshot.header.size() - offset) / sizeof(TValue)) throw std::runtime_error("AGC driver: truncated shader metadata");
     std::vector<TValue> result(count);
@@ -521,6 +535,14 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
     } catch (const ShaderRecompiler::UnsupportedInstructionError& error) {
         if (deferred == nullptr) throw;
         return defer(error.what());
+    } catch (const std::invalid_argument&) {
+        char name[64];
+        std::snprintf(name, sizeof(name), "rawcode_%llx_type%u.bin", static_cast<unsigned long long>(snapshot.codeAddress), static_cast<unsigned>(snapshot.type));
+        if (std::FILE* file = std::fopen(name, "wb")) {
+            std::fwrite(code.data(), sizeof(std::uint32_t), code.size(), file);
+            std::fclose(file);
+        }
+        throw;
     }
     std::optional<ShaderRecompiler::ShaderComputeStageInfo> compute;
     std::optional<ShaderRecompiler::ShaderPixelStageInfo> pixel;
@@ -754,6 +776,17 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
     ShaderPreparationTransaction transaction;
     CheckFailure();
     require(!stages.empty(), "graphics ABI has no shader headers");
+    // LOCAL GTAV HACK (never upstream): a second header for already registered code replaces the registered one.
+    for (const auto* shader : stages) {
+        GuestMemory::CheckRange(shader, sizeof(Shader), alignof(Shader));
+        const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(shader->code));
+        bool replaced;
+        {
+            std::lock_guard lock(mutex);
+            replaced = shaders != nullptr && shaders->contains(address) && !SameHeader(*shaders->at(address), shader);
+        }
+        if (replaced) RegisterShader(shader);
+    }
     QueueState state{};
     std::shared_ptr<const ShaderRegistry> registry;
     std::shared_ptr<const ShaderSnapshot> owner;
