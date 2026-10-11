@@ -186,6 +186,7 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
             waitMilliseconds = static_cast<int>(std::clamp<std::int64_t>(roundedMilliseconds, 0, 100));
         }
         if (devicesReady) waitMilliseconds = 0;
+#ifndef _WIN32
         if (!hosts.empty() && !sockets.empty()) {
             if (poller == nullptr) UnknownDescriptor(sockets.front().descriptor, false);
             const auto sliceEnd = std::chrono::steady_clock::now() + std::chrono::milliseconds(waitMilliseconds);
@@ -214,7 +215,9 @@ int APS5_VABI select_nid_postfix(int nfds, void* readfds, void* writefds, void* 
                 return -1;
             }
             for (std::size_t index = 0; index < hosts.size(); ++index) requested[hostSlots[index]].revents = hosts[index].revents;
-        } else if (!sockets.empty()) {
+        } else
+#endif
+        if (!sockets.empty()) {
             if (poller == nullptr) UnknownDescriptor(sockets.front().descriptor, false);
             for (auto& socket : sockets) socket.revents = 0;
             const int result = poller(sockets.data(), static_cast<int>(sockets.size()), waitMilliseconds);
