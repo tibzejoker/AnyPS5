@@ -27,6 +27,17 @@ constexpr std::uint32_t MovrelsV1V4 = 0x7e028704u;
 constexpr std::uint32_t MovreldV4V0 = 0x7e088500u;
 constexpr std::uint32_t MoveV1V5 = 0x7e020305u;
 constexpr std::uint32_t EndProgram = 0xbf810000u;
+constexpr std::uint32_t MoveV2Zero = 0x7e040280u;
+constexpr std::uint32_t MoveV3Zero = 0x7e060280u;
+constexpr std::uint32_t WritelaneV4 = 0xd7610004u;
+constexpr std::uint32_t FromS8Lane0 = 0x00010008u;
+constexpr std::uint32_t ReadlaneS8 = 0xd7600008u;
+constexpr std::uint32_t FromV4Lane0 = 0x00010104u;
+constexpr std::uint32_t ImageSampleLz2d = 0xf09c0f08u;
+constexpr std::uint32_t SampleV8V2S0S8 = 0x00400802u;
+constexpr std::uint32_t AddV8V1V8 = 0x4a101101u;
+constexpr std::uint32_t BufferStoreDword = 0xe0700000u;
+constexpr std::uint32_t StoreV8WithS12 = 0x80030800u;
 
 struct Shape {
     std::size_t functionArrays = 0;
@@ -41,7 +52,7 @@ void Require(bool condition, const std::string& message) {
 
 std::vector<std::uint32_t> RecompileProgram(std::span<const std::uint32_t> code) {
     const std::array<std::uint32_t, 7> capabilities{spv::CapabilityShader, spv::CapabilityGroupNonUniform, spv::CapabilityGroupNonUniformBallot, spv::CapabilityGroupNonUniformVote, spv::CapabilityGroupNonUniformShuffle, spv::CapabilityInt64, spv::CapabilityPhysicalStorageBufferAddresses};
-    const std::array<std::uint32_t, 4> userData{0x10000000u, 0u, 0x40u, 0x31016facu};
+    const std::array<std::uint32_t, 16> userData{0x10000000u, 0u, 0x40u, 0x31016facu};
     const std::array<std::string_view, 2> extensions{"SPV_KHR_physical_storage_buffer", "SPV_KHR_8bit_storage"};
     RecompileRequest request{};
     request.shader = {ShaderStage::Compute, 0x20000u, code, 0, {}};
@@ -269,6 +280,12 @@ int main(int argc, char** argv) {
         const std::array<std::uint32_t, 7> code{MoveV4One, MoveV5Two, MoveV6Four, MoveV1V5, 0xe0700000u, 0x80000100u, EndProgram};
         const auto shape = Scan(RecompileProgram(code));
         return shape.functionArrays == 0 && shape.accessChains == 0;
+    });
+
+    passed &= run("a sampler dword spilled into a relatively read register keeps its definition through v_readlane", [] {
+        const std::array<std::uint32_t, 14> code{MoveM0Two, MoveV2Zero, MoveV3Zero, WritelaneV4, FromS8Lane0, MovrelsV1V4, ReadlaneS8, FromV4Lane0, ImageSampleLz2d, SampleV8V2S0S8, AddV8V1V8, BufferStoreDword, StoreV8WithS12, EndProgram};
+        const auto shape = Scan(RecompileProgram(code));
+        return shape.functionArrays == 1;
     });
 
     if (passed) std::puts("Vector window shape and SSA control tests passed");
