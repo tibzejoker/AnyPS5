@@ -30,14 +30,10 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
     }
 }
 
+// Relieves GPU memory when the failed work hit an out-of-memory allocation: AllocateGpuMemory counts each one on its
+// thread (Graphics::OutOfMemoryFailures), so the error's text is not parsed.
 bool Driver::relieveMemory(std::uint64_t failures, const std::exception& error) {
     if (Graphics::OutOfMemoryFailures() == failures || GuestMemory::GpuMutex().HeldByThisThread()) return false;
-    const std::string_view what = error.what();
-    const auto result = what.rfind("Vulkan result -");
-    if (result == std::string_view::npos) return false;
-    const auto code = what.substr(result + 14, 3);
-    if (code.substr(0, 2) != "-1" && code.substr(0, 2) != "-2") return false;
-    if (code.size() > 2 && code[2] >= '0' && code[2] <= '9') return false;
     const auto relief = device.Load();
     if (relief == nullptr) return false;
     static std::atomic<std::int64_t> lastRelief{0};

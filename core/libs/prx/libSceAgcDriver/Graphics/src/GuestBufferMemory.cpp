@@ -696,10 +696,16 @@ const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint6
 bool importsStale(const Context& context, const HostImports& state);
 
 const HostImport* importAllocation(const Context& context, HostImports& state, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end = 0, bool evict = true) {
-    if (!importsStale(context, state)) {
-        if (const auto* current = findImport(state, address, end != 0 ? end : address + 1)) return current;
+    const bool fresh = !importsStale(context, state);
+    if (fresh && end != 0) {
+        if (const auto* current = findImport(state, address, end)) return current;
     }
     auto run = importRun(lease, address);
+    // Without an end the caller views the whole run through the import (AcquireRegistered): a window that holds the
+    // first byte is shorter than that, so only an import of the whole run is a hit; a window is replaced below.
+    if (fresh && end == 0) {
+        if (const auto* current = findImport(state, address, run.ranges.empty() ? address + 1 : run.base + run.bytes)) return current;
+    }
     if (end != 0) run = windowRun(std::move(run), address, end, context.hostImportAlignment);
     if (run.ranges.empty()) return nullptr;
     const auto base = run.base;
