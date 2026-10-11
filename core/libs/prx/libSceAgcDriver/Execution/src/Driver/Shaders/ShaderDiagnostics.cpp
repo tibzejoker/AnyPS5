@@ -2,6 +2,7 @@
 #include "ControlFlow/RequestSerializer.hpp"
 #include <cstdlib>
 #include <functional>
+#include <map>
 #include <string_view>
 
 namespace AgcDriver::DriverDetail {
@@ -51,13 +52,15 @@ void Driver::reportSkip(const char* kind, const std::string& what) {
 
 std::string Driver::dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request) {
     static std::mutex dumpMutex;
-    static std::set<std::uint64_t> dumped;
+    static std::set<std::size_t> dumped;
+    static std::map<std::uint64_t, int> variants;
     char name[64];
     std::snprintf(name, sizeof(name), "shader_%llx.req", static_cast<unsigned long long>(address));
     std::lock_guard lock(dumpMutex);
-    if (!dumped.insert(address).second) return name;
     try {
         const auto text = ShaderRecompiler::RequestSerializer{}.Serialize(request);
+        if (!dumped.insert(std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(text.data()), text.size()))).second) return name;
+        if (const int n = variants[address]++; n > 0) std::snprintf(name, sizeof(name), "shader_%llx_%d.req", static_cast<unsigned long long>(address), n);
         if (std::FILE* file = std::fopen(name, "wb")) {
             std::fwrite(text.data(), 1, text.size(), file);
             std::fclose(file);
