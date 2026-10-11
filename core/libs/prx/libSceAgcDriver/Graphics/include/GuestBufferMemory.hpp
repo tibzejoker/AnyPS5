@@ -34,6 +34,7 @@ struct HostImport {
     bool unwatched = false;
     bool dmaBuf = false;
     std::shared_ptr<void> chunk;
+    mutable std::uint64_t lastUse = 0;
 };
 
 enum class ImportWatch : std::uint8_t { Watch, Unwatch };
@@ -59,6 +60,9 @@ void SetImportWatch(const Context& context, ImportWatch watch);
 // the imports were not probed. The overload without a device reads the last decision (true before one).
 bool WatchedImportsStampPages(const Context& context);
 bool WatchedImportsStampPages();
+
+std::uint64_t RelieveGpuMemory(const Context& context);
+std::uint64_t HostImportLimit();
 
 // The host import of the registered allocation containing [address, address + bytes), made on demand
 // (alignment and budget permitting), or null. Bytes at `address` are at `address - import->base` in
@@ -384,6 +388,7 @@ private:
     // Import registry epoch when `direct` pointers were taken at acquire time; they are reused while
     // no import was destroyed since.
     std::uint64_t importsEpoch = 0;
+    std::uint64_t importFloor = 0;
     std::vector<Region> regions;
     // Whether `regions` is in ascending address order (true right after AcquireRegistered, whose
     // regions follow the registry's order), so AddSnapshot can search instead of scanning.

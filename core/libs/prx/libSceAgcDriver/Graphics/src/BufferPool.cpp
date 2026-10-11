@@ -1,11 +1,14 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <algorithm>
 #include <bit>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <limits>
+#include <new>
+#include <system_error>
 
 namespace AgcDriver::Graphics {
 
@@ -41,9 +44,10 @@ BufferPool::~BufferPool() {
     for (auto& [memory, block] : slabBlocks) freeBlock(*block);
 }
 
-VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation) {
+VkDeviceMemory BufferPool::AllocateMemory(const Context& context, const VkMemoryAllocateInfo& allocation, const char* operation) {
+    const auto kind = (context.memory.memoryTypes[allocation.memoryTypeIndex].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 ? GpuMemoryKind::HostBuffer : GpuMemoryKind::DeviceBuffer;
     VkDeviceMemory memory = VK_NULL_HANDLE;
-    auto result = allocateMemory(device, &allocation, nullptr, &memory);
+    auto result = AllocateGpuMemory(context, allocation, memory, kind, operation);
     const auto initialResult = result;
     unsigned attempts = 1;
     VkDeviceSize reclaimed = 0;
@@ -51,7 +55,7 @@ VkDeviceMemory BufferPool::AllocateMemory(const VkMemoryAllocateInfo& allocation
         reclaimed = trim();
         if (reclaimed != 0) {
             memory = VK_NULL_HANDLE;
-            result = allocateMemory(device, &allocation, nullptr, &memory);
+            result = AllocateGpuMemory(context, allocation, memory, kind, operation);
             ++attempts;
         }
     }
@@ -104,11 +108,15 @@ SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, 
     if (addressable) allocation.pNext = &flags;
     allocation.allocationSize = blockBytes;
     allocation.memoryTypeIndex = memoryType;
-    block->memory = AllocateMemory(allocation, "vkAllocateMemory buffer slab");
+    block->memory = AllocateMemory(context, allocation, "vkAllocateMemory buffer slab");
+    block->bytes = blockBytes;
     if ((context.memory.memoryTypes[memoryType].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
         void* mapping = nullptr;
         const auto mapped = mapMemory(device, block->memory, 0, VK_WHOLE_SIZE, 0, &mapping);
-        if (mapped != VK_SUCCESS) freeMemory(device, block->memory, nullptr);
+        if (mapped != VK_SUCCESS) {
+            freeMemory(device, block->memory, nullptr);
+            CountGpuMemory(GpuMemoryKind::HostBuffer, -static_cast<std::int64_t>(blockBytes));
+        }
         Check(mapped, "vkMapMemory buffer slab");
         block->mapping = static_cast<std::byte*>(mapping);
     }
@@ -127,6 +135,8 @@ SlabSlot BufferPool::TakeSlot(const Context& context, std::uint32_t memoryType, 
 void BufferPool::freeBlock(SlabBlock& block) noexcept {
     if (block.mapping != nullptr) unmap(device, block.memory);
     freeMemory(device, block.memory, nullptr);
+    // A slab block is host visible exactly when it is mapped (TakeSlot).
+    CountGpuMemory(block.mapping != nullptr ? GpuMemoryKind::HostBuffer : GpuMemoryKind::DeviceBuffer, -static_cast<std::int64_t>(block.bytes));
 }
 
 VkDeviceSize BufferPool::PutSlot(VkDeviceMemory memory, VkDeviceSize offset) noexcept {
@@ -184,6 +194,7 @@ VkDeviceSize BufferPool::destroy(const BufferAllocation& allocation) noexcept {
     if (allocation.mapping != nullptr) unmap(device, allocation.memory);
     destroyBuffer(device, allocation.buffer, nullptr);
     freeMemory(device, allocation.memory, nullptr);
+    CountGpuMemory((allocation.properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0 ? GpuMemoryKind::HostBuffer : GpuMemoryKind::DeviceBuffer, -static_cast<std::int64_t>(allocation.allocationBytes));
     return allocation.allocationBytes;
 }
 
@@ -321,6 +332,38 @@ void BufferPool::Put(const BufferAllocation& allocation) noexcept {
         destroy(allocation);
     }
     for (const auto& gone : evicted) destroy(gone);
+}
+
+VkDeviceSize BufferPool::Trim() noexcept {
+    std::vector<BufferAllocation> evicted;
+    VkDeviceSize bytes = 0;
+    try {
+        std::lock_guard lock(mutex);
+        evicted.reserve(smallTier.slots + largeTier.slots + deviceTier.slots);
+        for (auto* tier : {&smallTier, &largeTier, &deviceTier}) {
+            for (const auto& [key, slots] : tier->free) {
+                for (const auto& slot : slots) {
+                    evicted.push_back(slot.allocation);
+                    bytes += slot.allocation.allocationBytes;
+                }
+            }
+            tier->evictions += tier->slots;
+            tier->free.clear();
+            tier->retainedBytes = 0;
+            tier->slots = 0;
+        }
+    } catch (const std::bad_alloc&) {
+        return 0;
+    } catch (const std::system_error&) {
+        return 0;
+    }
+    for (const auto& gone : evicted) destroy(gone);
+    return bytes;
+}
+
+std::pair<VkDeviceSize, VkDeviceSize> BufferPool::RetainedBytes() {
+    std::lock_guard lock(mutex);
+    return {smallTier.retainedBytes + largeTier.retainedBytes, deviceTier.retainedBytes};
 }
 
 std::shared_ptr<BufferPool> GetBufferPool(const Context& context) {

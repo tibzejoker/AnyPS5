@@ -8,6 +8,7 @@
 #include <mutex>
 #include <optional>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -61,7 +62,9 @@ public:
     // The size a buffer for `bytes` is created with: its size class, or `bytes` itself when large.
     static std::size_t Capacity(std::size_t bytes, VkMemoryPropertyFlags properties);
     static VkBufferUsageFlags Usage(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties);
-    VkDeviceMemory AllocateMemory(const VkMemoryAllocateInfo& allocation, const char* operation);
+    // A vkAllocateMemory counted as GPU memory (AllocateGpuMemory, a host or device buffer by the memory type), retried
+    // once after a trim when out of memory; throws when it still fails.
+    VkDeviceMemory AllocateMemory(const Context& context, const VkMemoryAllocateInfo& allocation, const char* operation);
     std::optional<BufferAllocation> Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     void Put(const BufferAllocation& allocation) noexcept;
     static bool SlabEligible(std::size_t capacity, VkDeviceSize alignment, VkDeviceSize size, VkDeviceSize atom);
@@ -69,12 +72,15 @@ public:
     SlabSlot TakeSlot(const Context& context, std::uint32_t memoryType, std::size_t capacity, bool addressable);
     VkDeviceSize PutSlot(VkDeviceMemory memory, VkDeviceSize offset) noexcept;
     std::size_t SlabBlocks();
+    VkDeviceSize Trim() noexcept;
+    std::pair<VkDeviceSize, VkDeviceSize> RetainedBytes();
 
 private:
     struct SlabBlock {
         VkDeviceMemory memory = VK_NULL_HANDLE;
         std::byte* mapping = nullptr;
         VkDeviceSize slotBytes = 0;
+        VkDeviceSize bytes = 0;
         std::vector<std::uint32_t> free;
         std::uint32_t used = 0;
         std::uint64_t slab = 0;
