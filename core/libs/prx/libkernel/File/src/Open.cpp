@@ -215,6 +215,12 @@ std::int64_t APS5_VABI sceKernelLseek(int d, std::int64_t offset, int whence) {
     if (whence < 0 || whence > 2) {
         throw std::invalid_argument(std::string(__func__) + ": invalid whence=" + std::to_string(whence));
     }
+#ifdef _WIN32
+    if (const auto directory = File::SeekDirectoryDescriptor(d, offset, whence)) {
+        if (*directory < 0) return SceIoErrorFromErrno(errno);
+        return *directory;
+    }
+#endif
     std::int64_t result = NativeLseek(d, offset, whence);
     if (result < 0) return SceIoErrorFromErrno(errno);
     return result;
