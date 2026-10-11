@@ -116,6 +116,7 @@ struct State {
     VkPipelineColorBlendAttachmentState blend;
     std::array<float, 4> blendConstants;
     std::uint32_t samples = 1;
+    std::uint32_t paClVsOutCntl = 0;
 };
 
 ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup = false);
