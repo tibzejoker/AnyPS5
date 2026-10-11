@@ -1044,17 +1044,6 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
     ShaderPreparationTransaction transaction;
     CheckFailure();
     require(!stages.empty(), "graphics ABI has no shader headers");
-    // LOCAL GTAV HACK (never upstream): a second header for already registered code replaces the registered one.
-    for (const auto* shader : stages) {
-        GuestMemory::CheckRange(shader, sizeof(Shader), alignof(Shader));
-        const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(shader->code));
-        bool replaced;
-        {
-            std::lock_guard lock(mutex);
-            replaced = shaders != nullptr && shaders->contains(address) && !SameHeader(*shaders->at(address), shader);
-        }
-        if (replaced) RegisterShader(shader);
-    }
     QueueState state{};
     std::shared_ptr<const ShaderRegistry> registry;
     std::shared_ptr<const ShaderSnapshot> owner;
