@@ -1,3 +1,6 @@
+#include <cstring>
+#include <mutex>
+#include <array>
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
@@ -158,6 +161,25 @@ void Driver::execute(const Submission& submission) {
 
         timing.Mark("device_lock");
         GuestMemory::SetCurrentPacket(header == FlipPacketHeader ? 0xffffu : opcode, submission.queue);
+        {
+            static const std::uint64_t poolWatch = [] { const char* text = std::getenv("GTAV_POOL_WATCH"); return text ? std::strtoull(text, nullptr, 16) : 0ull; }();
+            if (poolWatch != 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(poolWatch), 64)) {
+                static std::mutex poolMutex;
+                static std::array<std::uint32_t, 16> last{};
+                static bool seen = false;
+                std::array<std::uint32_t, 16> now{};
+                std::memcpy(now.data(), reinterpret_cast<const void*>(poolWatch), sizeof(now));
+                std::lock_guard poolLock(poolMutex);
+                if (!seen || now != last) {
+                    seen = true;
+                    last = now;
+                    char line[400];
+                    int length = std::snprintf(line, sizeof(line), "[pool] before serial=%llu queue=0x%x @%zu %s:", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, Pm4::Name(header).c_str());
+                    for (std::size_t i = 0; i < 8 && length < 380; ++i) length += std::snprintf(line + length, sizeof(line) - length, " %08x", now[i]);
+                    std::fprintf(stderr, "%s\n", line);
+                }
+            }
+        }
         CaptureTrace::Log("packet submission=%llu queue=%x offset=%zu header=%08x words=%zu", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, header, packet.size());
         if (Pm4::Predicated(header) && queue.predication.operation != 0) {
             landPendingWaits(submission.queue);
