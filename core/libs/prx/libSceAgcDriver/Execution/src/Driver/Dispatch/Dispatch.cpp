@@ -290,6 +290,20 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                     std::fprintf(stderr, "\n");
                 };
                 std::fprintf(stderr, "[gtav-probe] compute 0x%llx queue %u user", static_cast<unsigned long long>(address), static_cast<unsigned>(submission.queue));
+                {
+                    std::string text = "[gtav-probe] submission " + std::to_string(submission.serial) + " packets:\n";
+                    for (std::size_t cursor = 0; cursor < submission.commands.size();) {
+                        const auto header = submission.commands[cursor];
+                        const auto count = std::max<std::size_t>(1, Pm4::PacketWords(header));
+                        char line[220];
+                        int length = std::snprintf(line, sizeof(line), "[gtav-probe]   @%zu %s", cursor, Pm4::Name(header).c_str());
+                        for (std::size_t i = 1; i < count && i < 12 && length < 200; ++i) length += std::snprintf(line + length, sizeof(line) - length, " %08x", submission.commands[cursor + i]);
+                        text += line;
+                        text += "\n";
+                        cursor += count;
+                    }
+                    std::fwrite(text.data(), 1, text.size(), stderr);
+                }
                 for (const auto word : user) std::fprintf(stderr, " %08x", word);
                 std::fprintf(stderr, "\n");
                 for (int round = 0; round < 3; ++round) {
