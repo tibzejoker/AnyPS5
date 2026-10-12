@@ -103,6 +103,7 @@ std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // collect stamps newer.
 std::uint64_t TrackerGeneration();
 std::uint64_t NewestStamp(std::uint64_t address, std::size_t bytes);
+std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes);
 // Whether no CPU write touched the range since `generation`: an uncached resetting collect of the
 // range's pages first (a game store not collected yet becomes a block stamp), then the compare over
 // the stamps collects make (dirty pages), not the MarkWritten stamps of the driver's own GPU label
