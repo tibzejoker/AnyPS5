@@ -319,9 +319,14 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (dump.empty()) std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
             else std::snprintf(where, sizeof(where), "compute shader 0x%llx (%s): ", static_cast<unsigned long long>(address), dump.c_str());
             static const bool skipFailed = std::getenv("GTAV_SKIP_DISPATCH_ERRORS") != nullptr;
-            if (skipFailed) {
-                reportSkip("compute dispatch (GTAV_SKIP_DISPATCH_ERRORS)", where + reason);
+            if (skipFailed && !resolving) {
+                static std::atomic<int> printed{0};
+                if (printed.fetch_add(1) < 40) std::fprintf(stderr, "[gpu] in-order dispatch skipped (GTAV_SKIP_DISPATCH_ERRORS) serial=%llu @%zu queue=0x%x: %s%s\n", static_cast<unsigned long long>(submission.serial), currentPacketOffset(), static_cast<unsigned>(submission.queue), where, reason.c_str());
                 return;
+            }
+            if (skipFailed && resolving) {
+                static std::atomic<int> printedAhead{0};
+                if (printedAhead.fetch_add(1) < 40) std::fprintf(stderr, "[gpu] ahead capture failed serial=%llu @%zu queue=0x%x: %s%s\n", static_cast<unsigned long long>(submission.serial), currentPacketOffset(), static_cast<unsigned>(submission.queue), where, reason.c_str());
             }
             throw std::runtime_error(where + reason);
         }
