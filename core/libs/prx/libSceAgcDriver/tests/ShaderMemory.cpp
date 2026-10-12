@@ -1515,6 +1515,25 @@ void verifyMeshConfiguration() {
     other.graphics = GraphicsCompileContext{0u, {}, otherMesh, std::nullopt, {}};
     RecompileCacheKey::Build(other, key);
     require(key != first && RecompileCacheKey::ContextHash(request) != RecompileCacheKey::ContextHash(other), "the cache keys ignore the mesh configuration");
+    RecompileRequest hull{};
+    hull.shader = {ShaderStage::TessellationControl, 0x10000u, code, 0, {}};
+    hull.context.waveSize = 64;
+    hull.graphics = GraphicsCompileContext{0u, {}, std::nullopt, TessellationConfiguration{4u, 4u, 2u, 2u, 3u, 1.0f, 9.0f}, {}};
+    const auto hullReplay = RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(hull));
+    const auto* replayed = hullReplay.request.graphics && hullReplay.request.graphics->tessellation ? &*hullReplay.request.graphics->tessellation : nullptr;
+    require(replayed != nullptr && replayed->domain == 2u && replayed->outputTopology == 3u && replayed->minLevel == 1.0f && replayed->maxLevel == 9.0f, "the quad tessellation configuration or its level clamps were lost in serialization");
+    auto clamped = hull;
+    clamped.graphics->tessellation->maxLevel = 5.0f;
+    RecompileCacheKey::Build(hull, key);
+    const auto hullKey = key;
+    RecompileCacheKey::Build(clamped, key);
+    require(key != hullKey && RecompileCacheKey::ContextHash(hull) != RecompileCacheKey::ContextHash(clamped), "the hull cache keys ignore the tessellation level clamps");
+    hull.shader.stage = ShaderStage::TessellationEvaluation;
+    clamped.shader.stage = ShaderStage::TessellationEvaluation;
+    RecompileCacheKey::Build(hull, key);
+    const auto domainKey = key;
+    RecompileCacheKey::Build(clamped, key);
+    require(key == domainKey, "the domain cache key depends on the tessellation level clamps that only hull programs apply");
     const std::array<std::uint32_t, 8> users{};
     request.context.waveSize = 32u;
     request.context.userData = users;
@@ -1654,12 +1673,12 @@ void verifyPixelRequestSerialization() {
     minimal.context.waveSize = 64;
     minimal.context.pixel = ShaderPixelStageInfo{};
     const auto encoded = serializer.Serialize(minimal);
-    require(requestPrefix(encoded, 8u) == "NVNQQRIAAAA=", "new requests did not use serialization version 18");
+    require(requestPrefix(encoded, 8u) == "NVNQQRMAAAA=", "new requests did not use serialization version 19");
     constexpr std::size_t mappingOffset = 8u + 37u + 18u + 163u;
     for (std::size_t bytes = 0; bytes < 19u; ++bytes) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source, alpha-to-coverage or stencil reference export flag was accepted");
     }
-    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRMAAAA="}) {
+    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRQAAAA="}) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(unsupported)); }, "serialization version", "an unsupported request version was accepted");
     }
 }
