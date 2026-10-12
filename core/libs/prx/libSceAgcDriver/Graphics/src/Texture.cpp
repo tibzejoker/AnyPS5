@@ -1529,7 +1529,7 @@ LookupOutcomes& ThreadLookupOutcomes() {
 
 
 namespace GtavPhases {
-constexpr int Count = 15;
+constexpr int Count = 21;
 std::array<std::atomic<std::uint64_t>, Count> ns{};
 std::array<std::atomic<std::uint64_t>, Count> counts{};
 std::atomic<std::int64_t> lastReport{0};
@@ -1543,7 +1543,7 @@ void Add(int phase, std::chrono::steady_clock::time_point& start) {
     auto last = lastReport.load(std::memory_order_relaxed);
     if (last == 0) { lastReport.compare_exchange_strong(last, stamp); return; }
     if (stamp - last < 10 || !lastReport.compare_exchange_strong(last, stamp)) return;
-    static constexpr const char* names[Count] = {"proved", "alias", "flush", "collect", "keys", "stamps", "equals", "direct", "unchanged-tail", "changed-rest", "rt-lookup", "rt-regclear", "rt-cmask", "rt-total", "refresh-calls"};
+    static constexpr const char* names[Count] = {"proved", "alias", "flush", "collect", "keys", "stamps", "equals", "direct", "unchanged-tail", "changed-rest", "rt-lookup", "rt-regclear", "rt-cmask", "rt-total", "refresh-calls", "scan-changedblocks", "scan-unitcompare", "scan-wholecompare", "unchangedsince-false", "keys-changed", "maybe-units"};
     char line[1500];
     int n = std::snprintf(line, sizeof(line), "[gtav-phases] 10 s:");
     for (int i = 0; i < Count && n < 1400; ++i) {
@@ -1631,18 +1631,23 @@ bool StorageTexture::Refresh() {
             return GuestMemory::EqualsCommitted(descriptor.baseAddress, original);
         };
         const auto scanBlocks = [&] {
+            auto scanStart = std::chrono::steady_clock::now();
             blockGenerations(generations);
             stampedBlocks.assign(generations.size(), 0);
             cpuBlocks.assign(generations.size(), 0);
             tracked = GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generations, stampedBlocks, cpuBlocks);
+            if (gtavOn) GtavPhases::Add(15, scanStart);
             for (std::uint32_t unit = 0; tracked && blockUnits && unit < trackedLayers; ++unit) {
                 if (stampedBlocks[unit] != GuestMemory::BlockMaybeWritten) continue;
+                if (gtavOn) { auto t = std::chrono::steady_clock::now(); GtavPhases::Add(20, t); }
                 std::array<std::uint8_t, 1> block{};
                 if (!compareUntracked(layerBegin(unit), static_cast<std::size_t>(layerBytes(unit)), block) || block[0] != GuestMemory::BlockUnchanged) continue;
                 stampedBlocks[unit] = GuestMemory::BlockUnchanged;
                 cpuBlocks[unit] = 0;
             }
+            if (gtavOn) GtavPhases::Add(16, scanStart);
             compared = !tracked && compareUntracked(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), stampedBlocks, true);
+            if (gtavOn) GtavPhases::Add(17, scanStart);
             if (compared) cpuBlocks = stampedBlocks;
         };
         const auto keysStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -1653,10 +1658,12 @@ bool StorageTexture::Refresh() {
             changed.assign(trackedLayers, true);
             unchanged = false;
             keysChanged = true;
+            if (gtavOn) { auto t = std::chrono::steady_clock::now(); GtavPhases::Add(19, t); }
             // Which units the CPU stamped still decides what the drop rule below may drop.
             if (blockUnits) scanBlocks();
         } else if (blockUnits) {
             if (!GuestMemory::UnchangedSince(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generation)) {
+                if (gtavOn) { auto t = std::chrono::steady_clock::now(); GtavPhases::Add(18, t); }
                 // One stamp scan for every unit (each is one stamp block); the unchanged units move
                 // to the current generation, so the whole-surface check answers next time.
                 scanBlocks();
