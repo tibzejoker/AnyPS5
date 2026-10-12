@@ -1968,6 +1968,23 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
     const auto* recorder = Recorder::Active();
     const std::array<std::uint64_t, 4> stamp{GuestMemory::CollectEpoch(), GuestMemory::NewestStamp(address, bytes), GuestMemory::ForgetSerial(), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
     const bool cacheable = memoize && stamp[0] != 0 && (stamp[2] & 1u) == 0 && address == descriptor.baseAddress && bytes == guestBytes;
+    if (std::getenv("GTAV_DRAW_PHASES") != nullptr) {
+        static std::array<std::atomic<std::uint64_t>, 10> why{};
+        static std::atomic<std::uint64_t> calls{0};
+        if (!memoize) ++why[0];
+        else if (stamp[0] == 0) ++why[1];
+        else if ((stamp[2] & 1u) != 0) ++why[2];
+        else if (address != descriptor.baseAddress || bytes != guestBytes) ++why[3];
+        else if (comparedGuestBytes == stamp) ++why[4];
+        else if (comparedGuestBytes == std::array<std::uint64_t, 4>{}) ++why[5];
+        else {
+            if (comparedGuestBytes[0] != stamp[0]) ++why[6];
+            if (comparedGuestBytes[1] != stamp[1]) ++why[7];
+            if (comparedGuestBytes[2] != stamp[2]) ++why[8];
+            if (comparedGuestBytes[3] != stamp[3]) ++why[9];
+        }
+        if (++calls % 20000 == 0) std::fprintf(stderr, "[gtav-memo] calls %llu: not-memoize %llu epoch0 %llu forget-odd %llu partial %llu HIT %llu no-entry %llu | miss by epoch %llu newest %llu forget %llu note %llu\n", static_cast<unsigned long long>(calls.load()), static_cast<unsigned long long>(why[0].load()), static_cast<unsigned long long>(why[1].load()), static_cast<unsigned long long>(why[2].load()), static_cast<unsigned long long>(why[3].load()), static_cast<unsigned long long>(why[4].load()), static_cast<unsigned long long>(why[5].load()), static_cast<unsigned long long>(why[6].load()), static_cast<unsigned long long>(why[7].load()), static_cast<unsigned long long>(why[8].load()), static_cast<unsigned long long>(why[9].load()));
+    }
     if (cacheable && comparedGuestBytes == stamp) {
         std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);
         return true;
