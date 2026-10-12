@@ -1717,6 +1717,7 @@ void ShaderResources::noteReusable() {
     reusable = false;
     directRegions.clear();
     if (guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || (bda != nullptr && LoopGuardEnabled())) return;
+    if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
     if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.size > MaxRefreshBytes; })) return;
     const auto regions = guestMemory.DirectRegions();
     if (!regions.has_value()) return;
@@ -3194,7 +3195,7 @@ bool ShaderResources::precollectImages() {
 }
 
 std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record) {
-    if (record.texture == nullptr) return nullptr;
+    if (record.texture == nullptr || record.texture->RefreshedPerUse()) return nullptr;
     struct Outcome {
         bool profile;
         std::chrono::steady_clock::time_point start;
