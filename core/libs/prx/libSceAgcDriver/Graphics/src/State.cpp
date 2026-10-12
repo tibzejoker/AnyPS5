@@ -551,9 +551,7 @@ ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup) {
         validate(tess.inputControlPoints != 0 && tess.inputControlPoints <= 32 && tess.outputControlPoints != 0 && tess.outputControlPoints <= 32, "invalid tessellation control-point counts");
         if ((parameters & ~0x000600ffu) != 0) Require(false, zeroMessage(0x2db, parameters, "VGT_TF_PARAM donut, factor detection, memory type or reserved state"));
         validate(tess.domain == 1 && tess.partitioning == 2 && tess.outputTopology == 2, "only triangular, fractional-odd, clockwise tessellation is supported by the reference path");
-        const auto maxLevel = readFloat(queue.context, 0x286);
-        Require(readFloat(queue.context, 0x287) <= 1.0f && maxLevel >= 1.0f, "a minimum tessellation level above 1 or a maximum below 1 is unsupported");
-        tess.maxLevel = std::min(maxLevel, 63.0f);
+        Require(readFloat(queue.context, 0x287) <= 1.0f && readFloat(queue.context, 0x286) >= 63.0f, "tessellation level clamps inside the fractional-odd range [1, 63] are unsupported");
         result.tessellation = tess;
     } else {
         validate((value & ~0x0047ec30u) == 0, "unsupported geometry routing, fast launch or wave-ID state");
