@@ -1,3 +1,5 @@
+#include <string>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <array>
@@ -162,21 +164,35 @@ void Driver::execute(const Submission& submission) {
         timing.Mark("device_lock");
         GuestMemory::SetCurrentPacket(header == FlipPacketHeader ? 0xffffu : opcode, submission.queue);
         {
-            static const std::uint64_t poolWatch = [] { const char* text = std::getenv("GTAV_POOL_WATCH"); return text ? std::strtoull(text, nullptr, 16) : 0ull; }();
-            if (poolWatch != 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(poolWatch), 64)) {
+            static std::atomic<std::uint64_t> poolWatch{[] { const char* text = std::getenv("GTAV_POOL_WATCH"); return text && std::strcmp(text, "auto") != 0 ? std::strtoull(text, nullptr, 16) : 0ull; }()};
+            static const bool poolAuto = [] { const char* text = std::getenv("GTAV_POOL_WATCH"); return text && std::strcmp(text, "auto") == 0; }();
+            if (poolAuto && poolWatch.load() == 0 && opcode == 0x37 && packet.size() >= 10 && packet[4] == 0x7f800000u && packet[5] == 0x7f800000u && packet[6] == 0x7f800000u && packet[7] == 0xff800000u) {
+                const std::uint64_t target = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+                static int candidates = 0;
+                std::fprintf(stderr, "[pool] candidate 0x%llx queue=0x%x words=%zu tail=%08x %08x\n", static_cast<unsigned long long>(target), submission.queue, packet.size(), packet.size() > 10 ? packet[10] : 0u, packet.size() > 11 ? packet[11] : 0u);
+                if (packet.size() >= 12 && packet[10] == 0u && packet[11] == 0u && ++candidates >= 1) poolWatch.store(target);
+                std::fprintf(stderr, "[pool] armed at 0x%llx by serial=%llu @%zu\n", static_cast<unsigned long long>(target), static_cast<unsigned long long>(submission.serial), cursor);
+            }
+            const auto watched = poolWatch.load();
+            if (watched != 0 && GuestMemory::Accessible(reinterpret_cast<const void*>(watched), 0x100)) {
                 static std::mutex poolMutex;
-                static std::array<std::uint32_t, 16> last{};
+                static std::array<std::uint32_t, 64> last{};
                 static bool seen = false;
-                std::array<std::uint32_t, 16> now{};
-                std::memcpy(now.data(), reinterpret_cast<const void*>(poolWatch), sizeof(now));
+                std::array<std::uint32_t, 64> now{};
+                std::memcpy(now.data(), reinterpret_cast<const void*>(watched), sizeof(now));
                 std::lock_guard poolLock(poolMutex);
                 if (!seen || now != last) {
+                    std::string line = "[pool] before serial=" + std::to_string(submission.serial) + " queue=0x" + [&] { char q[8]; std::snprintf(q, sizeof(q), "%x", submission.queue); return std::string(q); }() + " @" + std::to_string(cursor) + " " + Pm4::Name(header) + ":";
+                    for (std::size_t i = 0; i < now.size(); ++i) {
+                        if (seen && now[i] == last[i]) continue;
+                        char word[24];
+                        std::snprintf(word, sizeof(word), " +%02zx=%08x", i * 4, now[i]);
+                        line += word;
+                    }
                     seen = true;
                     last = now;
-                    char line[400];
-                    int length = std::snprintf(line, sizeof(line), "[pool] before serial=%llu queue=0x%x @%zu %s:", static_cast<unsigned long long>(submission.serial), submission.queue, cursor, Pm4::Name(header).c_str());
-                    for (std::size_t i = 0; i < 8 && length < 380; ++i) length += std::snprintf(line + length, sizeof(line) - length, " %08x", now[i]);
-                    std::fprintf(stderr, "%s\n", line);
+                    line += "\n";
+                    std::fwrite(line.data(), 1, line.size(), stderr);
                 }
             }
         }
