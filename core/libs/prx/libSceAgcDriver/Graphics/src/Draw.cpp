@@ -37,6 +37,10 @@
 #include <utility>
 
 namespace AgcDriver::Graphics {
+namespace GtavPhases {
+bool Enabled();
+void Add(int phase, std::chrono::steady_clock::time_point& start);
+}
 
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews) {
     std::uint64_t key = 14695981039346656037ull;
@@ -1258,10 +1262,15 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
+    const bool gtavOn = GtavPhases::Enabled();
+    auto gtavStart = std::chrono::steady_clock::now();
+    const auto gtavBegin = gtavStart;
     std::shared_ptr<StorageTexture> resident;
     try {
         resident = lookup();
+        if (gtavOn) GtavPhases::Add(10, gtavStart);
         if (resident != nullptr) materializeRegisterClear(context, color, *resident);
+        if (gtavOn) GtavPhases::Add(11, gtavStart);
     } catch (const std::exception& error) {
         static std::mutex reportMutex;
         static std::set<std::uint64_t> reported;
@@ -1269,6 +1278,7 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         if (reported.insert(color.address).second) std::fprintf(stderr, "[gpu] color target 0x%llx stays non-resident: %s\n", static_cast<unsigned long long>(color.address), error.what());
     }
     if (resident != nullptr) materializeCmaskClear(context, color, resident);
+    if (gtavOn) { GtavPhases::Add(12, gtavStart); auto b = gtavBegin; GtavPhases::Add(13, b); }
     if (profile) {
         const auto lookupUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lookupStart).count();
         ++outcome.targetLookups;

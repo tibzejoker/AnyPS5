@@ -1527,10 +1527,42 @@ LookupOutcomes& ThreadLookupOutcomes() {
     return outcomes;
 }
 
+
+namespace GtavPhases {
+constexpr int Count = 15;
+std::array<std::atomic<std::uint64_t>, Count> ns{};
+std::array<std::atomic<std::uint64_t>, Count> counts{};
+std::atomic<std::int64_t> lastReport{0};
+bool Enabled() { static const bool on = std::getenv("GTAV_DRAW_PHASES") != nullptr; return on; }
+void Add(int phase, std::chrono::steady_clock::time_point& start) {
+    const auto now = std::chrono::steady_clock::now();
+    ns[phase].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - start).count()), std::memory_order_relaxed);
+    counts[phase].fetch_add(1, std::memory_order_relaxed);
+    start = now;
+    const auto stamp = std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count();
+    auto last = lastReport.load(std::memory_order_relaxed);
+    if (last == 0) { lastReport.compare_exchange_strong(last, stamp); return; }
+    if (stamp - last < 10 || !lastReport.compare_exchange_strong(last, stamp)) return;
+    static constexpr const char* names[Count] = {"proved", "alias", "flush", "collect", "keys", "stamps", "equals", "direct", "unchanged-tail", "changed-rest", "rt-lookup", "rt-regclear", "rt-cmask", "rt-total", "refresh-calls"};
+    char line[1500];
+    int n = std::snprintf(line, sizeof(line), "[gtav-phases] 10 s:");
+    for (int i = 0; i < Count && n < 1400; ++i) {
+        const auto c = counts[i].exchange(0);
+        const auto t = ns[i].exchange(0);
+        if (c != 0) n += std::snprintf(line + n, sizeof(line) - n, " %s %llux %.0fms", names[i], static_cast<unsigned long long>(c), t / 1e6);
+    }
+    std::fprintf(stderr, "%s\n", line);
+}
+}
 bool StorageTexture::Refresh() {
+    const bool gtavOn = GtavPhases::Enabled();
+    auto gtavStart = std::chrono::steady_clock::now();
+    if (gtavOn) { auto dummy = gtavStart; GtavPhases::Add(14, dummy); }
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    if (refreshProved()) {
+    const bool gtavProved = refreshProved();
+    if (gtavOn) GtavPhases::Add(0, gtavStart);
+    if (gtavProved) {
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
         if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshProved, start);
@@ -1565,13 +1597,16 @@ bool StorageTexture::Refresh() {
             }
         }
     }
+    if (gtavOn) GtavPhases::Add(1, gtavStart);
     // No publish: the upload below reads the stored units from the unit shadow itself.
     const bool flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.get(), "storage refresh", PublishScope::None);
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
+    if (gtavOn) GtavPhases::Add(2, gtavStart);
     // `original` holds the guest bytes the image was last uploaded from or written back as; while the
     // guest memory and the DCC keys still match, the image content is current. Pages nobody wrote
     // since `generation` need no comparison.
     const auto current = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    if (gtavOn) GtavPhases::Add(3, gtavStart);
     // Per tracked layer: changed since its generation (a keys change makes every layer stale).
     std::vector<bool> changed(trackedLayers, false);
     // Per 64 KiB block of the surface (blockGenerations): stamped since its layer's generation, and
@@ -1613,6 +1648,7 @@ bool StorageTexture::Refresh() {
         const auto keysStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         keys = ProvedKeys();
         if (profile && descriptor.dccAddress != 0) LookupOutcomes::Add(LookupOutcomes::DccScan, keysStart);
+        if (gtavOn) GtavPhases::Add(4, gtavStart);
         if (keys != uploadedKeys) {
             changed.assign(trackedLayers, true);
             unchanged = false;
@@ -1658,6 +1694,7 @@ bool StorageTexture::Refresh() {
         // Unchanged bytes rescue an upload only when nothing else moved: with the keys changed
         // the same bytes read differently, and a changed unit holding pending results must take
         // the drop rule below (the image holds the results, `original` what the CPU wrote back).
+        if (gtavOn) GtavPhases::Add(5, gtavStart);
         bool pendingChanged = false;
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (changed[layer] && layerPending[layer]) pendingChanged = true;
@@ -1666,6 +1703,7 @@ bool StorageTexture::Refresh() {
             unchanged = true;
             stamped = false;
         }
+        if (gtavOn) GtavPhases::Add(6, gtavStart);
         // Only the direct path uploads the selected layers alone (see upload); the others replace
         // the whole image, so every pending layer's results are stored first.
         direct = keys == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr;
@@ -1692,11 +1730,13 @@ bool StorageTexture::Refresh() {
             }
         }
     }
+    if (gtavOn) GtavPhases::Add(7, gtavStart);
     if (unchanged) {
         ++Profile().storageReused;
         layerGeneration.assign(trackedLayers, current);
         refreshGeneration();
         takeRefreshProof(alias != nullptr);
+        if (gtavOn) GtavPhases::Add(8, gtavStart);
         if (profile) LookupOutcomes::Add(stamped ? LookupOutcomes::RefreshUnchanged : LookupOutcomes::RefreshCompared, start);
         return true;
     }
