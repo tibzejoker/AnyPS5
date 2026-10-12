@@ -16,9 +16,9 @@
 namespace ShaderRecompiler {
 namespace {
 
-constexpr std::int64_t PatchIndexCount = 256;
 constexpr std::int64_t LocalVertexIndexCount = 8192;
 constexpr std::int64_t TriangleFactorBytes = 16;
+constexpr std::int64_t QuadFactorBytes = 24;
 constexpr std::int64_t AddressLimit = 0xffffffffll;
 
 struct Affine {
@@ -351,7 +351,7 @@ std::uint32_t ComponentCount(IrOpcode opcode) {
 class Lowering {
 public:
     Lowering(IrProgram& program, const ShaderTessellationInputInfo& tessellation)
-        : program(program), tessellation(tessellation), stage(program.Resources().stage), evaluator(stage == IrShaderStage::TessellationControl ? tessellation.outputControlPoints : 0u, stage == IrShaderStage::Local ? LocalVertexIndexCount : PatchIndexCount) {}
+        : program(program), tessellation(tessellation), stage(program.Resources().stage), evaluator(stage == IrShaderStage::TessellationControl ? tessellation.outputControlPoints : 0u, stage == IrShaderStage::Local ? LocalVertexIndexCount : static_cast<std::int64_t>(tessellation.patchesPerGroup)) {}
 
     void Run() {
         for (IrBlock* block : program.BlockOrder()) {
@@ -483,10 +483,13 @@ private:
             case TessellationAttribute::EvaluationInput:
                 if (address.constant < 0 || end > outputs * controlStride) Fail("the domain shader reads off-chip memory outside its patch's control points", access.pc);
                 break;
-            case TessellationAttribute::Factor:
-                if (tessellation.domain != 1u || address.vertex != 0 || address.relative != TriangleFactorBytes || address.constant < 0 || end > TriangleFactorBytes) Fail("the hull shader writes tessellation factors outside its patch's triangle factors", access.pc);
+            case TessellationAttribute::Factor: {
+                const bool quads = tessellation.domain == 2u;
+                const auto factorBytes = quads ? QuadFactorBytes : TriangleFactorBytes;
+                if ((tessellation.domain != 1u && !quads) || address.vertex != 0 || address.relative != factorBytes || address.constant < 0 || end > factorBytes) Fail(quads ? "the hull shader writes tessellation factors outside its patch's quad factors" : "the hull shader writes tessellation factors outside its patch's triangle factors", access.pc);
                 requireFirstInvocation(access);
                 break;
+            }
             case TessellationAttribute::PatchOutput:
                 break;
             }

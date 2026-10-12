@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <functional>
 #include <optional>
@@ -704,6 +705,9 @@ bool ValidationKey(const Context& context, std::span<const CompiledShader> shade
             add(tessellation.domain);
             add(tessellation.partitioning);
             add(tessellation.outputTopology);
+            add(std::bit_cast<std::uint32_t>(tessellation.minLevel));
+            add(std::bit_cast<std::uint32_t>(tessellation.maxLevel));
+            add(tessellation.patchesPerGroup);
         }
     }
     return keyed;
