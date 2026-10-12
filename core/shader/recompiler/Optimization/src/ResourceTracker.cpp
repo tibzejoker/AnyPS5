@@ -359,8 +359,31 @@ private:
         return matched && stride >= 4u && stride % 4u == 0u && key->Type() == IrType::U32;
     }
 
+    static bool ReadsThroughDescriptor(const IrValue* value) {
+        std::vector<const IrValue*> pending{value};
+        std::vector<const IrValue*> seen;
+        while (!pending.empty()) {
+            const IrValue* current = pending.back()->Resolve();
+            pending.pop_back();
+            if (std::find(seen.begin(), seen.end(), current) != seen.end()) continue;
+            seen.push_back(current);
+            if (current->Opcode() == IrOpcode::ReadConstBuffer || current->Opcode() == IrOpcode::LoadAddressU32) return true;
+            for (std::size_t index = 0; index < current->ArgumentCount(); index++) pending.push_back(current->Argument(index));
+        }
+        return false;
+    }
+
     std::optional<KeyDomain> MatchKeyDomain(IrValue* key) {
         key = key->Resolve();
+        DescriptorSource direct;
+        direct.dwordCount = 1u;
+        direct.dwords[0] = key;
+        std::uint32_t badDword = 0;
+        if (ValidateSource(direct, badDword) && !ReadsThroughDescriptor(key)) {
+            KeyDomain domain{InternSource(direct), 0u, 4u};
+            domain.value = true;
+            return domain;
+        }
         std::uint32_t memoryIndex = 0;
         const MemoryInfo* memory = ScalarReadMemory(*key, memoryIndex);
         if (memory == nullptr) {

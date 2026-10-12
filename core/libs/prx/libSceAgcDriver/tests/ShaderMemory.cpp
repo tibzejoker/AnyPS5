@@ -686,7 +686,7 @@ struct TableGuest {
     std::array<std::array<std::uint32_t, 8>, 128> heap{};
     std::array<std::array<std::uint32_t, 4>, 3> materials{};
     std::array<std::uint32_t, 4> output{};
-    std::array<std::uint32_t, 16> srt{};
+    std::array<std::uint32_t, 20> srt{};
 };
 
 constexpr std::uint32_t TableFormat8888UNorm = 56;
@@ -697,6 +697,7 @@ constexpr std::uint32_t TableType2D = 9;
 constexpr std::uint32_t TableType3D = 10;
 
 const std::vector<std::uint32_t> TableMaterialCode{0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0x7e200500u, 0x93109010u, 0xf4200406u, 0x20000004u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xbf810000u};
+const std::vector<std::uint32_t> TableSrtKeyCode{0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0xf4000400u, 0xfa000040u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xbf810000u};
 const std::vector<std::uint32_t> TableWholeCode{0xf4080100u, 0xfa000000u, 0xf4080200u, 0xfa000010u, 0xf4080300u, 0xfa000020u, 0xf4080700u, 0xfa000030u, 0x7e200500u, 0x8f108510u, 0xf42c0502u, 0x20000000u, 0xf09c0f08u, 0x00450000u, 0xe0700000u, 0x80070000u, 0xbf810000u};
 
 std::vector<std::uint32_t> TableLoadCode(std::vector<std::uint32_t> code) {
@@ -971,6 +972,38 @@ void verifyImageTables() {
     const auto typedFault = typedMap[Abi::TableHeader(0) + Abi::TableFault];
     require((typedFault & Abi::PoisonFlag) != 0u && typed.result->imageTablePoison.at(typedFault & ~Abi::PoisonFlag).reason == static_cast<std::uint32_t>(Abi::PoisonReason::NotBuffer), "image tables: a typed table V# was not a whole-table fault");
     FillTableSrt(guest, heap.data(), 32u, 4u);
+}
+
+void verifyImageTableSrtKey() {
+    using namespace ShaderRecompiler;
+    namespace Abi = ImageTableAbi;
+    static TableTexture textures[2];
+    alignas(4096) static TableGuest guest;
+    auto& heap = guest.heap;
+    std::fill(heap.begin(), heap.end(), std::array<std::uint32_t, 8>{});
+    heap[0] = TableT(textures[0].bytes.data(), TableFormat8888UNorm, TableType2D);
+    heap[1] = TableT(textures[1].bytes.data(), TableFormat32UInt, TableType2D);
+    heap[2] = heap[1];
+    heap[3] = heap[0];
+    FillTableSrt(guest, heap.data(), 32u, 4u);
+    guest.srt[16] = 2u;
+    const auto userData = TableUserData(guest);
+    const auto request = TableRequest(TableSrtKeyCode, userData);
+    const auto plan = GetResourcePlan(request);
+    require(plan->info.images.size() == 1u && plan->info.images[0].table == 0u, "image table SRT key: the T# was not planned as a table");
+    const auto& column = plan->descriptorSources.at(plan->info.images[0].source).tableColumn;
+    require(column.has_value() && column->keyDomain.has_value(), "image table SRT key: a key read through the SRT has no key domain");
+    const auto compiled = CompileTable(request);
+    const auto& snapshot = compiled.capture->snapshot.tables.tables.at(0);
+    const auto outside = Abi::PoisonCode(static_cast<std::uint32_t>(Abi::PoisonReason::OutsideDomain));
+    require(snapshot.records == 4u && snapshot.keys == 4u && snapshot.codes.size() == 4u && (snapshot.codes[0] & Abi::PoisonFlag) == 0u && snapshot.codes[1] == outside && (snapshot.codes[2] & Abi::PoisonFlag) == 0u && snapshot.codes[3] == outside, "image table SRT key: the snapshot was not narrowed to the key read through the SRT");
+    const auto* images = TableBinding(*compiled.result, DescriptorRole::ImageTable);
+    require(images != nullptr && images->count == 2u, "image table SRT key: the binding holds other entries than the selected one and the first");
+    require(TableCovered(compiled.regions, &guest.srt[16], sizeof(std::uint32_t)), "image table SRT key: the key was not captured");
+    guest.srt[16] = 3u;
+    const auto moved = CompileTable(request);
+    const auto& movedSnapshot = moved.capture->snapshot.tables.tables.at(0);
+    require((movedSnapshot.codes[3] & Abi::PoisonFlag) == 0u && movedSnapshot.codes[2] == outside && movedSnapshot.codes[1] == outside && moved.result->spirv == compiled.result->spirv && moved.key == compiled.key, "image table SRT key: a changed key did not move the snapshot alone");
 }
 
 void verifyImageTableRegistration() {
@@ -3480,6 +3513,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--bindless") {
             verifyImageTableKeys();
             verifyImageTables();
+            verifyImageTableSrtKey();
             verifyImageTableRegistration();
             std::cout << "Image table keys, maps, records and registration passed\n";
             return 0;
