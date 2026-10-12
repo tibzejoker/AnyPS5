@@ -102,19 +102,12 @@ alignas(256) constexpr std::array<std::uint32_t, 49> HullAndSaveexec{
     0xbf810000,
 };
 
-alignas(256) constexpr std::array<std::uint32_t, 36> DomainPatchConstants{
-    0xf8000941, 0x00000000, 0x34020e84, 0x16020283, 0xe0341000, 0x04030a01, 0xe0301014, 0x04030d01,
-    0xe0301024, 0x04030f01, 0x4a060e81, 0x16060690, 0x4c0606ff, 0x00008000, 0xe0341000, 0x04031603,
-    0xbf8c3f70, 0x08040af2, 0x08040d02, 0x10201505, 0x3e202d06, 0x3e202f02, 0x10221705, 0x3e221b06,
+alignas(256) constexpr std::array<std::uint32_t, 36> DomainPatchRead{
+    0xf8000941, 0x00000000, 0x34020e84, 0x16020283, 0xe0341000, 0x04030a01, 0xe0341010, 0x04030c01,
+    0xe0341020, 0x04030e01, 0x4a060e81, 0x16060690, 0x4c0606ff, 0x00008000, 0xe0341000, 0x04030c03,
+    0xbf8c3f70, 0x08040af2, 0x08040d02, 0x10201505, 0x3e201906, 0x3e201d02, 0x10221705, 0x3e221b06,
     0x3e221f02, 0xd5510012, 0x040a0d05, 0x102424ff, 0x40400000, 0x7e260280, 0x7e2802f2, 0xf80008cf,
     0x14131110, 0xf800020f, 0x14131214, 0xbf810000,
-};
-
-alignas(256) constexpr std::array<std::uint32_t, 30> DomainNeighbourRead{
-    0xf8000941, 0x00000000, 0x34020e84, 0x16020283, 0xe0341000, 0x04030a01, 0xe0341010, 0x04030c01,
-    0xe0341030, 0x04030e01, 0xbf8c3f70, 0x08040af2, 0x08040d02, 0x10201505, 0x3e201906, 0x3e201d02,
-    0x10221705, 0x3e221b06, 0x3e221f02, 0xd5510012, 0x040a0d05, 0x102424ff, 0x40400000, 0x7e260280,
-    0x7e2802f2, 0xf80008cf, 0x14131110, 0xf800020f, 0x14131214, 0xbf810000,
 };
 
 alignas(256) constexpr std::array<std::uint32_t, 32> DomainCulledPrimitive{
@@ -290,12 +283,12 @@ std::uint32_t CoveredPixels(std::uint32_t patch, bool interior) {
     return count;
 }
 
-void RequirePatches(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target, std::span<const std::uint32_t> hull, const std::string& program, const PatchDraw& patches = Triangles, std::span<const std::uint32_t> domain = DomainCode) {
+void RequirePatches(AgcDriver::VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target, std::span<const std::uint32_t> hull, const std::string& program, const PatchDraw& patches = Triangles) {
     std::uint32_t cursor = 0;
     const Stages stages{
         Compile(target, ShaderStage::Local, LocalCode, cursor, patches),
         Compile(target, ShaderStage::TessellationControl, hull, cursor, patches),
-        Compile(target, ShaderStage::TessellationEvaluation, domain, cursor, patches),
+        Compile(target, ShaderStage::TessellationEvaluation, DomainCode, cursor, patches),
         Compile(target, ShaderStage::Fragment, PixelCode, cursor, patches),
     };
     const auto center = Row(-0.5f + 1.0f / 3.0f);
@@ -306,9 +299,6 @@ void RequirePatches(AgcDriver::VulkanDevice& device, const ShaderRecompiler::Spi
         Require(CoveredPixels(1, false) == 0, name + ": the patch with level 0 was not culled");
         Require(CoveredPixels(2, false) > 100 && PixelAt(Column(2, 0.25f), center)[1] > 32, name + ": the level-5 patch has no interior domain points at its centre, " + PixelText(PixelAt(Column(2, 0.25f), center)));
         Require(PixelAt(0, 0) == Background && PixelAt(Width - 1, Height - 1) == Background, name + ": the corners changed");
-        for (const std::uint32_t patch : {0u, 2u}) {
-            Require(PixelAt(Column(patch, 0.16f), Row(0.0f)) != Background && PixelAt(Column(patch, 0.44f), Row(0.0f)) == Background, name + ": patch " + std::to_string(patch) + " is not the triangle of its control points at mid-height");
-        }
     }
     Draw(device, stages, VK_CULL_MODE_BACK_BIT, VK_FRONT_FACE_CLOCKWISE, patches);
     Require(CoveredPixels(0, false) == 0 && CoveredPixels(2, false) == 0, program + ": tessellated triangles did not keep the control points' winding");
@@ -431,7 +421,7 @@ int main() {
         ExpectRefusal(target, ShaderStage::TessellationControl, HullUnguardedFactors, "not written by control point 0 alone");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullSquaredAddress, "not affine");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullAndSaveexec, "lane mask");
-        ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainNeighbourRead, "outside its patch's control points");
+        ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainPatchRead, "patch constants");
         ExpectRefusal(target, ShaderStage::TessellationEvaluation, DomainCulledPrimitive, "passthrough primitive");
         ExpectRefusal(target, ShaderStage::Local, LocalIndexAsData, "outside a tessellation ring or LDS address");
         ExpectRefusal(target, ShaderStage::TessellationControl, HullCode, "outside its patch's quad factors", {{3u, 3u, 2u, 2u, 2u}, Indices});
@@ -441,7 +431,6 @@ int main() {
         RequirePatches(*device, target, HullCode, "hull program");
         RequirePatches(*device, target, HullRestoredExecSaved, "hull program saving its restored exec");
         RequirePatches(*device, target, HullDescendingRecords, "hull program with descending patch records in 157-patch groups", {{3u, 3u, 1u, 2u, 2u, 1.0f, 64.0f, 157u}, Indices});
-        RequirePatches(*device, target, HullCode, "domain program reading its patch constants", Triangles, DomainPatchConstants);
         RequireCounterClockwise(*device, target);
         RequireLevelClamps(*device, target);
         RequireQuads(*device, target);

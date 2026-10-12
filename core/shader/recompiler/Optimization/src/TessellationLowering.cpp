@@ -383,7 +383,6 @@ public:
         deadCodeEliminator.Eliminate(program);
         program.Metadata().tessellationLocalStride = localStride;
         program.Metadata().tessellationControlStride = controlStride;
-        program.Metadata().tessellationPatchStride = patchRecordStride;
     }
 
 private:
@@ -449,15 +448,10 @@ private:
             if (access.kind == TessellationAttribute::LocalOutput) agree(localStride, access.address.relative, access.pc);
             if (access.kind == TessellationAttribute::ControlInput && access.address.vertex != 0) agree(localStride, access.address.vertex, access.pc);
             if (access.kind == TessellationAttribute::ControlOutput && access.address.vertex != 0) agree(controlStride, access.address.vertex, access.pc);
-            if (access.kind == TessellationAttribute::EvaluationInput && readsOwnControlPoints(access, outputs)) agree(controlStride, access.address.relative / outputs, access.pc);
-        }
-        for (auto& access : accesses) {
-            if (access.kind != TessellationAttribute::EvaluationInput || readsOwnControlPoints(access, outputs)) continue;
-            const auto controlRecords = outputs * static_cast<std::int64_t>(controlStride);
-            if (controlStride == 0u) Fail("the domain shader reads patch constants but no control point, so the patch-constant location is unknown", access.pc);
-            if (access.address.relative == controlRecords && access.address.constant < static_cast<std::int64_t>(tessellation.patchesPerGroup) * controlRecords) continue;
-            if (access.address.relative == 0 || access.address.constant < controlRecords) Fail("domain shader reads of patch constants outside a per-patch record are unsupported", access.pc);
-            access.kind = TessellationAttribute::PatchInput;
+            if (access.kind == TessellationAttribute::EvaluationInput) {
+                if (access.address.relative <= 0 || access.address.relative % outputs != 0) Fail("domain shader reads of patch constants or other patches are unsupported", access.pc);
+                agree(controlStride, access.address.relative / outputs, access.pc);
+            }
         }
         std::optional<std::int64_t> patchStride;
         std::int64_t patchLowest = AddressLimit;
@@ -496,24 +490,11 @@ private:
                 requireFirstInvocation(access);
                 break;
             }
-            case TessellationAttribute::PatchInput:
-                if (patchStride && *patchStride != address.relative) Fail("inconsistent patch-constant stride", access.pc);
-                patchStride = address.relative;
-                patchLowest = std::min(patchLowest, address.constant);
-                patchHighest = std::max(patchHighest, end);
-                break;
             case TessellationAttribute::PatchOutput:
                 break;
             }
         }
         if (patchStride && (*patchStride == 0 || std::abs(*patchStride) < patchHighest - patchLowest)) Fail("patch-constant records of neighbouring patches overlap", 0u);
-        if (patchStride && (std::abs(*patchStride) & 3) != 0) Fail("unaligned patch-constant stride", 0u);
-        if (patchStride) patchRecordStride = static_cast<std::uint32_t>(std::abs(*patchStride));
-    }
-
-    static bool readsOwnControlPoints(const Access& access, std::int64_t outputs) {
-        const auto& address = access.address;
-        return address.relative > 0 && address.relative % outputs == 0 && address.constant >= 0 && address.constant + 4 * static_cast<std::int64_t>(access.components) <= address.relative;
     }
 
     void requireRelativeIndependence(const std::vector<IrValue*>& bases) {
@@ -630,7 +611,6 @@ private:
     std::vector<Access> accesses;
     std::uint32_t localStride = 0;
     std::uint32_t controlStride = 0;
-    std::uint32_t patchRecordStride = 0;
 };
 
 }
