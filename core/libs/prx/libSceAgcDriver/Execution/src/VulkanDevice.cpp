@@ -3247,6 +3247,20 @@ void WatchMemory(std::uint64_t programAddress) {
         contents.insert(contents.end(), bytes, bytes + ranges[i].bytes);
     }
     if (history.empty() || history.back().second != contents) {
+        if (std::getenv("GTAV_WATCH_PRINT") != nullptr) {
+            std::string text = "[watch] after dispatch of 0x";
+            char word[16];
+            std::snprintf(word, sizeof(word), "%llx:", static_cast<unsigned long long>(programAddress));
+            text += word;
+            for (std::size_t i = 0; i + 4 <= contents.size() && i < 64; i += 4) {
+                std::uint32_t value = 0;
+                std::memcpy(&value, contents.data() + i, 4);
+                std::snprintf(word, sizeof(word), " %08x", value);
+                text += word;
+            }
+            text += "\n";
+            std::fwrite(text.data(), 1, text.size(), stderr);
+        }
         history.emplace_back(programAddress, std::move(contents));
         if (history.size() > 64) history.pop_front();
     }
