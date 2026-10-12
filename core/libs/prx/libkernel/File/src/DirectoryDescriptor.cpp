@@ -87,6 +87,15 @@ void ForgetDirectoryDescriptor(int fd) {
     g_directoryCount = g_directories.size();
 }
 
+void DuplicateDirectoryDescriptor(int from, int to) {
+    if (g_directoryCount == 0) return;
+    std::lock_guard lock(g_mutex);
+    const auto found = g_directories.find(from);
+    if (found == g_directories.end()) return;
+    g_directories[to] = found->second;
+    g_directoryCount = g_directories.size();
+}
+
 std::optional<std::int64_t> SeekDirectoryDescriptor(int fd, std::int64_t offset, int whence) {
     constexpr int SeekSet = 0;
     constexpr int SeekCurrent = 1;

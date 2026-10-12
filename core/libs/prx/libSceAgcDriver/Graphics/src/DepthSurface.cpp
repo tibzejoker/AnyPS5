@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -29,19 +30,19 @@ Recorder* RecorderFor(const Context& context) {
 
 class DepthSurface {
 public:
-    DepthSurface(const Context& context, const DepthTarget& target) : context(context), target(target) {
+    DepthSurface(const Context& context, const DepthTarget& target) : context(context), target(target), hostFormat(HostDepthFormat(context, target.format)) {
         this->context.bufferPool.reset();
         VkFormatProperties properties{};
-        context.formatProperties(context.physical, target.format, &properties);
-        Require((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0, "depth/stencil format " + std::to_string(target.format) + " cannot be an attachment on this device");
-        Require((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0, "depth/stencil format " + std::to_string(target.format) + " cannot be sampled on this device");
+        context.formatProperties(context.physical, hostFormat, &properties);
+        Require((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0, "depth/stencil format " + std::to_string(hostFormat) + " cannot be an attachment on this device");
+        Require((properties.optimalTilingFeatures & VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT) != 0, "depth/stencil format " + std::to_string(hostFormat) + " cannot be sampled on this device");
         Require(target.extent.width <= context.limits.maxFramebufferWidth && target.extent.height <= context.limits.maxFramebufferHeight, "depth target exceeds framebuffer limits");
         const VkImageAspectFlags aspects = VK_IMAGE_ASPECT_DEPTH_BIT | (target.stencilAddress != 0 ? VK_IMAGE_ASPECT_STENCIL_BIT : 0u);
         try {
             VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-            if (SampleLocationsCompatibleDepth(context, target.format, target.samples)) info.flags = VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
+            if (SampleLocationsCompatibleDepth(context, hostFormat, target.samples)) info.flags = VK_IMAGE_CREATE_SAMPLE_LOCATIONS_COMPATIBLE_DEPTH_BIT_EXT;
             info.imageType = VK_IMAGE_TYPE_2D;
-            info.format = target.format;
+            info.format = hostFormat;
             info.extent = {target.extent.width, target.extent.height, 1};
             info.mipLevels = 1;
             info.arrayLayers = 1;
@@ -61,7 +62,7 @@ public:
             VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
             viewInfo.image = image;
             viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-            viewInfo.format = target.format;
+            viewInfo.format = hostFormat;
             viewInfo.subresourceRange = {aspects, 0, 1, 0, 1};
             Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView depth");
             auto* recorder = RecorderFor(context);
@@ -134,7 +135,7 @@ public:
             throw std::runtime_error(text);
         }
         const auto viewType = resource.dimension == TextureDimension::k2DArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
-        auto texture = std::make_shared<Texture>(context, image, target.format, stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, components, viewType);
+        auto texture = std::make_shared<Texture>(context, image, hostFormat, stencil ? VK_IMAGE_ASPECT_STENCIL_BIT : VK_IMAGE_ASPECT_DEPTH_BIT, components, viewType);
         textures.emplace(key, texture);
         return texture;
     }
@@ -178,6 +179,7 @@ public:
 
     const Context context;
     const DepthTarget target;
+    const VkFormat hostFormat;
     VkImage image = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
@@ -386,6 +388,12 @@ std::set<std::uint64_t>& clearedHtiles() {
     return *cleared;
 }
 
+std::atomic<std::uint64_t> surfacesSerial{0};
+
+}
+
+std::uint64_t DepthSurfacesSerial() {
+    return surfacesSerial.load(std::memory_order_acquire);
 }
 
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel) {
@@ -406,6 +414,32 @@ bool SampleLocationsCompatibleDepth(const Context& context, VkFormat format, std
     return (properties.sampleCounts & samples) != 0;
 }
 
+VkFormat HostDepthFormat(const Context& context, VkFormat format) {
+    if (format != VK_FORMAT_D16_UNORM_S8_UINT) return format;
+    static std::mutex mutex;
+    static std::map<VkPhysicalDevice, VkFormat> chosen;
+    std::lock_guard lock(mutex);
+    if (const auto found = chosen.find(context.physical); found != chosen.end()) return found->second;
+    constexpr VkFormatFeatureFlags required = VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    auto host = format;
+    for (const auto candidate : {VK_FORMAT_D16_UNORM_S8_UINT, VK_FORMAT_D24_UNORM_S8_UINT, VK_FORMAT_D32_SFLOAT_S8_UINT}) {
+        VkFormatProperties properties{};
+        context.formatProperties(context.physical, candidate, &properties);
+        if ((properties.optimalTilingFeatures & required) != required) continue;
+        host = candidate;
+        break;
+    }
+    chosen.emplace(context.physical, host);
+    return host;
+}
+
+float HostDepthBiasConstant(const Context& context, VkFormat format, float constant) {
+    const auto host = HostDepthFormat(context, format);
+    if (constant == 0.0f || host == format) return constant;
+    Require(host == VK_FORMAT_D24_UNORM_S8_UINT, "a constant depth bias on a 16-bit depth target with stencil that the device stores as 32-bit float depth is not implemented");
+    return constant * 256.0f;
+}
+
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) {
     std::lock_guard lock(surfacesMutex());
     const bool cleared = target.htileAddress != 0 && clearedHtiles().erase(target.htileAddress) != 0;
@@ -417,6 +451,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
         surface->ApplyFastClear();
         return surface->view;
     }
+    surfacesSerial.fetch_add(1, std::memory_order_release);
     surfaces().push_back(std::make_unique<DepthSurface>(context, target));
     surfaces().back()->clearDepth = target.clearDepth;
     surfaces().back()->clearStencil = target.clearStencil;
@@ -444,6 +479,7 @@ void NoteHtileDepthClear(std::uint64_t htileAddress) {
 
 void ClearDepthSurfaces(VkDevice device) {
     std::lock_guard lock(surfacesMutex());
+    surfacesSerial.fetch_add(1, std::memory_order_release);
     std::erase_if(surfaces(), [&](const auto& surface) { return surface->context.device == device; });
     std::erase_if(planeCopies(), [&](const auto& entry) { return std::get<0>(entry.first) == device; });
 }

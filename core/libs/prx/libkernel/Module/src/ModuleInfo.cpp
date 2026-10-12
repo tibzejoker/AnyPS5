@@ -205,6 +205,12 @@ std::uint64_t GuestSegmentBytes() {
     dl_iterate_phdr(AddGuestSegmentBytes, &bytes);
     return bytes;
 }
+
+bool SystemImage(const GuestImage& image) {
+    const auto* name = static_cast<const link_map*>(image.native)->l_name;
+    const std::string_view path = name ? name : "";
+    return !path.empty() && !path.ends_with(GuestModuleSuffix);
+}
 #else
 bool SectionNamed(const IMAGE_SECTION_HEADER& section, const char* name) {
     return std::strncmp(reinterpret_cast<const char*>(section.Name), name, IMAGE_SIZEOF_SHORT_NAME) == 0;
@@ -341,7 +347,45 @@ std::uint64_t GuestSegmentBytes() {
     }
     return bytes;
 }
+
+bool SystemImage(const GuestImage& image) {
+    if (image.address == reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr))) return false;
+    constexpr std::wstring_view suffix = L".guest.prx";
+    const auto path = ModulePath(reinterpret_cast<HMODULE>(image.address));
+    return path.size() < suffix.size() || CompareStringOrdinal(path.data() + path.size() - suffix.size(), static_cast<int>(suffix.size()), suffix.data(), static_cast<int>(suffix.size()), TRUE) != CSTR_EQUAL;
+}
 #endif
+
+int FillModuleInfo(KernelModule handle, ModuleInfo* info, bool titleOnly) {
+    if (!info) return SCE_KERNEL_ERROR_EFAULT;
+    if (info->st_size != sizeof(ModuleInfo)) return SCE_KERNEL_ERROR_EINVAL;
+    for (const auto& image : GuestImages()) {
+        if (ModuleIdForImage_nid_no_patch(image.native) != handle) continue;
+        if (titleOnly && SystemImage(image)) return SCE_KERNEL_ERROR_EPERM;
+        ModuleInfo result{};
+        result.st_size = sizeof(ModuleInfo);
+#ifdef _WIN32
+        if (!Fill(image.address, result)) return SCE_KERNEL_ERROR_ESRCH;
+#else
+        ImageSearch<ModuleInfo> search{image.address, &result, false};
+        dl_iterate_phdr(FindImage<ModuleInfo>, &search);
+        if (!search.found) return SCE_KERNEL_ERROR_ESRCH;
+#endif
+        *info = result;
+        return 0;
+    }
+    return SCE_KERNEL_ERROR_ESRCH;
+}
+
+int FillModuleList(KernelModule* handles, std::size_t count, std::size_t* actual, bool titleOnly) {
+    if (!handles || !actual) return SCE_KERNEL_ERROR_EFAULT;
+    auto images = GuestImages();
+    if (titleOnly) std::erase_if(images, SystemImage);
+    for (std::size_t i = 0; i < images.size() && i < count; ++i) handles[i] = ModuleIdForImage_nid_no_patch(images[i].native);
+    if (images.size() > count) return SCE_KERNEL_ERROR_ENOMEM;
+    *actual = images.size();
+    return 0;
+}
 
 }
 
@@ -369,32 +413,19 @@ int APS5_VABI sceKernelGetModuleInfoFromAddr(std::uint64_t address, int flags, M
 }
 
 int APS5_VABI sceKernelGetModuleList(KernelModule* handles, std::size_t count, std::size_t* actual) {
-    if (!handles || !actual) return SCE_KERNEL_ERROR_EFAULT;
-    const auto images = GuestImages();
-    for (std::size_t i = 0; i < images.size() && i < count; ++i) handles[i] = ModuleIdForImage_nid_no_patch(images[i].native);
-    if (images.size() > count) return SCE_KERNEL_ERROR_ENOMEM;
-    *actual = images.size();
-    return 0;
+    return FillModuleList(handles, count, actual, false);
+}
+
+int APS5_VABI sceKernelGetModuleList2(KernelModule* handles, std::size_t count, std::size_t* actual) {
+    return FillModuleList(handles, count, actual, true);
 }
 
 int APS5_VABI sceKernelGetModuleInfo(KernelModule handle, ModuleInfo* info) {
-    if (!info) return SCE_KERNEL_ERROR_EFAULT;
-    if (info->st_size != sizeof(ModuleInfo)) return SCE_KERNEL_ERROR_EINVAL;
-    for (const auto& image : GuestImages()) {
-        if (ModuleIdForImage_nid_no_patch(image.native) != handle) continue;
-        ModuleInfo result{};
-        result.st_size = sizeof(ModuleInfo);
-#ifdef _WIN32
-        if (!Fill(image.address, result)) return SCE_KERNEL_ERROR_ESRCH;
-#else
-        ImageSearch<ModuleInfo> search{image.address, &result, false};
-        dl_iterate_phdr(FindImage<ModuleInfo>, &search);
-        if (!search.found) return SCE_KERNEL_ERROR_ESRCH;
-#endif
-        *info = result;
-        return 0;
-    }
-    return SCE_KERNEL_ERROR_ESRCH;
+    return FillModuleInfo(handle, info, false);
+}
+
+int APS5_VABI sceKernelGetModuleInfo2(KernelModule handle, ModuleInfo* info) {
+    return FillModuleInfo(handle, info, true);
 }
 
 std::uint64_t GuestImageSegmentBytes_nid_no_patch() {

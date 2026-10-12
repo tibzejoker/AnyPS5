@@ -21,6 +21,13 @@
 #include "prx/libc/include/WindowsScanning.hpp"
 #endif
 
+#if defined(__GLIBC__)
+extern "C" {
+int __isoc99_vsscanf(const char*, const char*, std::va_list) noexcept;
+int __isoc99_vfscanf(std::FILE*, const char*, std::va_list);
+}
+#endif
+
 namespace {
 
 #ifndef _WIN32
@@ -30,7 +37,7 @@ bool HasGuestWideFormat(const char* format) {
         ++format;
         if (*format == '%') { ++format; continue; }
         while (*format && std::strchr("-+ #0'0123456789.*$", *format)) ++format;
-        if (*format == 'S' || *format == 'C' || (*format == 'l' && (format[1] == 's' || format[1] == 'c'))) return true;
+        if (*format == 'S' || *format == 'C' || *format == 'm' || (*format == 'l' && (format[1] == 's' || format[1] == 'c'))) return true;
         if (*format) ++format;
     }
     return false;
@@ -63,6 +70,32 @@ std::string HostLength(const std::string& length, char conversion) {
 #endif
     return length;
 }
+
+int HostVsscanf(const char* input, const char* format, std::va_list args) {
+#if defined(__GLIBC__)
+    return __isoc99_vsscanf(input, format, args);
+#else
+    return std::vsscanf(input, format, args);
+#endif
+}
+
+int HostSscanf(const char* input, const char* format, ...) {
+    std::va_list args;
+    va_start(args, format);
+    const int result = HostVsscanf(input, format, args);
+    va_end(args);
+    return result;
+}
+
+#ifndef _WIN32
+int HostVfscanf(std::FILE* stream, const char* format, std::va_list args) {
+#if defined(__GLIBC__)
+    return __isoc99_vfscanf(stream, format, args);
+#else
+    return std::vfscanf(stream, format, args);
+#endif
+}
+#endif
 
 template <typename NextPointer, typename NextCapacity>
 int ScanGuest(const char* buffer, const char* format, bool secure, NextPointer nextPointer, NextCapacity nextCapacity) {
@@ -147,7 +180,7 @@ int ScanGuest(const char* buffer, const char* format, bool secure, NextPointer n
         directive += specifier;
         directive += "%n";
         int consumed = -1;
-        const int matched = suppress ? std::sscanf(input, directive.c_str(), &consumed) : std::sscanf(input, directive.c_str(), target, &consumed);
+        const int matched = suppress ? HostSscanf(input, directive.c_str(), &consumed) : HostSscanf(input, directive.c_str(), target, &consumed);
         if (consumed < 0 || (!suppress && matched != 1)) return finish(!converted && *input == '\0' ? EOF : assigned);
         if (capped && conversion != 'c') {
             const char next = input[consumed];
@@ -257,7 +290,7 @@ int APS5_VABI fscanf_nid_postfix(FileStream* stream, const char* format, ...) {
     RejectGuestWideScan(format);
     std::va_list args;
     va_start(args, format);
-    const int result = std::vfscanf(native, format, args);
+    const int result = HostVfscanf(native, format, args);
     va_end(args);
 #endif
     stream->SyncStatus();
@@ -341,7 +374,7 @@ int APS5_VABI vsscanf_nid_postfix(const char* input, const char* format, VaList*
     RejectGuestWideScan(format);
     std::va_list copy;
     va_copy(copy, *reinterpret_cast<std::va_list*>(args));
-    const int result = std::vsscanf(input, format, copy);
+    const int result = HostVsscanf(input, format, copy);
     va_end(copy);
     return result;
 #endif
@@ -360,7 +393,7 @@ int APS5_VABI sscanf_nid_postfix(const char* input, const char* format, ...) {
     RejectGuestWideScan(format);
     std::va_list args;
     va_start(args, format);
-    const int result = std::vsscanf(input, format, args);
+    const int result = HostVsscanf(input, format, args);
     va_end(args);
     return result;
 }

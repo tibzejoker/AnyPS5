@@ -50,6 +50,45 @@ enum class ForbiddenInstruction {
     Return,
 };
 
+static constexpr std::array<std::uint8_t, 62> SDK_MPROTECT_INLINE{
+    0x55, 0x48, 0x89, 0xE5, 0x53, 0x50, 0x89, 0xD1, 0x49, 0x89, 0xF0, 0x48, 0x89, 0xFE,
+    0xF6, 0xC1, 0x04, 0x75, 0x31, 0x48, 0x63, 0xD1, 0xB8, 0x4A, 0x00, 0x00, 0x00,
+    0x48, 0x89, 0xF7, 0x4C, 0x89, 0xC6, 0x45, 0x31, 0xD2, 0x45, 0x31, 0xC0, 0x45, 0x31, 0xC9,
+    0x0F, 0x05, 0x0F, 0x93, 0xC1, 0x48, 0x89, 0xC3, 0x48, 0xF7, 0xDB, 0x84, 0xC9,
+    0x48, 0x0F, 0x45, 0xD8, 0x48, 0x85, 0xDB,
+};
+
+static constexpr std::array<std::uint8_t, 37> SDK_MMAP_INLINE{
+    0x49, 0x63, 0xD6, 0x4C, 0x63, 0xD1, 0x4D, 0x63, 0xC0, 0xB8, 0xDD, 0x01, 0x00, 0x00,
+    0x48, 0x89, 0xDE, 0x0F, 0x05, 0x48, 0x89, 0xC1, 0x0F, 0x93, 0xC2, 0x48, 0xF7, 0xD8,
+    0x84, 0xD2, 0x48, 0x0F, 0x45, 0xC1, 0x48, 0x85, 0xC0,
+};
+
+static constexpr std::array<std::uint8_t, 43> SDK_MMAP_EXEC_INLINE{
+    0x44, 0x89, 0xF0, 0x83, 0xE0, 0xFB, 0x48, 0x63, 0xD0, 0x4C, 0x63, 0xD1, 0x4D, 0x63, 0xC0,
+    0xB8, 0xDD, 0x01, 0x00, 0x00, 0x48, 0x89, 0xDE, 0x0F, 0x05, 0x0F, 0x93, 0xC1,
+    0x49, 0x89, 0xC7, 0x49, 0xF7, 0xDF, 0x84, 0xC9, 0x4C, 0x0F, 0x45, 0xF8, 0x4D, 0x85, 0xFF,
+};
+
+template<std::size_t TSize>
+static bool MatchesSdkInlineStub(const std::vector<std::uint8_t>& code, std::size_t syscallOffset, std::size_t limit,
+                                  const std::array<std::uint8_t, TSize>& pattern, std::size_t beforeSyscall,
+                                  const std::vector<Codegen::InstructionMatch>& matches, FileByteOffset codeOffset) {
+    if (syscallOffset < beforeSyscall || syscallOffset > limit) return false;
+    const auto start = syscallOffset - beforeSyscall;
+    if (pattern.size() > limit - start || !std::equal(pattern.begin(), pattern.end(), code.begin() + static_cast<std::ptrdiff_t>(start))) return false;
+    const auto instruction = std::lower_bound(matches.begin(), matches.end(), codeOffset + start,
+        [](const Codegen::InstructionMatch& match, FileByteOffset offset) { return match.Offset < offset; });
+    return instruction != matches.end() && instruction->Offset == codeOffset + start;
+}
+
+static bool IsSdkMmanSyscallStub(const std::vector<std::uint8_t>& code, std::size_t syscallOffset, std::size_t limit,
+                                 const std::vector<Codegen::InstructionMatch>& matches, FileByteOffset codeOffset) {
+    return MatchesSdkInlineStub(code, syscallOffset, limit, SDK_MPROTECT_INLINE, 42, matches, codeOffset)
+        || MatchesSdkInlineStub(code, syscallOffset, limit, SDK_MMAP_INLINE, 17, matches, codeOffset)
+        || MatchesSdkInlineStub(code, syscallOffset, limit, SDK_MMAP_EXEC_INLINE, 23, matches, codeOffset);
+}
+
 static ForbiddenInstruction ClassifyForbiddenInstruction(
     const std::vector<std::uint8_t>& codeSection,
     const std::size_t opcodeOffset,
@@ -158,7 +197,8 @@ std::vector<std::size_t> SyscallScanner::ScanCodeSectionForSyscalls(
         if (kind == ForbiddenInstruction::None)
             continue;
 
-        if (_trapSdkStubs && kind == ForbiddenInstruction::Invocation && IsSdkSyscallStub(codeSection, opcode)) {
+        if (_trapSdkStubs && kind == ForbiddenInstruction::Invocation &&
+            (IsSdkSyscallStub(codeSection, opcode) || IsSdkMmanSyscallStub(codeSection, opcode, limit, matches, codeSectionOffset))) {
             trapped.push_back(opcode);
             std::cout << "Trapping SDK syscall instruction at code offset 0x" << std::hex << match.Offset << std::dec << '\n';
             continue;

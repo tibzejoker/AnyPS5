@@ -338,6 +338,14 @@ int APS5_VABI sceKernelGetCurrentCpu(void) {
     return GuestCpuFromHost(index, scePthreadSelf()->affinity.load(std::memory_order_relaxed));
 }
 
+int APS5_VABI sceKernelGetMainSocId(void) {
+    return 0;
+}
+
+int APS5_VABI sceKernelGetCpumode(void) {
+    return 0;
+}
+
 std::uint64_t APS5_VABI sceKernelGetGPI(void) {
     return gpoBits.load(std::memory_order_relaxed);
 }

@@ -10,8 +10,9 @@ from pathlib import PurePosixPath
 from urllib.parse import unquote
 
 RULES = {
-    "comment": ("error", "docs/dev/CONVENTIONS.md", "Comments are only for technical debt, so they need a change to docs/dev/TechnicalDebt.md in the same pull request; #endif and namespace ends are always allowed"),
-    "silent-stub": ("error", "CONTRIBUTING.md#code", "Unimplemented exports call NotImplemented_nid_no_patch(__func__); silent stubs are listed in docs/dev/TechnicalDebt.md#silent-stubs, by their file or by name with a path in their library"),
+    "comment": ("error", "docs/dev/CONVENTIONS.md", "Comments are only for technical debt, so they need a change to docs/dev/TechnicalDebt.md or docs/dev/debt/ in the same pull request; #endif and namespace ends are always allowed"),
+    "silent-stub": ("error", "CONTRIBUTING.md#code", "Unimplemented exports call NotImplemented_nid_no_patch(__func__); silent stubs are listed under Silent stubs in docs/dev/debt/<library>.md, by their file or by name with a path in their library"),
+    "debt-file": ("error", "CONTRIBUTING.md#documentation", "Technical debt about one library or component goes in docs/dev/debt/<name>.md, named after the first core/ path it links: <library> for core/libs/prx/<library>, otherwise <component> for core/<component>"),
     "duplicate-export": ("error", "CONTRIBUTING.md#code", "Already exported by another library: remove the copy, or use APS5_DUMMY_FUN if nothing is left"),
     "system-dependency": ("error", "CONTRIBUTING.md#code", "Third-party code is a submodule under 3rdparty/ built from source, not found on the system"),
     "title-specific": ("error", "CONTRIBUTING.md#code", "Implement the general behaviour, not what one title needs; title-specific code belongs in its sce_module"),
@@ -29,6 +30,9 @@ CPP = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx", ".inl", ".ipp"}
 IMAGES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".svg", ".webp", ".ico", ".tga", ".dds"}
 NOTES = {".md", ".markdown", ".rst", ".log", ".patch", ".diff"}
 AGENT_FILES = {"AGENTS.md", "CLAUDE.md", "GEMINI.md", ".cursorrules", "copilot-instructions.md"}
+DEBT = "docs/dev/TechnicalDebt.md"
+DEBT_DIR = "docs/dev/debt/"
+DEBT_TARGET = re.compile(r"\]\((?:\.\./)+(core/[^)#\s]+)")
 
 CONVENTIONAL = re.compile(r"^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^)]+\))?!?: \S")
 STRINGS = re.compile(r'"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'')
@@ -58,7 +62,7 @@ class Check:
         self.added = defaultdict(list)
         self.status = {}
         self.numstat = {}
-        entries = [entry.split("\t", 1) for entry in git("ls-tree", "-rz", head).split("\0") if entry]
+        entries = [entry.split("\t", 1) for entry in git("ls-tree", "-rz", "--full-tree", head).split("\0") if entry]
         self.modes = {path: metadata.split()[0] for metadata, path in entries}
         self.tree = set(self.modes)
         self.dirs = {str(parent) for path in self.tree for parent in PurePosixPath(path).parents}
@@ -91,7 +95,7 @@ class Check:
         return git("show", f"{self.head}:{path}")
 
     def code(self):
-        debt = silent_stub_debt(self.show("docs/dev/TechnicalDebt.md")) if "docs/dev/TechnicalDebt.md" in self.tree else []
+        debt = [entry for path in sorted(self.tree) if is_debt(path) for entry in silent_stub_debt(self.show(path), path)]
         exports = {}
         for path, lines in self.files(lambda p: p.suffix in CPP):
             core = path.startswith("core/") and "tests" not in PurePosixPath(path).parts
@@ -118,14 +122,14 @@ class Check:
             for number, text in lines:
                 if "#" in STRINGS.sub('""', text) and not text.startswith("#!"):
                     self.report("comment", path, number)
-        if "docs/dev/TechnicalDebt.md" in self.status:
+        if any(is_debt(path) for path in self.status):
             self.findings = [finding for finding in self.findings if finding[0] != "comment"]
 
     def duplicates(self, exports):
         if not exports:
             return
         pattern = r"(^|[^[:alnum:]_])APS5_VABI[[:space:]]+(" + "|".join(exports) + r")[[:space:]]*\("
-        result = subprocess.run(["git", "grep", "-nE", pattern, self.head, "--", "core/libs/prx"], capture_output=True, encoding="utf-8", errors="replace")
+        result = subprocess.run(["git", "grep", "-nE", "--full-name", pattern, self.head, "--", ":(top)core/libs/prx"], capture_output=True, encoding="utf-8", errors="replace")
         for line in result.stdout.splitlines():
             _, path, number, text = line.split(":", 3)
             name = EXPORT.search(text).group(1)
@@ -172,6 +176,9 @@ class Check:
     def docs(self):
         for path, lines in self.files(lambda p: p.suffix == ".md"):
             for number, text in lines:
+                name = debt_name(text) if is_debt(path) and text.startswith("- ") else None
+                if name and path != f"{DEBT_DIR}{name}.md":
+                    self.report("debt-file", path, number, f"{DEBT_DIR}{name}.md")
                 for target, resolved in links(path, text):
                     if resolved not in self.tree and resolved not in self.dirs:
                         self.report("doc-link", path, number, target)
@@ -232,7 +239,19 @@ def links(path, text):
     return result
 
 
-def silent_stub_debt(text):
+def is_debt(path):
+    return path == DEBT or (path.startswith(DEBT_DIR) and path.endswith(".md") and "/" not in path[len(DEBT_DIR):])
+
+
+def debt_name(text):
+    match = DEBT_TARGET.search(text)
+    if not match:
+        return None
+    parts = match.group(1).split("/")
+    return parts[3] if parts[1:3] == ["libs", "prx"] and len(parts) > 3 else parts[1]
+
+
+def silent_stub_debt(text, path=DEBT):
     debt = []
     section_level = 0
     for line in text.splitlines():
@@ -244,7 +263,7 @@ def silent_stub_debt(text):
             elif level <= section_level:
                 section_level = 0
         if section_level:
-            debt.append((line, links("docs/dev/TechnicalDebt.md", line)))
+            debt.append((line, links(path, line)))
     return debt
 
 

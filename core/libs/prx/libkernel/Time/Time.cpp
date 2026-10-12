@@ -614,6 +614,10 @@ uint64_t APS5_VABI sceKernelGetTscFrequency(void) {
     return frequency;
 }
 
+std::int64_t APS5_VABI sceKernelGetCpuFrequency(void) {
+    return static_cast<std::int64_t>(sceKernelGetTscFrequency());
+}
+
 unsigned int APS5_VABI sceKernelSleep(unsigned int seconds) {
     CancellableSleep(static_cast<std::uint64_t>(seconds) * 1000000000ULL);
     return 0;

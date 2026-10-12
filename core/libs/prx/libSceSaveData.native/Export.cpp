@@ -62,6 +62,9 @@ static bool dir_name_match(const char* str, const char* pattern) {
         str++;
         pattern++;
     }
+    while (*pattern == '%') {
+        pattern++;
+    }
     return *str == '\0' && *pattern == '\0';
 }
 

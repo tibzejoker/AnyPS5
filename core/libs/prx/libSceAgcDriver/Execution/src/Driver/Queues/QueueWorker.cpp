@@ -67,11 +67,9 @@ void Driver::reapCompletionLabels() {
 
 void Driver::run(std::uint32_t id) noexcept {
     onWorkerThread() = true;
-    {
-        char role[32];
-        std::snprintf(role, sizeof role, "queue worker 0x%x", id);
-        PinWorkerThread(role);
-    }
+    char role[32];
+    std::snprintf(role, sizeof role, "queue worker 0x%x", id);
+    PinWorkerThread(role);
 
     GuestMemory::TagGpuLockThread(id);
     if (id == 0) StartWorkerSampler();
@@ -79,6 +77,7 @@ void Driver::run(std::uint32_t id) noexcept {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& costs = submissionCosts(id);
     try {
+        if (PerformanceTrace::Configured()) PerformanceTrace::BindThread(role);
         for (;;) {
             submission = Submission{};
             struct Running {

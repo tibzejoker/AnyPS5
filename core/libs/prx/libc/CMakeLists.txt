@@ -17,6 +17,7 @@ target_sources(libc PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src/HostEntropy.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/Time.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/FileAndHeap.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/FileLock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/StdioExtras.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/StandardStreams.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/GuestAllocations.cpp
@@ -334,6 +335,16 @@ if(BUILD_TESTING)
         set_tests_properties(guest_interfaces PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test_executable(guest_qsort_tests ${LIBS_INCLUDE_DIR}/tests/GuestQsort.cpp)
+    target_include_directories(guest_qsort_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_qsort_tests PRIVATE libc)
+    configure_windows_unwind(guest_qsort_tests)
+    add_test(NAME guest_qsort COMMAND guest_qsort_tests)
+    set_tests_properties(guest_qsort PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(guest_qsort PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test_executable(guest_atoi_tests ${LIBS_INCLUDE_DIR}/tests/GuestAtoi.cpp)
     target_include_directories(guest_atoi_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_atoi_tests PRIVATE libc)
@@ -417,6 +428,11 @@ if(BUILD_TESTING)
         set_tests_properties(guest_new_handler PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME guest_new_handler_default_heap COMMAND guest_new_handler_tests default)
+    if(WIN32)
+        set_tests_properties(guest_new_handler_default_heap PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test_executable(guest_search_tests ${LIBS_INCLUDE_DIR}/tests/GuestSearch.cpp)
     target_include_directories(guest_search_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_search_tests PRIVATE libc)
@@ -460,6 +476,15 @@ if(BUILD_TESTING)
     add_test(NAME guest_wcsrtombs_s COMMAND guest_wcsrtombs_s_tests)
     if(WIN32)
         set_tests_properties(guest_wcsrtombs_s PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test_executable(guest_overflow_error_tests ${LIBS_INCLUDE_DIR}/tests/GuestOverflowError.cpp)
+    target_include_directories(guest_overflow_error_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_overflow_error_tests PRIVATE libc)
+    configure_windows_unwind(guest_overflow_error_tests)
+    add_test(NAME guest_overflow_error COMMAND guest_overflow_error_tests)
+    if(WIN32)
+        set_tests_properties(guest_overflow_error PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
     if(UNIX)

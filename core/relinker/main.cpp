@@ -66,8 +66,8 @@ int Run(const int argc, char* argv[]) {
 
         std::vector<Codegen::TrampolineSite> trampolines;
         if (args.toIntel) {
-            const auto codeSegments = Relinker::ElfReader(sourceBytes).ReadCodeSegments();
-            auto converted = Codegen::MakeAmd64OnlyConverter(args.toRosetta ? Codegen::Amd64OnlyTarget::Rosetta : Codegen::Amd64OnlyTarget::Intel)->Convert(std::move(sourceBytes), codeSegments);
+            const auto segments = Relinker::ElfReader(sourceBytes).ReadProgramHeaders();
+            auto converted = Codegen::MakeAmd64OnlyConverter(args.toRosetta ? Codegen::Amd64OnlyTarget::Rosetta : Codegen::Amd64OnlyTarget::Intel)->Convert(std::move(sourceBytes), segments);
             sourceBytes = std::move(converted.Bytes);
             trampolines = std::move(converted.Trampolines);
             std::map<std::string, std::size_t> stubsByName;

@@ -166,8 +166,10 @@ int APS5_VABI sceNpEntitlementAccessGetPftFlag(void) {
     return 0;
 }
 
-int APS5_VABI sceNpEntitlementAccessGetGameTrialsFlag(void) {
-    NotImplemented_nid_no_patch(__func__);
+int APS5_VABI sceNpEntitlementAccessGetGameTrialsFlag(uint32_t* flag) {
+    constexpr int errorParameter = static_cast<int>(0x817D0002);
+    if (!flag) return errorParameter;
+    *flag = 0;
     return 0;
 }
 

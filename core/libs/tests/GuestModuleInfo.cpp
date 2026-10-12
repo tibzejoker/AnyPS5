@@ -16,6 +16,8 @@ int APS5_VABI dlclose_nid_postfix(void*);
 int APS5_VABI sceKernelGetModuleInfoFromAddr(std::uint64_t, int, ModuleInfoEx*);
 int APS5_VABI sceKernelGetModuleList(KernelModule*, std::size_t, std::size_t*);
 int APS5_VABI sceKernelGetModuleInfo(KernelModule, ModuleInfo*);
+int APS5_VABI sceKernelGetModuleList2(KernelModule*, std::size_t, std::size_t*);
+int APS5_VABI sceKernelGetModuleInfo2(KernelModule, ModuleInfo*);
 }
 static void Require(bool value) { if (!value) std::abort(); }
 template<typename TFunction>
@@ -105,6 +107,36 @@ int main(int argc, char** argv) {
     unknown.st_size = sizeof(ModuleInfo);
     Require(sceKernelGetModuleInfo(info.id, &unknown) == SCE_KERNEL_ERROR_ESRCH);
     Require(sceKernelGetModuleInfo(-1, &unknown) == SCE_KERNEL_ERROR_ESRCH && unknown.name[0] == '\0');
+    std::vector<KernelModule> titleHandles(handles.size() + 1, -1);
+    std::size_t titleCount = 0;
+    Require(sceKernelGetModuleList2(titleHandles.data(), titleHandles.size(), &titleCount) == 0);
+    Require(titleCount >= 1 && titleCount < count && titleHandles[titleCount] == -1);
+    titleHandles.resize(titleCount);
+    Require(titleHandles.front() == self.id);
+    for (const auto handle : titleHandles) {
+        Require(std::count(handles.begin(), handles.end(), handle) == 1);
+        ModuleInfo title{}, listed{};
+        title.st_size = listed.st_size = sizeof(ModuleInfo);
+        Require(sceKernelGetModuleInfo2(handle, &title) == 0 && sceKernelGetModuleInfo(handle, &listed) == 0);
+        Require(std::string(title.name) == listed.name && title.segment_count == listed.segment_count);
+    }
+    std::size_t titleUntouched = 99;
+    Require(sceKernelGetModuleList2(titleHandles.data(), titleCount - 1, &titleUntouched) == SCE_KERNEL_ERROR_ENOMEM && titleUntouched == 99);
+    Require(sceKernelGetModuleList2(nullptr, 0, &titleUntouched) == SCE_KERNEL_ERROR_EFAULT);
+    Require(sceKernelGetModuleList2(titleHandles.data(), titleHandles.size(), nullptr) == SCE_KERNEL_ERROR_EFAULT);
+    for (const auto handle : handles) {
+        if (std::count(titleHandles.begin(), titleHandles.end(), handle) != 0) continue;
+        ModuleInfo system{};
+        system.st_size = sizeof(ModuleInfo);
+        system.name[0] = 'x';
+        Require(sceKernelGetModuleInfo2(handle, &system) == SCE_KERNEL_ERROR_EPERM && system.name[0] == 'x');
+        Require(sceKernelGetModuleInfo2(handle, nullptr) == SCE_KERNEL_ERROR_EFAULT);
+        system.st_size = 0x158;
+        Require(sceKernelGetModuleInfo2(handle, &system) == SCE_KERNEL_ERROR_EINVAL);
+    }
+    ModuleInfo absent{};
+    absent.st_size = sizeof(ModuleInfo);
+    Require(sceKernelGetModuleInfo2(-1, &absent) == SCE_KERNEL_ERROR_ESRCH && absent.name[0] == 0);
     int local = 0;
     Query(&local, SCE_KERNEL_ERROR_ESRCH);
     Require(sceKernelGetModuleInfoFromAddr(reinterpret_cast<std::uintptr_t>(add), 2, nullptr) == SCE_KERNEL_ERROR_EFAULT);

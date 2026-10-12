@@ -130,6 +130,23 @@ std::vector<ProgramHeader> ElfReader::ReadProgramHeaders() const {
         offset += header.ProgramHeaderEntrySize;
     }
 
+    for (auto& relro : headers) {
+        if (relro.Type != PT_OS_RELRO || relro.MemorySize == 0) continue;
+        bool covered = false;
+        for (const auto& load : headers) {
+            if (load.Type != PT_LOAD || load.MemorySize == 0) continue;
+            const bool overlaps = relro.MappedAddress < load.MappedAddress ? load.MappedAddress - relro.MappedAddress < relro.MemorySize : relro.MappedAddress - load.MappedAddress < load.MemorySize;
+            if (!overlaps) continue;
+            if (relro.MappedAddress < load.MappedAddress || relro.MemorySize > load.MemorySize - (relro.MappedAddress - load.MappedAddress))
+                throw RelinkerException("PT_SCE_RELRO partially overlaps a PT_LOAD segment", relro.MappedAddress);
+            covered = true;
+        }
+        if (!covered) {
+            relro.Type = PT_LOAD;
+            relro.Flags = PF_R | PF_W;
+        }
+    }
+
     return headers;
 }
 
@@ -261,18 +278,6 @@ std::vector<std::uint8_t> ElfReader::ReadSegment(const ProgramHeader& header) co
     return std::vector<std::uint8_t>(
         _fileBuffer.begin() + header.Offset,
         _fileBuffer.begin() + header.Offset + header.FileSize);
-}
-
-std::vector<ProgramHeader> ElfReader::ReadCodeSegments() const {
-    static constexpr std::uint32_t kPtLoad = 1;
-    static constexpr std::uint32_t kPfX = 0x1;
-    std::vector<ProgramHeader> result;
-    for (const auto& ph : ReadProgramHeaders()) {
-        if (ph.Type == kPtLoad && (ph.Flags & kPfX)) {
-            result.push_back(ph);
-        }
-    }
-    return result;
 }
 
 std::uint64_t ElfReader::GetFileSize() const {

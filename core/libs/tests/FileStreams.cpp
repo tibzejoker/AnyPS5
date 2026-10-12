@@ -21,6 +21,8 @@ int APS5_VABI fputs_nid_postfix(const char* str, FileStream* stream);
 int APS5_VABI fflush_nid_postfix(FileStream* stream);
 int APS5_VABI remove_nid_postfix(const char* path);
 int APS5_VABI rename_nid_postfix(const char* from, const char* to);
+int APS5_VABI ferror_nid_postfix(FileStream* stream);
+void APS5_VABI clearerr_nid_postfix(FileStream* stream);
 }
 
 static void Require(bool condition) {
@@ -114,5 +116,21 @@ int main(int argc, char** argv) {
     std::array<char, 5> appended{};
     Require(stream != nullptr && fread_nid_postfix(appended.data(), 1, 4, stream) == 4 && std::strcmp(appended.data(), "abcd") == 0);
     Require(fclose_nid_postfix(stream) == 0 && remove_nid_postfix(heldName.c_str()) == 0);
+    constexpr char marker[] = "marker";
+    stream = fopen_nid_postfix(argv[1], "wb");
+    Require(stream != nullptr);
+    std::array<char, sizeof(marker)> markerBuffer{};
+    Require(fread_nid_postfix(markerBuffer.data(), 1, markerBuffer.size(), stream) == 0);
+    Require(ferror_nid_postfix(stream) != 0);
+    Require(fclose_nid_postfix(stream) == 0);
+    stream = fopen_nid_postfix(argv[1], "rb");
+    Require(stream != nullptr);
+    Require(fwrite_nid_postfix(marker, 1, sizeof(marker), stream) == 0);
+    Require(ferror_nid_postfix(stream) != 0);
+    clearerr_nid_postfix(stream);
+    Require(fputs_nid_postfix(marker, stream) == EOF);
+    Require(ferror_nid_postfix(stream) != 0);
+    Require(fclose_nid_postfix(stream) == 0);
+    Require(std::remove(argv[1]) == 0);
     std::cout << "PASS: stream objects, file operations, EOF and error handling\n";
 }

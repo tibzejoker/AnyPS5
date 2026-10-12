@@ -32,6 +32,7 @@ char* APS5_VABI strtok_s_nid_postfix(char* str, const char* delim, char** contex
 int APS5_VABI __fpclassifyd_nid_postfix(double value);
 unsigned __int128 APS5_VABI __udivti3_nid_postfix(unsigned __int128 dividend, unsigned __int128 divisor);
 __int128 APS5_VABI __divti3_nid_postfix(__int128 dividend, __int128 divisor);
+unsigned __int128 APS5_VABI __umodti3_nid_postfix(unsigned __int128 dividend, unsigned __int128 divisor);
 SonyLconv* APS5_VABI localeconv_nid_postfix(void);
 int APS5_VABI sceAmprFpclassifyd(double value);
 unsigned int APS5_VABI _ZSt14_Random_devicev_nid_postfix();
@@ -106,6 +107,29 @@ int main() {
         SonyDivti3(1, 0);
     } catch (const std::exception&) {
         trapped = true;
+    }
+    Require(trapped);
+
+    const unsigned __int128 unsignedMaximum = ~(unsigned __int128)0;
+    const unsigned __int128 largeDivisor = ((unsigned __int128)1 << 64) + 3;
+    Require(__umodti3_nid_postfix(100, 3) == 1);
+    Require(__umodti3_nid_postfix(0, 5) == 0);
+    Require(__umodti3_nid_postfix(3, 100) == 3);
+    Require(__umodti3_nid_postfix(unsignedMaximum, 1) == 0);
+    Require(__umodti3_nid_postfix(unsignedMaximum, unsignedMaximum) == 0);
+    Require(__umodti3_nid_postfix(largeDivisor, largeDivisor) == 0);
+    Require(__umodti3_nid_postfix(unsignedMaximum, 10) == 5);
+    Require(__umodti3_nid_postfix((unsigned __int128)1 << 100, 3) == 1);
+    Require(__umodti3_nid_postfix(unsignedMaximum, (unsigned __int128)1 << 64) == 0xFFFFFFFFFFFFFFFFull);
+    Require(__umodti3_nid_postfix(unsignedMaximum, largeDivisor) == 8);
+    Require(__umodti3_nid_postfix((unsigned __int128)1 << 127, largeDivisor) == 0x8000000000000006ull);
+    Require(__umodti3_nid_postfix(unsignedMaximum - 1, unsignedMaximum) == unsignedMaximum - 1);
+    Require(__umodti3_nid_postfix(unsignedMaximum, (unsigned __int128)1 << 127) == ((unsigned __int128)1 << 127) - 1);
+    trapped = false;
+    try {
+        __umodti3_nid_postfix(((unsigned __int128)0x1234 << 64) | 0x5678, 0);
+    } catch (const std::runtime_error& error) {
+        trapped = std::strcmp(error.what(), "__umodti3: integer divide by zero (0x00000000000012340000000000005678 % 0)") == 0;
     }
     Require(trapped);
 

@@ -16,12 +16,18 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 namespace Relinker {
 
 namespace {
+
+struct GuestExport {
+    std::size_t Provider;
+    std::uint8_t Type;
+};
 
 std::vector<std::string> ReadNeededNames(const Domain::SysVDynamicSection& dynamic) {
     if (dynamic.DynamicSegmentData.size() % 16 != 0) throw Domain::RelinkerException("Invalid executable dependency table");
@@ -136,7 +142,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
             if (std::filesystem::equivalent(path, outputPath))
                 throw Domain::RelinkerException("Executable output would overwrite an input module: " + Io::Utf8Path(outputPath));
     }
-    std::map<std::string, std::vector<std::size_t>> exports;
+    std::unordered_map<std::string, std::vector<GuestExport>> exports;
     std::map<std::string, std::set<std::size_t>> sharedExports;
     std::set<std::string> outputNames;
     for (const auto& path : paths) {
@@ -153,10 +159,11 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         for (const auto& symbol : image.Symbols) {
             if (symbol.Section == 0 || symbol.Section == AbsoluteSection || (symbol.Info >> 4) == 0 || symbol.Visibility == 1 || symbol.Visibility == 2) continue;
             auto& providers = exports[symbol.Name];
-            const bool repeated = std::find(providers.begin(), providers.end(), images.size()) != providers.end();
-            if (!windows && repeated) throw Domain::RelinkerException("Duplicate guest export after stripping #: " + symbol.Name + " in " + Io::Utf8Path(path) + " and " + Io::Utf8Path(images[providers.front()].SourcePath));
-            if (!repeated) providers.push_back(images.size());
-            if (!windows && providers.size() > 1) sharedExports[symbol.Name].insert(providers.begin(), providers.end());
+            const bool repeated = !providers.empty() && providers.back().Provider == images.size();
+            if (!windows && repeated) throw Domain::RelinkerException("Duplicate guest export after stripping #: " + symbol.Name + " in " + Io::Utf8Path(path) + " and " + Io::Utf8Path(images[providers.front().Provider].SourcePath));
+            if (!repeated) providers.push_back({images.size(), static_cast<std::uint8_t>(symbol.Info & 15)});
+            if (!windows && providers.size() > 1)
+                for (const auto& provider : providers) sharedExports[symbol.Name].insert(provider.Provider);
         }
         images.push_back(std::move(image));
     }
@@ -264,20 +271,19 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
             if (shared == sharedExports.end() || declared == guestNames.end() || !shared->second.contains(declared->second))
                 rejectSharedImport(symbol.Name, Io::Utf8Path(images[index].SourcePath));
             const auto found = exports.find(symbol.Name);
-            std::vector<std::size_t> providers;
+            const GuestExport* provider = nullptr;
             if (found != exports.end()) {
-                for (const auto provider : found->second) {
-                    if (symbol.Library.empty() || (declared != guestNames.end() && declared->second == provider)) providers.push_back(provider);
+                for (const auto& candidate : found->second) {
+                    if (!symbol.Library.empty() && (declared == guestNames.end() || declared->second != candidate.Provider)) continue;
+                    if (provider != nullptr) throw Domain::RelinkerException("Ambiguous guest import after stripping #: " + symbol.Name);
+                    provider = &candidate;
                 }
             }
-            if (providers.size() > 1) throw Domain::RelinkerException("Ambiguous guest import after stripping #: " + symbol.Name);
-            if (!providers.empty()) {
-                const auto& provider = images[providers.front()];
-                const auto exported = std::find_if(provider.Symbols.begin(), provider.Symbols.end(), [&](const auto& candidate) { return candidate.Section != 0 && candidate.Section != AbsoluteSection && candidate.Name == symbol.Name && (candidate.Info >> 4) != 0 && candidate.Visibility != 1 && candidate.Visibility != 2; });
-                if (exported == provider.Symbols.end() || ((symbol.Info & 15) != 0 && (symbol.Info & 15) != (exported->Info & 15))) throw Domain::RelinkerException("Guest import/export type mismatch: " + symbol.Name);
-                if (providers.front() != index) dependencies[index].insert(providers.front());
+            if (provider != nullptr) {
+                if ((symbol.Info & 15) != 0 && (symbol.Info & 15) != provider->Type) throw Domain::RelinkerException("Guest import/export type mismatch: " + symbol.Name);
+                if (provider->Provider != index) dependencies[index].insert(provider->Provider);
             } else if (windows && (symbol.Info & 15) == 6) throw Domain::RelinkerException("Windows guest TLS import requires a guest TLS export: " + symbol.Name);
-            if (providers.empty()) systemImports[index].insert(symbolIndex);
+            if (provider == nullptr) systemImports[index].insert(symbolIndex);
         }
     }
     std::vector<bool> required(images.size());
@@ -342,7 +348,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         std::vector<Domain::ProgramHeader> codeHeaders;
         for (const auto& header : image.Headers) if (header.Type == 1 && (header.Flags & 1) != 0) codeHeaders.push_back(header);
         if (toIntel) {
-            auto converted = Codegen::MakeAmd64OnlyConverter(toRosetta ? Codegen::Amd64OnlyTarget::Rosetta : Codegen::Amd64OnlyTarget::Intel)->Convert(std::move(image.Bytes), codeHeaders);
+            auto converted = Codegen::MakeAmd64OnlyConverter(toRosetta ? Codegen::Amd64OnlyTarget::Rosetta : Codegen::Amd64OnlyTarget::Intel)->Convert(std::move(image.Bytes), image.Headers);
             image.Trampolines = std::move(converted.Trampolines);
             image.Bytes = std::move(converted.Bytes);
         }

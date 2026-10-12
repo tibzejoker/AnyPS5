@@ -14,7 +14,7 @@ public:
 
     [[nodiscard]] virtual ConvertResult Convert(
         std::vector<std::uint8_t> fileBytes,
-        const std::vector<Domain::ProgramHeader>& codeSegments
+        const std::vector<Domain::ProgramHeader>& segments
     ) const = 0;
 };
 

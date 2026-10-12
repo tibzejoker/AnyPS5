@@ -1,6 +1,7 @@
 import argparse
 import os
 from pathlib import Path
+import re
 import tempfile
 import time
 
@@ -12,6 +13,36 @@ BUTTONS = {
     "triangle": 0x1000, "circle": 0x2000, "cross": 0x4000,
     "square": 0x8000, "touchpad": 0x100000, "release": 0,
 }
+
+
+def previous_sequence(path):
+    try:
+        with path.open("rb") as command:
+            line = command.readline(129)
+    except FileNotFoundError:
+        return 0
+    if os.name == "nt" and line.endswith(b"\r\n"):
+        line = line[:-2] + b"\n"
+    tokens = line.split()
+    if len(line.rstrip(b"\n")) > 127 or len(tokens) not in (3, 7):
+        return 0
+    if any(re.fullmatch(rb"\+?[0-9]+", token) is None for token in tokens):
+        return 0
+    values = [int(token) for token in tokens]
+    if any(value > 2**64 - 1 for value in values):
+        return 0
+    if values[0] == 0 or values[1] & ~0x10fffe or not 1 <= values[2] <= 5000:
+        return 0
+    if any(axis > 255 for axis in values[3:]):
+        return 0
+    return values[0]
+
+
+def next_sequence(path):
+    sequence = max(time.monotonic_ns(), previous_sequence(path) + 1)
+    if sequence > 2**64 - 1:
+        raise ValueError("controller command sequence is exhausted")
+    return sequence
 
 
 def main():
@@ -30,11 +61,15 @@ def main():
         if not all(0 <= axis <= 255 for axis in axes):
             parser.error("stick axes must be between 0 and 255")
         sticks = "".join(f" {axis}" for axis in axes)
+    try:
+        sequence = next_sequence(args.path)
+    except ValueError as error:
+        parser.error(str(error))
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", dir=args.path.parent, delete=False) as output:
             temporary = Path(output.name)
-            output.write(f"{time.monotonic_ns()} {BUTTONS[args.button]} {args.hold_ms}{sticks}\n")
+            output.write(f"{sequence} {BUTTONS[args.button]} {args.hold_ms}{sticks}\n")
         os.replace(temporary, args.path)
     finally:
         if temporary is not None:

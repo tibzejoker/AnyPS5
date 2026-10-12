@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
+#include <string>
+#include <vector>
 #ifdef _WIN32
 #include <io.h>
 #include <windows.h>
@@ -48,6 +50,7 @@ int APS5_VABI rmdir_nid_postfix(const char*);
 int APS5_VABI mkdir_nid_postfix(const char*, unsigned short);
 int APS5_VABI sceKernelOpen(const char*, int, unsigned short);
 int APS5_VABI sceKernelClose(int);
+int APS5_VABI sceKernelGetdents(int, char*, int);
 int APS5_VABI sceKernelStat(const char*, FileStat*);
 int APS5_VABI sceKernelCheckReachability(const char*);
 int APS5_VABI sceKernelFstat(int, FileStat*);
@@ -64,6 +67,7 @@ FileStream* APS5_VABI fopen_nid_postfix(const char*, const char*);
 FileStream* APS5_VABI freopen_nid_postfix(const char*, const char*, FileStream*);
 int* APS5_VABI __error_nid_postfix();
 int APS5_VABI pipe_nid_postfix(int*);
+int APS5_VABI dup2_nid_postfix(int, int);
 std::int64_t APS5_VABI read_nid_postfix(int, void*, std::size_t);
 std::int64_t APS5_VABI write_nid_postfix(int, const void*, std::size_t);
 int APS5_VABI sceKernelDebugOutText(int, const char*);
@@ -223,6 +227,29 @@ int main() {
         Require(std::filesystem::remove("creat_probe.bin"));
     }
     Require(close_nid_postfix(descriptors[0]) == 0);
+    auto* hostCapture = std::tmpfile();
+    Require(hostCapture != nullptr && pipe_nid_postfix(descriptors) == 0);
+#ifdef _WIN32
+    const int hostError = ::_dup(2);
+    Require(hostError >= 0 && ::_dup2(::_fileno(hostCapture), 2) == 0);
+#else
+    const int hostError = ::dup(2);
+    Require(hostError >= 0 && ::dup2(::fileno(hostCapture), 2) == 2);
+#endif
+    Require(dup2_nid_postfix(descriptors[1], 2) == 2);
+    Require(sceKernelDebugOutText(1, "kept\n") == 0);
+    Require(write_nid_postfix(2, "P", 1) == 1);
+#ifdef _WIN32
+    Require(::_dup2(hostError, 2) == 0 && ::_close(hostError) == 0);
+#else
+    Require(::dup2(hostError, 2) == 2 && ::close(hostError) == 0);
+#endif
+    Require(close_nid_postfix(descriptors[1]) == 0);
+    Require(read_nid_postfix(descriptors[0], received, sizeof(received)) == 1 && received[0] == 'P');
+    Require(close_nid_postfix(descriptors[0]) == 0);
+    std::rewind(hostCapture);
+    Require(std::fread(debugText, 1, sizeof(debugText), hostCapture) == 15 && std::memcmp(debugText, "[debug:1] kept\n", 15) == 0);
+    Require(std::fclose(hostCapture) == 0);
     const auto root = std::filesystem::path("anyps5-filesystem-test-" +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     Require(mkdir_nid_postfix(root.string().c_str(), 0700) == 0);
@@ -578,6 +605,15 @@ int main() {
     Require(directoryDescriptor >= 0 && close_nid_postfix(directoryDescriptor) == 0);
     const int flaggedDirectory = sceKernelOpen(rootName.c_str(), 0x20000, 0);
     Require(flaggedDirectory >= 0 && sceKernelClose(flaggedDirectory) == 0);
+    std::vector<char> entries(4096);
+    for (const auto& directoryName : {std::string("/"), std::string("."), rootName + "/", rootName + "/.."}) {
+        const int listed = sceKernelOpen(directoryName.c_str(), 0x20000, 0);
+        Require(listed >= 0);
+        int read = sceKernelGetdents(listed, entries.data(), static_cast<int>(entries.size()));
+        Require(read > 0);
+        while (read > 0) read = sceKernelGetdents(listed, entries.data(), static_cast<int>(entries.size()));
+        Require(read == 0 && sceKernelClose(listed) == 0);
+    }
     Require(open_nid_postfix(presentName.c_str(), 0x20000, 0) == -1 && *__error_nid_postfix() == 20);
     Require(sceKernelOpen(presentName.c_str(), 0x20000, 0) == static_cast<int>(0x80020014u));
     Require(sceKernelOpen(presentName.c_str(), 0x20402, 0) == static_cast<int>(0x80020014u));

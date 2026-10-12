@@ -13,6 +13,7 @@ DEPENDS = re.compile(r'Depends on:[ \t]*((?:#\d+\b(?:(?:[ \t]*,[ \t]*(?:and[ \t]
 PLAIN_DEPENDS = re.compile(r'Depends on[ \t]+(#\d+\b(?:(?:[ \t]*,[ \t]*(?:and[ \t]+)?|[ \t]+and[ \t]+)#\d+\b)*)')
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))?", re.M)
 MARKER = "<!-- pr-overlap -->"
+FETCH_REFS = 100
 
 
 def git(*args):
@@ -51,7 +52,8 @@ def open_prs(base):
 
 def fetch(base, prs):
     refspecs = [f"+refs/heads/{base}:refs/pr/base"] + [f"+{pr['sha']}:{pr['ref']}" for pr in prs.values()]
-    git("fetch", "--no-tags", "-q", f"https://github.com/{REPO}.git", *refspecs)
+    for start in range(0, len(refspecs), FETCH_REFS):
+        git("fetch", "--no-tags", "-q", f"https://github.com/{REPO}.git", *refspecs[start:start + FETCH_REFS])
 
 
 def merge(*args):

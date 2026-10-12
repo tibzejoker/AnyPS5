@@ -81,6 +81,31 @@ static void SortByKey() {
     Require(sceSaveDataDirNameSearch(&cond, &result) == SaveDataErrorParameter, "an unknown sort order must be rejected");
 }
 
+static std::vector<std::string> SearchPattern(const char* text) {
+    SceSaveDataDirName pattern{};
+    std::snprintf(pattern.data, sizeof(pattern.data), "%s", text);
+    SaveDataDirNameSearchCond cond{};
+    cond.user_id = 1;
+    cond.dir_name = &pattern;
+    std::array<SceSaveDataDirName, 4> names{};
+    SaveDataDirNameSearchResult result{};
+    result.dir_names = names.data();
+    result.dir_names_num = static_cast<std::uint32_t>(names.size());
+    Require(sceSaveDataDirNameSearch(&cond, &result) == 0, "pattern search failed");
+    std::vector<std::string> found;
+    for (std::uint32_t i = 0; i < result.set_num; ++i) found.emplace_back(names[i].data);
+    return found;
+}
+
+static void TrailingWildcards() {
+    for (const char* name : std::array{"TRAIL", "TRAIL1"}) std::filesystem::create_directories(std::filesystem::path("_sd") / name);
+    using Names = std::vector<std::string>;
+    Require(SearchPattern("TRAIL%") == Names{"TRAIL", "TRAIL1"}, "a trailing % must also match no characters");
+    Require(SearchPattern("TRAIL%%") == Names{"TRAIL", "TRAIL1"}, "trailing %% must also match no characters");
+    Require(SearchPattern("TRAI_%") == Names{"TRAIL", "TRAIL1"}, "_ then % must match one character and then none");
+    Require(SearchPattern("TRAIL_%") == Names{"TRAIL1"}, "_ must still match exactly one character");
+}
+
 static void SearchAndMount() {
     const std::array names{std::string(31, 'A'), std::string(31, 'B')};
     for (const auto& name : names) std::filesystem::create_directories(std::filesystem::path("_sd") / name);
@@ -139,6 +164,7 @@ int main() {
     try {
         SearchAndMount();
         SortByKey();
+        TrailingWildcards();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         status = 1;

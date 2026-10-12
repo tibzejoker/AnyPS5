@@ -90,6 +90,7 @@ struct AlarmState {
     std::mutex lock;
     std::condition_variable changed;
     std::optional<std::chrono::steady_clock::time_point> deadline;
+    std::chrono::microseconds interval{0};
     bool threadStarted = false;
 };
 
@@ -98,19 +99,28 @@ AlarmState& Alarms() {
     return *state;
 }
 
-void ExpireAlarm() {
+std::string DescribeInterval(std::chrono::microseconds interval) {
+    char text[64];
+    std::snprintf(text, sizeof(text), "%lld.%06lld s", static_cast<long long>(interval.count() / 1000000),
+        static_cast<long long>(interval.count() % 1000000));
+    return text;
+}
+
+void ExpireAlarm(std::chrono::microseconds interval) {
     std::uintptr_t handler = 0;
     {
         std::lock_guard lock(registration);
         handler = dispositions[GuestSigalrm].handler;
     }
     if (handler == 1) return;
+    if ((blockedMask.load() & (1u << (GuestSigalrm - 1))) != 0)
+        throw std::runtime_error("ITIMER_REAL (it_interval " + DescribeInterval(interval) + ") expired while SIGALRM is blocked: pending signals are not implemented");
     if (handler == 0) {
         std::fprintf(stderr, "SIGALRM: the alarm expired with the default disposition; the process terminates\n");
         std::fflush(stderr);
         std::_Exit(128 + GuestSigalrm);
     }
-    throw std::runtime_error("alarm: delivering SIGALRM to a guest handler is not implemented");
+    throw std::runtime_error("ITIMER_REAL (it_interval " + DescribeInterval(interval) + ") expired: delivering SIGALRM to a guest handler is not implemented");
 }
 
 void RunAlarms() {
@@ -123,11 +133,30 @@ void RunAlarms() {
         }
         const auto deadline = *alarms.deadline;
         if (alarms.changed.wait_until(lock, deadline) != std::cv_status::timeout || alarms.deadline != deadline) continue;
-        alarms.deadline.reset();
+        const auto interval = alarms.interval;
+        if (interval.count() == 0) alarms.deadline.reset();
+        else {
+            const auto now = std::chrono::steady_clock::now();
+            const auto periods = now < deadline ? 1 : (now - deadline) / interval + 1;
+            alarms.deadline = deadline + periods * interval;
+        }
         lock.unlock();
-        ExpireAlarm();
+        ExpireAlarm(interval);
         lock.lock();
     }
+}
+
+std::chrono::microseconds RemainingAlarm(const AlarmState& alarms, std::chrono::steady_clock::time_point now) {
+    if (!alarms.deadline || *alarms.deadline <= now) return std::chrono::microseconds(0);
+    return std::chrono::duration_cast<std::chrono::microseconds>(*alarms.deadline - now);
+}
+
+void NotifyAlarms(AlarmState& alarms) {
+    if (!alarms.threadStarted) {
+        std::thread(RunAlarms).detach();
+        alarms.threadStarted = true;
+    }
+    alarms.changed.notify_all();
 }
 }
 
@@ -135,18 +164,12 @@ extern "C" unsigned int APS5_VABI GuestAlarm_nid_no_patch(unsigned int seconds) 
     auto& alarms = Alarms();
     std::lock_guard lock(alarms.lock);
     const auto now = std::chrono::steady_clock::now();
-    unsigned int remaining = 0;
-    if (alarms.deadline && *alarms.deadline > now) {
-        const auto micros = std::chrono::duration_cast<std::chrono::microseconds>(*alarms.deadline - now).count();
-        remaining = static_cast<unsigned int>((micros + 999999) / 1000000);
-    }
+    const auto micros = RemainingAlarm(alarms, now).count();
+    const auto remaining = static_cast<unsigned int>((micros + 999999) / 1000000);
+    alarms.interval = std::chrono::microseconds(0);
     if (seconds == 0) alarms.deadline.reset();
     else alarms.deadline = now + std::chrono::seconds(seconds);
-    if (!alarms.threadStarted) {
-        std::thread(RunAlarms).detach();
-        alarms.threadStarted = true;
-    }
-    alarms.changed.notify_all();
+    NotifyAlarms(alarms);
     return remaining;
 }
 
@@ -176,8 +199,70 @@ extern "C" int APS5_VABI getitimer_nid_postfix(int which, GuestItimerval* output
             result.value.tv_sec = micros / 1000000;
             result.value.tv_usec = micros % 1000000;
         }
+        const auto interval = alarms.interval.count();
+        result.interval.tv_sec = interval / 1000000;
+        result.interval.tv_usec = interval % 1000000;
     }
     *output = result;
+    return 0;
+}
+
+namespace {
+constexpr int ItimerReal = 0;
+constexpr int ItimerProf = 2;
+constexpr std::int64_t MaxItimerSeconds = 0x7fffffff / 2;
+constexpr std::int64_t MinExactIntervalMicros = 1000;
+
+bool ValidItimer(const KernelTimeval& time) {
+    return time.tv_sec >= 0 && time.tv_usec >= 0 && time.tv_usec < 1000000 && time.tv_sec <= MaxItimerSeconds;
+}
+
+bool ItimerSet(const KernelTimeval& time) {
+    return time.tv_sec != 0 || time.tv_usec != 0;
+}
+
+std::chrono::microseconds ItimerDuration(const KernelTimeval& time) {
+    return std::chrono::seconds(time.tv_sec) + std::chrono::microseconds(time.tv_usec);
+}
+
+KernelTimeval ItimerTimeval(std::chrono::microseconds duration) {
+    return {duration.count() / 1000000, duration.count() % 1000000};
+}
+}
+
+extern "C" int APS5_VABI setitimer_nid_postfix(int which, const GuestItimerval* value, GuestItimerval* previous) {
+    if (which < ItimerReal || which > ItimerProf) { *__error_nid_postfix() = 22; return -1; }
+    if (value == nullptr && previous == nullptr) { *__error_nid_postfix() = 14; return -1; }
+    GuestItimerval requested{};
+    if (value != nullptr) {
+        requested = *value;
+        if (!ValidItimer(requested.value)) { *__error_nid_postfix() = 22; return -1; }
+        if (!ItimerSet(requested.value)) requested.interval = {};
+        else if (!ValidItimer(requested.interval)) { *__error_nid_postfix() = 22; return -1; }
+    }
+    if (which != ItimerReal) {
+        if (ItimerSet(requested.value))
+            throw std::runtime_error(std::string("setitimer: ") + (which == ItimerProf ? "ITIMER_PROF" : "ITIMER_VIRTUAL") + " needs process CPU time accounting, which is not implemented");
+        if (previous != nullptr) *previous = {};
+        return 0;
+    }
+    if (requested.interval.tv_sec == 0 && requested.interval.tv_usec != 0 && requested.interval.tv_usec < MinExactIntervalMicros)
+        throw std::runtime_error("setitimer: it_interval " + DescribeInterval(ItimerDuration(requested.interval)) + " is below 1 ms, where the kernel rounds it up to a clock tick that is not known");
+    GuestItimerval old{};
+    {
+        auto& alarms = Alarms();
+        std::lock_guard lock(alarms.lock);
+        const auto now = std::chrono::steady_clock::now();
+        old.interval = ItimerTimeval(alarms.interval);
+        old.value = ItimerTimeval(RemainingAlarm(alarms, now));
+        if (value != nullptr) {
+            alarms.interval = ItimerDuration(requested.interval);
+            if (ItimerSet(requested.value)) alarms.deadline = now + ItimerDuration(requested.value);
+            else alarms.deadline.reset();
+            NotifyAlarms(alarms);
+        }
+    }
+    if (previous != nullptr) *previous = old;
     return 0;
 }
 

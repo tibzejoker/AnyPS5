@@ -181,8 +181,7 @@ inline int SonyFltrounds(void) {
     }
 }
 
-inline unsigned __int128 SonyUdivti3(unsigned __int128 dividend, unsigned __int128 divisor) {
-    if (divisor == 0) throw std::runtime_error("__udivti3: integer divide by zero");
+inline unsigned __int128 SonyUdivmod128(unsigned __int128 dividend, unsigned __int128 divisor, unsigned __int128* remainderOut) {
     unsigned __int128 quotient = 0;
     unsigned __int128 remainder = 0;
     for (int i = 127; i >= 0; --i) {
@@ -192,7 +191,26 @@ inline unsigned __int128 SonyUdivti3(unsigned __int128 dividend, unsigned __int1
             quotient |= (unsigned __int128)1 << i;
         }
     }
+    *remainderOut = remainder;
     return quotient;
+}
+
+inline unsigned __int128 SonyUdivti3(unsigned __int128 dividend, unsigned __int128 divisor) {
+    if (divisor == 0) throw std::runtime_error("__udivti3: integer divide by zero");
+    unsigned __int128 remainder = 0;
+    return SonyUdivmod128(dividend, divisor, &remainder);
+}
+
+inline unsigned __int128 SonyUmodti3(unsigned __int128 dividend, unsigned __int128 divisor) {
+    if (divisor == 0) {
+        char message[96];
+        std::snprintf(message, sizeof(message), "__umodti3: integer divide by zero (0x%016llx%016llx %% 0)",
+            (unsigned long long)(dividend >> 64), (unsigned long long)dividend);
+        throw std::runtime_error(message);
+    }
+    unsigned __int128 remainder = 0;
+    SonyUdivmod128(dividend, divisor, &remainder);
+    return remainder;
 }
 
 inline __int128 SonyDivti3(__int128 dividend, __int128 divisor) {
