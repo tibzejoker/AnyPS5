@@ -327,6 +327,7 @@ public:
     bool Refresh();
     static std::uint64_t SinglePassMoves();
     static std::uint64_t RefreshesProved();
+    static std::uint64_t UntrackedCompares();
     std::uint64_t GuestBytes() const;
     VkDeviceSize AllocationBytes() const { return memoryBytes; }
 
@@ -482,7 +483,7 @@ private:
     std::uint64_t sliceLinearBytes = 0;
     SurfaceGeometry geometry;
     std::vector<std::byte> original;
-    mutable std::array<std::uint64_t, 4> comparedGuestBytes{};
+    mutable std::array<std::uint64_t, 5> comparedGuestBytes{};
     std::vector<std::byte> generationBaseline;
     // DCC keys the image content was uploaded under: a fast-cleared surface starts as its clear value.
     DccKeys uploadedKeys = DccKeys::Uncompressed;

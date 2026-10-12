@@ -470,6 +470,69 @@ void RunImportWindow(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
 #endif
 
 #ifdef _WIN32
+void RunHintedImport(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+    using namespace AgcDriver::GuestMemory;
+    const auto address = AddressOf(block);
+    std::memset(block, 0x55, BlockBytes);
+    auto descriptor = TextureDescriptor(block, nullptr);
+    descriptor[2] = ((Side - 1u) >> 2u) | ((2 * Side - 1u) << 14u);
+    descriptor[6] = 0;
+    descriptor[7] = 0;
+    std::vector<std::uint32_t> userData(16, 0u);
+    std::copy(descriptor.begin(), descriptor.end(), userData.begin() + 4);
+    std::lock_guard gpu(GpuMutex());
+    BumpCollectEpoch();
+    Dispatch(device, WriteCode, userData);
+    const auto image = StorageTexture::FindPending(address, BlockBytes);
+    Require(image != nullptr && image->GuestBytes() == BlockBytes, "hinted import: the two-block image has no pending results");
+    if (Watched(address, BlockBytes)) {
+        std::puts("the write-watched image stayed watched: its untracked hint is not tested");
+        StorageTexture::FlushPending(address, BlockBytes, nullptr, "test hinted import");
+        device.WaitIdle();
+        return;
+    }
+    StorageTexture::FlushPending(address, BlockBytes, nullptr, "test hinted import");
+    device.WaitIdle();
+    for (int settle = 0; settle < 2; ++settle) {
+        BumpCollectEpoch();
+        image->Refresh();
+    }
+    const auto version = image->Version();
+    const auto compares = StorageTexture::UntrackedCompares();
+    for (int epoch = 0; epoch < 50; ++epoch) {
+        BumpCollectEpoch();
+        Require(image->Refresh() && image->Version() == version, "hinted import: an unchanged image was uploaded again");
+    }
+    char message[192];
+    std::snprintf(message, sizeof(message), "hinted import: 50 collect epochs without a store compared the image %llu times", static_cast<unsigned long long>(StorageTexture::UntrackedCompares() - compares));
+    Require(StorageTexture::UntrackedCompares() == compares, message);
+    block[SurfaceBytes + 0x100] = 0x33;
+    BumpCollectEpoch();
+    Require(!image->Refresh() && image->Version() != version, "hinted import: a CPU store into the imported image was missed");
+    const auto stored = StorageTexture::UntrackedCompares();
+    Require(stored > compares, "hinted import: the CPU store was found without a compare");
+    BumpCollectEpoch();
+    Require(image->Refresh() && StorageTexture::UntrackedCompares() - stored <= 1, "hinted import: the stored image did not settle");
+    Dispatch(device, WriteCode, userData);
+    Require(StorageTexture::FindPending(address, BlockBytes) == image, "hinted import: the second write left no pending results");
+    BumpCollectEpoch();
+    image->Refresh();
+    const auto pendingVersion = image->Version();
+    const auto beforeRewrite = StorageTexture::UntrackedCompares();
+    auto* rewritten = reinterpret_cast<volatile std::uint8_t*>(block + SurfaceBytes + 0x2000);
+    *rewritten = *rewritten;
+    BumpCollectEpoch();
+    Require(image->Refresh() && image->Version() == pendingVersion, "hinted import: a store of the bytes already there uploaded the image");
+    Require(StorageTexture::UntrackedCompares() - beforeRewrite == 1, "hinted import: a store of the bytes already there did not cost exactly one compare");
+    Require(StorageTexture::FindPending(address, BlockBytes) == image, "hinted import: a store of the bytes already there dropped the pending results");
+    BumpCollectEpoch();
+    Require(image->Refresh() && StorageTexture::UntrackedCompares() - beforeRewrite == 1, "hinted import: the image was compared again without a store");
+    StorageTexture::FlushPending(address, BlockBytes, nullptr, "test hinted import");
+    device.WaitIdle();
+    Require(Count(block, SurfaceBytes, 0xff) == Threads * 4u, "hinted import: the pending results were lost");
+    Require(block[SurfaceBytes + 0x100] == 0x33, "hinted import: the write-back lost the CPU store");
+}
+
 void RunSharedImport(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     using namespace AgcDriver::GuestMemory;
     const auto address = AddressOf(block);
@@ -509,6 +572,8 @@ int main() {
         std::optional<GuestBlock> untracked;
         std::optional<GuestBlock> shared;
         std::optional<GuestBlock> window;
+        std::optional<GuestBlock> pendingSingle;
+        std::optional<GuestBlock> hinted;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         block.emplace(false);
@@ -529,6 +594,9 @@ int main() {
 #ifndef _WIN32
             window.emplace(true);
             RunImportWindow(*device, window->Data());
+#else
+            hinted.emplace(true);
+            RunHintedImport(*device, hinted->Data());
 #endif
         } else {
             std::puts("guest memory has no write watch: a write-watched surface is not tested");

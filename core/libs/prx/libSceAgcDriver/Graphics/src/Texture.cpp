@@ -89,6 +89,7 @@ std::atomic<std::uint64_t> pretestSkipped{0}, unregisteredDropped{0}, keyFlipKep
 std::atomic<std::uint64_t> flushedAfterSkip{0}, flushedAfterSkipSameSite{0}, staleEvicted{0};
 std::atomic<std::uint64_t> depthCopyTextures{0}, depthCopyRefreshes{0};
 std::atomic<std::uint64_t> refreshesProved{0};
+std::atomic<std::uint64_t> untrackedCompares{0};
 
 struct StorageTraffic {
     std::mutex mutex;
@@ -1902,6 +1903,10 @@ std::uint64_t StorageTexture::RefreshesProved() {
     return refreshesProved.load(std::memory_order_relaxed);
 }
 
+std::uint64_t StorageTexture::UntrackedCompares() {
+    return untrackedCompares.load(std::memory_order_relaxed);
+}
+
 bool StorageTexture::ServesKeysAt(std::uint64_t dccAddress) const {
     const bool locked = GuestMemory::GpuMutex().HeldByThisThread();
     const auto readFollowed = [&] {
@@ -1966,29 +1971,16 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
     const auto first = address / blockBytes;
     Require(changed.size() == (end - 1) / blockBytes - first + 1, "texture comparison block count differs");
     const auto* recorder = Recorder::Active();
-    const std::array<std::uint64_t, 4> stamp{GuestMemory::CollectEpoch(), GuestMemory::NewestStamp(address, bytes), GuestMemory::ForgetSerial(), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
-    const bool cacheable = memoize && stamp[0] != 0 && (stamp[2] & 1u) == 0 && address == descriptor.baseAddress && bytes == guestBytes;
-    if (std::getenv("GTAV_DRAW_PHASES") != nullptr) {
-        static std::array<std::atomic<std::uint64_t>, 10> why{};
-        static std::atomic<std::uint64_t> calls{0};
-        if (!memoize) ++why[0];
-        else if (stamp[0] == 0) ++why[1];
-        else if ((stamp[2] & 1u) != 0) ++why[2];
-        else if (address != descriptor.baseAddress || bytes != guestBytes) ++why[3];
-        else if (comparedGuestBytes == stamp) ++why[4];
-        else if (comparedGuestBytes == std::array<std::uint64_t, 4>{}) ++why[5];
-        else {
-            if (comparedGuestBytes[0] != stamp[0]) ++why[6];
-            if (comparedGuestBytes[1] != stamp[1]) ++why[7];
-            if (comparedGuestBytes[2] != stamp[2]) ++why[8];
-            if (comparedGuestBytes[3] != stamp[3]) ++why[9];
-        }
-        if (++calls % 20000 == 0) std::fprintf(stderr, "[gtav-memo] calls %llu: not-memoize %llu epoch0 %llu forget-odd %llu partial %llu HIT %llu no-entry %llu | miss by epoch %llu newest %llu forget %llu note %llu\n", static_cast<unsigned long long>(calls.load()), static_cast<unsigned long long>(why[0].load()), static_cast<unsigned long long>(why[1].load()), static_cast<unsigned long long>(why[2].load()), static_cast<unsigned long long>(why[3].load()), static_cast<unsigned long long>(why[4].load()), static_cast<unsigned long long>(why[5].load()), static_cast<unsigned long long>(why[6].load()), static_cast<unsigned long long>(why[7].load()), static_cast<unsigned long long>(why[8].load()), static_cast<unsigned long long>(why[9].load()));
-    }
+    const auto epoch = GuestMemory::CollectEpoch();
+    const bool whole = address == descriptor.baseAddress && bytes == guestBytes;
+    const auto hint = memoize && epoch != 0 && whole ? GuestMemory::UntrackedHint(address, bytes) : 0;
+    const std::array<std::uint64_t, 5> stamp{hint != 0, hint != 0 ? hint : epoch, GuestMemory::NewestStamp(address, bytes), GuestMemory::ForgetSerial(), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
+    const bool cacheable = memoize && epoch != 0 && (stamp[3] & 1u) == 0 && whole;
     if (cacheable && comparedGuestBytes == stamp) {
         std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);
         return true;
     }
+    untrackedCompares.fetch_add(1, std::memory_order_relaxed);
     const auto saved = std::span(original).subspan(static_cast<std::size_t>(address - descriptor.baseAddress), bytes);
     if (GuestMemory::EqualsCommittedUnsynced(address, saved)) {
         std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);
