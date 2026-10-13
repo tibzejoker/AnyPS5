@@ -2405,18 +2405,149 @@ void framebufferLayerTests() {
 }
 
 void quadPixelMaskTests() {
-    auto queue = makeState();
-    queue.context[0x30e] = 0xffff0000u;
-    queue.context[0x30f] = 0u;
-    queue.context[0x1b3] = 2;
-    queue.context[0x1b4] = 2;
-    static_cast<void>(AgcDriver::Graphics::DecodeState(queue));
-    Require(AgcDriver::Graphics::DrawRejection(queue, false).empty(), "a single-sample quad pixel mask was refused by the precheck");
-    Require(AgcDriver::Graphics::DecodePixelStageInfo(queue.context, {}).quadPixelMask == 0x2u, "PA_SC_AA_MASK did not decode to the covered quad pixel");
-    queue = makeState();
-    queue.context[0x1b3] = 2;
-    queue.context[0x1b4] = 2;
-    Require(AgcDriver::Graphics::DecodePixelStageInfo(queue.context, {}).quadPixelMask == 0xfu, "full sample masks did not cover the whole quad");
+    using AgcDriver::Graphics::DecodeState;
+    using AgcDriver::Graphics::DrawRejection;
+    using AgcDriver::Graphics::HostSampleMask;
+    using AgcDriver::Graphics::PartialSampleMask;
+    using AgcDriver::Graphics::QuadPixelMask;
+    using AgcDriver::Graphics::UniformSampleMask;
+    using Masks = std::array<std::uint16_t, 4>;
+    const auto masked = [](std::uint32_t top, std::uint32_t bottom, std::uint32_t log2 = 0u) {
+        auto queue = makeState();
+        queue.context[0x30e] = top;
+        queue.context[0x30f] = bottom;
+        queue.context[0x1b3] = 2;
+        queue.context[0x1b4] = 2;
+        if (log2 != 0u) {
+            queue.context[0x2f8] = (log2 << 20u) | log2;
+            queue.context[0x292] = 3;
+            queue.context[0x3b8] = 0x0dc00000u;
+            queue.context[0x31d] = (log2 << 12u) | (log2 << 15u);
+            for (std::uint32_t pixel = 0; pixel < 4; ++pixel) queue.context[0x2fe + pixel * 4u] = log2 == 1u ? 0xcc44u : 0x622ae6aeu;
+        }
+        return queue;
+    };
+    const auto accepted = [](const AgcDriver::QueueState& queue, const std::string& what) {
+        std::vector<AgcDriver::Graphics::RegisterRead> reads;
+        AgcDriver::Graphics::RegisterReadLog() = &reads;
+        const auto state = DecodeState(queue);
+        const auto rejection = DrawRejection(queue, false);
+        AgcDriver::Graphics::RegisterReadLog() = nullptr;
+        Require(rejection.empty(), what + " was refused by the precheck: " + rejection);
+        for (const auto read : reads) Require(AgcDriver::Graphics::DrawKeyCovers(read), "DrawKeyRegisters lacks a register decoded for " + what);
+        return state;
+    };
+    const auto refused = [](const AgcDriver::QueueState& queue, std::string_view reason) {
+        expectFailure([&] { DecodeState(queue); }, reason);
+        Require(DrawRejection(queue, false).find(reason) != std::string::npos, "the precheck accepted a draw DecodeState refuses for " + std::string(reason));
+    };
+    auto state = accepted(masked(0x0000ffffu, 0u), "the X0Y0 single-sample mask");
+    Require(state.quadSampleMask == Masks{1, 0, 0, 0} && PartialSampleMask(state) && !UniformSampleMask(state) && QuadPixelMask(state) == 0x1u, "PA_SC_AA_MASK 0x0000ffff/0 did not cover only the even-x, even-y pixel of each quad");
+    state = accepted(masked(0xffff0000u, 0u), "the X1Y0 single-sample mask");
+    Require(QuadPixelMask(state) == 0x2u, "PA_SC_AA_MASK 0xffff0000/0 did not cover only the odd-x, even-y pixel of each quad");
+    state = accepted(masked(0xfffe0001u, 0x0001fffeu), "a single-sample mask with bits above sample 0");
+    Require(state.quadSampleMask == Masks{1, 0, 0, 1} && QuadPixelMask(state) == 0x9u, "a single-sample mask did not keep only bit 0 of each pixel's field");
+    state = accepted(masked(0x00010001u, 0x00010001u), "a single-sample mask with only sample 0 set");
+    Require(!PartialSampleMask(state) && QuadPixelMask(state) == 0xfu && HostSampleMask(state) == 1u, "PA_SC_AA_MASK 0x00010001 at one sample is not a full mask");
+    state = accepted(masked(0u, 0u), "an empty single-sample mask");
+    Require(PartialSampleMask(state) && UniformSampleMask(state) && HostSampleMask(state) == 0u && QuadPixelMask(state) == 0xfu, "an empty mask equal for the whole quad did not become a host sample mask of 0");
+    Require(AgcDriver::Graphics::DecodePixelStageInfo(masked(0x0000ffffu, 0u).context, {}).quadPixelMask == 0xfu, "the pixel stage decode read the sample mask registers instead of the decoded state");
+    auto queue = masked(0x0000ffffu, 0u);
+    queue.context[0x203] = 0x10u;
+    Require(accepted(queue, "an early-Z masked draw").pixelEarlyZ, "DB_SHADER_CONTROL Z_ORDER EARLY_Z_THEN_LATE_Z did not decode as early Z");
+    queue.context[0x203] = 0x50u;
+    Require(!accepted(queue, "a killing masked draw").pixelEarlyZ, "a pixel program with kill decoded as early Z");
+    queue.context[0x313] = 0x6001u;
+    refused(queue, "sample masks with conservative rasterization");
+    queue = masked(0xffffffffu, 0xffffffffu);
+    queue.context[0x313] = 0x6001u;
+    Require(!PartialSampleMask(accepted(queue, "a full mask with conservative rasterization")), "a full mask with conservative rasterization decoded as partial");
+    state = accepted(masked(0x00050005u, 0x00050005u, 2u), "a 4x mask equal for the whole quad");
+    Require(state.samples == 4 && PartialSampleMask(state) && UniformSampleMask(state) && HostSampleMask(state) == 0x5u && QuadPixelMask(state) == 0xfu, "a 4x mask 0x5 equal for the whole quad did not become the host sample mask 0x5");
+    state = accepted(masked(0xfff5fff5u, 0xfff5fff5u, 2u), "a 4x mask with bits above sample 3");
+    Require(HostSampleMask(state) == 0x5u && state.quadSampleMask == Masks{5, 5, 5, 5}, "a 4x mask kept bits of samples the rasterizer does not have");
+    state = accepted(masked(0x0000000fu, 0u, 2u), "a 4x mask that covers whole pixels");
+    Require(!UniformSampleMask(state) && QuadPixelMask(state) == 0x1u && state.quadSampleMask == Masks{0xf, 0, 0, 0}, "a 4x mask covering all samples of one quad pixel did not become a quad pixel mask");
+    state = accepted(masked(0x00000003u, 0u, 1u), "a 2x mask that covers whole pixels");
+    Require(QuadPixelMask(state) == 0x1u, "a 2x mask covering both samples of one quad pixel did not become a quad pixel mask");
+    using AgcDriver::Graphics::QuadSampleMasks;
+    constexpr Masks NoSampleMask{0xffffu, 0xffffu, 0xffffu, 0xffffu};
+    state = accepted(masked(0x00020001u, 0x00080004u, 2u), "a 4x mask with one sample per quad pixel");
+    Require(QuadPixelMask(state) == 0xfu && QuadSampleMasks(state) == Masks{1, 2, 4, 8}, "a 4x mask of sample q for quad pixel q did not become per-pixel sample masks");
+    state = accepted(masked(0x0000000fu, 0x00030000u, 2u), "a 4x mask mixing full, empty and partial pixels");
+    Require(QuadPixelMask(state) == 0x9u && QuadSampleMasks(state) == Masks{0xffff, 0, 0, 3}, "a 4x mask mixing full, empty and partial pixels did not keep full pixels as all samples");
+    Require(QuadSampleMasks(accepted(masked(0x0000000fu, 0u, 2u), "a whole-pixel 4x mask")) == NoSampleMask && QuadSampleMasks(accepted(masked(0x00050005u, 0x00050005u, 2u), "a uniform 4x mask")) == NoSampleMask && QuadSampleMasks(accepted(masked(0x0000ffffu, 0u), "a single-sample mask")) == NoSampleMask, "a mask without partial pixels that differ produced per-pixel sample masks");
+    for (const auto centroid : {4u, 64u}) {
+        queue = masked(0x00020001u, 0x00080004u, 2u);
+        queue.context[0x1b3] = 2u | centroid;
+        queue.context[0x1b4] = 2u | centroid;
+        Require(QuadSampleMasks(accepted(queue, "centroid interpolation under per-pixel sample masks")) == Masks{1, 2, 4, 8}, "centroid interpolation refused per-pixel sample masks");
+    }
+    for (const auto centroid : {4u, 64u}) {
+        queue = masked(0x00050005u, 0x00050005u, 2u);
+        queue.context[0x1b3] = 2u | centroid;
+        queue.context[0x1b4] = 2u | centroid;
+        refused(queue, "sample masks that remove some samples of a pixel with centroid interpolation");
+        queue.context[0x1b4] = 2u;
+        Require(HostSampleMask(accepted(queue, "an unaddressed centroid input")) == 0x5u, "an unaddressed centroid input refused a 4x mask");
+        queue = masked(0x0000000fu, 0u, 2u);
+        queue.context[0x1b3] = 2u | centroid;
+        queue.context[0x1b4] = 2u | centroid;
+        Require(QuadPixelMask(accepted(queue, "centroid interpolation under a whole-pixel mask")) == 0x1u, "centroid interpolation refused a mask that covers whole pixels");
+    }
+    queue = masked(0x0000ffffu, 0u);
+    queue.context[0x31d] = 0x12000;
+    state = accepted(queue, "a single-sample mask into a 4x target");
+    Require(state.samples == 4 && state.quadSampleMask == Masks{0xf, 0, 0, 0} && QuadPixelMask(state) == 0x1u, "single-sample rasterization into a 4x target did not apply each pixel's sample 0 bit to all of its samples");
+    queue.context[0x30e] = queue.context[0x30f] = 0xfffefffeu;
+    state = accepted(queue, "an empty single-sample mask into a 4x target");
+    Require(UniformSampleMask(state) && HostSampleMask(state) == 0u, "an empty single-sample mask into a 4x target did not remove every sample");
+
+    AgcDriver::Graphics::Context context{};
+    ShaderRecompiler::RecompileResult early;
+    early.spirv = std::vector<std::uint32_t>{spv::MagicNumber, 0x10300u, 0u, 2u, 0u, (3u << 16u) | spv::OpExecutionMode, 1u, spv::ExecutionModeEarlyFragmentTests, (5u << 16u) | spv::OpFunction, 0u, 1u, 0u, 0u};
+    ShaderRecompiler::RecompileResult late;
+    late.spirv = std::vector<std::uint32_t>{spv::MagicNumber, 0x10300u, 0u, 2u, 0u, (3u << 16u) | spv::OpExecutionMode, 1u, spv::ExecutionModeOriginUpperLeft};
+    Require(AgcDriver::Graphics::DeclaresEarlyFragmentTests(early) && !AgcDriver::Graphics::DeclaresEarlyFragmentTests(late), "early fragment tests were not read from the SPIR-V execution modes");
+    using Stage = ShaderRecompiler::ShaderStage;
+    AgcDriver::Graphics::State uniform{};
+    uniform.samples = 4;
+    uniform.quadSampleMask = {5, 5, 5, 5};
+    const std::array<AgcDriver::Graphics::CompiledShader, 1> earlyShaders{{{Stage::Fragment, &early, 0}}};
+    const std::array<AgcDriver::Graphics::CompiledShader, 1> lateShaders{{{Stage::Fragment, &late, 0}}};
+    expectFailure([&] { AgcDriver::Graphics::ValidateSampleMask(context, uniform, earlyShaders); }, "earlyFragmentSampleMaskTestBeforeSampleCounting");
+    AgcDriver::Graphics::ValidateSampleMask(context, uniform, lateShaders);
+    context.earlyFragmentSampleMaskTestBeforeSampleCounting = true;
+    AgcDriver::Graphics::ValidateSampleMask(context, uniform, earlyShaders);
+    ShaderRecompiler::RecompileResult stores;
+    ShaderRecompiler::DescriptorBinding written{};
+    written.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    written.role = ShaderRecompiler::DescriptorRole::GuestBuffers;
+    written.count = 1;
+    written.bufferWritten = {true};
+    stores.bindings.push_back(written);
+    const std::array<AgcDriver::Graphics::CompiledShader, 2> storing{{{Stage::Vertex, &late, 0}, {Stage::Fragment, &stores, 0}}};
+    const std::array<AgcDriver::Graphics::CompiledShader, 2> vertexStoring{{{Stage::Vertex, &stores, 0}, {Stage::Fragment, &late, 0}}};
+    AgcDriver::Graphics::State varying{};
+    varying.quadSampleMask = {1, 0, 0, 0};
+    varying.pixelEarlyZ = true;
+    varying.depth = AgcDriver::Graphics::DepthTarget{};
+    varying.depthTest = true;
+    expectFailure([&] { AgcDriver::Graphics::ValidateSampleMask(context, varying, storing); }, "differs between the pixels of a quad");
+    AgcDriver::Graphics::ValidateSampleMask(context, varying, vertexStoring);
+    for (const auto change : {0, 1, 2}) {
+        auto relaxed = varying;
+        if (change == 0) relaxed.pixelEarlyZ = false;
+        if (change == 1) relaxed.depthTest = false;
+        if (change == 2) relaxed.quadSampleMask = {1, 1, 1, 1};
+        AgcDriver::Graphics::ValidateSampleMask(context, relaxed, storing);
+    }
+    varying.depthTest = false;
+    varying.stencilTest = true;
+    expectFailure([&] { AgcDriver::Graphics::ValidateSampleMask(context, varying, storing); }, "differs between the pixels of a quad");
+    varying.stencilTest = false;
+    varying.depthBoundsTest = true;
+    expectFailure([&] { AgcDriver::Graphics::ValidateSampleMask(context, varying, storing); }, "differs between the pixels of a quad");
 }
 
 void DepthClipTests() {
@@ -4530,6 +4661,11 @@ void earlyFragmentTestsTests() {
         request.context.pixel->alphaToCoverage = true;
         const auto replayed = serializer.Deserialize(serializer.Serialize(request));
         Require(!declaresEarlyFragmentTests(request) && !declaresEarlyFragmentTests(replayed.request), "DB_SHADER_CONTROL " + std::to_string(shaderControl) + " with alpha-to-coverage declared early fragment tests");
+        request = depthExportRequest(shaderControl);
+        request.context.pixel->quadPixelMask = 0x1u;
+        const auto masked = serializer.Deserialize(serializer.Serialize(request));
+        Require(!declaresEarlyFragmentTests(request) && !declaresEarlyFragmentTests(masked.request), "DB_SHADER_CONTROL " + std::to_string(shaderControl) + " with a quad pixel mask declared early fragment tests");
+        Require(AgcDriver::Graphics::DeclaresEarlyFragmentTests(ShaderRecompiler::Recompile(depthExportRequest(shaderControl))), "the driver did not read early fragment tests from a recompiled pixel shader");
     }
 }
 

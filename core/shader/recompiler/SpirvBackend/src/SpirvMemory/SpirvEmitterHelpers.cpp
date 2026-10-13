@@ -295,6 +295,11 @@ void DefineInputs(SpirvEmitterState& state) {
             state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationFlat);
         }
     }
+    if (state.program.Resources().stage == IrShaderStage::Pixel && state.inputInfo.pixel != nullptr && state.inputInfo.pixel->QuadSampleMaskPartial()) {
+        state.sampleMaskInputVariable = DefineInterfaceVariable(state, SampleMaskArrayType(state), spv::StorageClassInput, "gl_SampleMaskIn");
+        state.module.AddAnnotation(spv::OpDecorate, state.sampleMaskInputVariable, spv::DecorationBuiltIn, spv::BuiltInSampleMask);
+        state.module.AddAnnotation(spv::OpDecorate, state.sampleMaskInputVariable, spv::DecorationFlat);
+    }
 }
 
 constexpr std::uint32_t MaxClipDistances = 8u;
@@ -383,6 +388,9 @@ void DefineOutputs(SpirvEmitterState& state) {
     }
     if (state.program.Resources().stage == IrShaderStage::Pixel && state.inputInfo.pixel != nullptr && state.inputInfo.pixel->psAlphaToCoverage) {
         if (state.inputInfo.pixel->psSampleMaskExportEnable) throw std::runtime_error("alpha-to-coverage with a sample-mask export is unsupported");
+        BuiltIn(state.sampleMaskVariable, SampleMaskArrayType(state), "gl_SampleMask", spv::BuiltInSampleMask);
+    }
+    if (state.program.Resources().stage == IrShaderStage::Pixel && state.inputInfo.pixel != nullptr && state.inputInfo.pixel->QuadSampleMaskPartial()) {
         BuiltIn(state.sampleMaskVariable, SampleMaskArrayType(state), "gl_SampleMask", spv::BuiltInSampleMask);
     }
 }
