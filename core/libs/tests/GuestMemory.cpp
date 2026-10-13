@@ -1403,6 +1403,14 @@ static void CheckSecondDirectMappingWaitsForLeases() {
 #endif
 }
 
+#ifdef _WIN32
+static void RequireResidentMapping(const void* address) {
+    MEMORY_BASIC_INFORMATION info{};
+    Require(VirtualQuery(address, &info, sizeof(info)) == sizeof(info));
+    Require(info.State == MEM_COMMIT && info.Type == MEM_PRIVATE);
+}
+#endif
+
 static void CheckBreakingAResidentRunKeepsConcurrentAccesses() {
 #ifdef _WIN32
     constexpr std::size_t page = 0x4000;
@@ -1414,6 +1422,7 @@ static void CheckBreakingAResidentRunKeepsConcurrentAccesses() {
         Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, chunk * chunks, 0, 0, &phys) == 0);
         void* mapped = nullptr;
         Require(sceKernelMapDirectMemory(&mapped, chunk * chunks, 3, 0, phys, 0) == 0);
+        RequireResidentMapping(mapped);
         auto* memory = static_cast<volatile unsigned char*>(mapped);
         const auto value = [&](std::size_t at) { return static_cast<unsigned char>((at * 31 + static_cast<std::size_t>(round)) | 1); };
         const auto skipped = [&](std::size_t offset) { return unmap && offset >= page && offset < page * 2; };
@@ -1487,6 +1496,7 @@ static void CheckRemappedDirectMemoryIsChargedOnce() {
         Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, bytes, 0, 0, &phys) == 0);
         void* mapped = nullptr;
         Require(sceKernelMapDirectMemory(&mapped, bytes, 3, 0, phys, 0) == 0);
+        RequireResidentMapping(mapped);
         std::memset(mapped, 0xa5, bytes);
         Require(sceKernelMunmap(mapped, bytes) == 0);
         void* again = nullptr;
