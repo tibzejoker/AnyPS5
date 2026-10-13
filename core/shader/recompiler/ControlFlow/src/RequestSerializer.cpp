@@ -433,7 +433,7 @@ ShaderVertexStageInfo readVertexInfo(Reader& reader, std::uint32_t version) {
     info.fetchAttribReg = reader.ReadU32();
     info.fetchBufferReg = reader.ReadU32();
     info.fetchEmbedded = reader.ReadBool();
-    if (version >= 18u) info.paClVsOutCntl = reader.ReadU32();
+    if (version >= 22u) info.paClVsOutCntl = reader.ReadU32();
     return info;
 }
 
@@ -811,7 +811,7 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     if (version >= 16u) result.request.target.float64DenormPreserve = reader.ReadBool();
     if (version >= 17u) result.request.target.registrationModules = reader.ReadBool();
     if (version >= 17u) result.request.target.registrationWordLimit = reader.ReadU32();
-    if (version >= 22u) result.request.target.vertexSubgroups = reader.ReadBool();
+    if (version >= 18u) result.request.target.vertexSubgroups = reader.ReadBool();
     return result;
 }
 
