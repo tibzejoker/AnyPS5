@@ -2085,6 +2085,12 @@ void verifyMeshConfiguration() {
         std::vector<std::uint64_t> full;
         RecompileCacheKey::Build(fragment, full);
         require(masked != full, "the quad pixel mask is not part of the recompile cache key");
+        fragment.context.pixel->quadSampleMask = {0x1u, 0x2u, 0x0u, 0xffffu};
+        const auto sampled = RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(fragment));
+        require(sampled.request.context.pixel.has_value() && sampled.request.context.pixel->quadSampleMask == std::array<std::uint16_t, 4>{0x1u, 0x2u, 0x0u, 0xffffu}, "the quad sample masks were lost in serialization");
+        std::vector<std::uint64_t> partial;
+        RecompileCacheKey::Build(fragment, partial);
+        require(partial != full, "the quad sample masks are not part of the recompile cache key");
     }
     std::vector<std::uint64_t> key;
     RecompileCacheKey::Build(request, key);
@@ -2253,14 +2259,14 @@ void verifyPixelRequestSerialization() {
     minimal.context.pixel->rasterPrimitive = RasterPrimitive::Rectangle;
     minimal.context.pixel->layerExported = true;
     const auto encoded = serializer.Serialize(minimal);
-    require(requestPrefix(encoded, 8u) == "NVNQQRgAAAA=", "new requests did not use serialization version 24");
+    require(requestPrefix(encoded, 8u) == "NVNQQRkAAAA=", "new requests did not use serialization version 25");
     require(serializer.Deserialize(encoded).request.context.pixel->rasterPrimitive == RasterPrimitive::Rectangle, "the pixel primitive class did not round-trip");
     require(serializer.Deserialize(encoded).request.context.pixel->layerExported, "the pixel layer export did not round-trip");
     constexpr std::size_t mappingOffset = 8u + 37u + 18u + 163u;
-    for (std::size_t bytes = 0; bytes < 23u; ++bytes) {
-        expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source, alpha-to-coverage, stencil reference export flag, primitive class, layer export flag or quad pixel mask was accepted");
+    for (std::size_t bytes = 0; bytes < 39u; ++bytes) {
+        expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source, alpha-to-coverage, stencil reference export flag, primitive class, layer export flag, quad pixel mask or quad sample mask was accepted");
     }
-    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRkAAAA="}) {
+    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRoAAAA="}) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(unsupported)); }, "serialization version", "an unsupported request version was accepted");
     }
     static constexpr std::string_view version18Request{
@@ -2384,12 +2390,21 @@ void verifyVertexInfoVersion19() {
     std::size_t maskOffset = 0;
     while (maskOffset < legacyPixel.size() && legacyPixel[maskOffset] == maskedBytes[maskOffset]) ++maskOffset;
     require(maskOffset == flagOffset + 1u && maskOffset < legacyPixel.size(), "the quad pixel mask is not the byte after the pixel layer export flag");
+    constexpr std::size_t sampleMaskBytes = 16u;
+    auto sampledPixel = maskedPixel;
+    sampledPixel.context.pixel->quadSampleMask = {0x1u, 0x2u, 0x4u, 0x8u};
+    auto version24 = decodeBase64(serializer.Serialize(sampledPixel));
+    require(std::equal(maskedBytes.begin(), maskedBytes.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u), version24.begin()) && version24[maskOffset + 1u] == 0x1u && version24[maskOffset + 5u] == 0x2u && version24[maskOffset + 9u] == 0x4u && version24[maskOffset + 13u] == 0x8u, "the quad sample masks are not the four words after the quad pixel mask");
+    version24.erase(version24.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u), version24.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes));
+    version24[4] = 24u;
+    const auto replay24 = serializer.Deserialize(encodeBase64(version24));
+    require(replay24.request.context.pixel.has_value() && replay24.request.context.pixel->quadPixelMask == 0x2u && replay24.request.context.pixel->quadSampleMask == std::array<std::uint16_t, 4>{0xffffu, 0xffffu, 0xffffu, 0xffffu} && decodeBase64(serializer.Serialize(replay24.request)) == maskedBytes, "a version 24 request read quad sample masks or misread the fields after them");
     auto version23 = maskedBytes;
-    version23.erase(version23.begin() + static_cast<std::ptrdiff_t>(maskOffset));
+    version23.erase(version23.begin() + static_cast<std::ptrdiff_t>(maskOffset), version23.begin() + static_cast<std::ptrdiff_t>(maskOffset + 1u + sampleMaskBytes));
     version23[4] = 23u;
     const auto replay23 = serializer.Deserialize(encodeBase64(version23));
     require(replay23.request.context.pixel.has_value() && replay23.request.context.pixel->quadPixelMask == 0xfu && serializer.Serialize(replay23.request) == encodedPixel, "a version 23 request read a quad pixel mask or misread the fields after it");
-    legacyPixel.erase(legacyPixel.begin() + static_cast<std::ptrdiff_t>(flagOffset), legacyPixel.begin() + static_cast<std::ptrdiff_t>(flagOffset + 2u));
+    legacyPixel.erase(legacyPixel.begin() + static_cast<std::ptrdiff_t>(flagOffset), legacyPixel.begin() + static_cast<std::ptrdiff_t>(flagOffset + 2u + sampleMaskBytes));
     for (const auto version : {19u, 20u, 21u, 22u}) {
         legacyPixel[4] = static_cast<std::uint8_t>(version);
         const auto replayPixel = serializer.Deserialize(encodeBase64(legacyPixel));

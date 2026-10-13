@@ -125,6 +125,8 @@ struct State {
     std::array<std::uint8_t, 8> sampleLocations{};
     bool customSampleLocations = false;
     std::uint32_t paClVsOutCntl = 0;
+    std::array<std::uint16_t, 4> quadSampleMask{0xffffu, 0xffffu, 0xffffu, 0xffffu};
+    bool pixelEarlyZ = false;
 };
 
 // PA_CL_VS_OUT_CNTL bits that place position exports (clip and cull distances, the misc and the two
@@ -137,6 +139,11 @@ std::array<VkSampleLocationEXT, 8> SampleLocations(const State& state);
 std::array<std::uint8_t, 8> ExportMappings(const State& state);
 std::array<ShaderRecompiler::ColorExportPacking, 8> ExportPackings(const State& state);
 ShaderRecompiler::RasterPrimitive RasterPrimitiveOf(const State& state);
+bool PartialSampleMask(const State& state);
+bool UniformSampleMask(const State& state);
+VkSampleMask HostSampleMask(const State& state);
+std::uint8_t QuadPixelMask(const State& state);
+std::array<std::uint16_t, 4> QuadSampleMasks(const State& state);
 ColorTarget DecodeColorBuffer(const Registers& context, std::uint32_t slot);
 std::size_t CmaskBytes(std::uint32_t width, std::uint32_t height);
 std::uint32_t ColorWriteMask(const Registers& context);
