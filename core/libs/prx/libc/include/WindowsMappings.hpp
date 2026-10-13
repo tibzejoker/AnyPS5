@@ -75,11 +75,11 @@ public:
         reset(reinterpret_cast<std::uintptr_t>(address), bytes);
     }
 
-    void Map(void* address, std::size_t bytes, HANDLE section, std::uint64_t offset, DWORD protection, bool watched) {
+    void Map(void* address, std::size_t bytes, HANDLE section, std::uint64_t offset, DWORD protection, bool watched = false, bool resident = false) {
         std::lock_guard lock(mutex);
         auto cursor = reinterpret_cast<std::uintptr_t>(address);
         reset(cursor, bytes);
-        watchResident = watched;
+        if (resident) watchResident = watched;
         HANDLE duplicate = nullptr;
         if (!DuplicateHandle(GetCurrentProcess(), section, GetCurrentProcess(), &duplicate, 0, FALSE, DUPLICATE_SAME_ACCESS)) fail("keep shared guest section");
         const auto owned = std::make_shared<Section>(duplicate);
@@ -95,7 +95,7 @@ public:
         const auto single = [&](std::size_t done) {
             const auto& slot = slotOf(done);
             const auto shared = slot.page.lock();
-            return !slot.stored && (!shared || shared->aliases.empty());
+            return resident && !slot.stored && (!shared || shared->aliases.empty());
         };
         for (std::size_t done = 0; done < bytes;) {
             const auto base = cursor + done;
@@ -589,7 +589,7 @@ private:
     void mapShared(std::uintptr_t base, HANDLE section, std::uint64_t offset, DWORD protection) {
         void* page = reinterpret_cast<void*>(base);
         if (!map(section, GetCurrentProcess(), page, offset, pageBytes, MEM_REPLACE_PLACEHOLDER, PAGE_EXECUTE_READWRITE, nullptr, 0)) fail("map shared guest page");
-        if (!VirtualAlloc(page, pageBytes, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) fail("commit shared guest page");
+        if (query(base).State == MEM_RESERVE && !VirtualAlloc(page, pageBytes, MEM_COMMIT, PAGE_EXECUTE_READWRITE)) fail("commit shared guest page");
         DWORD previous;
         if (!VirtualProtect(page, pageBytes, protection, &previous)) fail("protect shared guest page");
     }
@@ -610,7 +610,7 @@ private:
         if (!VirtualProtect(reinterpret_cast<void*>(start), stop - start, PAGE_READONLY, &previous)) fail("fence resident guest pages");
         const auto section = views.at(start).section;
         auto window = open(section->handle, views.at(start).offset, stop - start);
-        if (!VirtualAlloc(window.bytes, stop - start, MEM_COMMIT, PAGE_READWRITE)) fail("commit direct memory pages");
+        if (query(reinterpret_cast<std::uintptr_t>(window.bytes)).State == MEM_RESERVE && !VirtualAlloc(window.bytes, stop - start, MEM_COMMIT, PAGE_READWRITE)) fail("commit direct memory pages");
         std::memcpy(window.bytes, reinterpret_cast<const void*>(start), stop - start);
         close(window);
         if (!VirtualFree(reinterpret_cast<void*>(start), stop - start, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) fail("release resident guest pages");
