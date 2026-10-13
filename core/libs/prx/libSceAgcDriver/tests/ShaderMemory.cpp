@@ -12,6 +12,7 @@
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
+#include "IntermediateRepresentation/IrProgram.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
@@ -1926,6 +1927,22 @@ void verifyMeshConfiguration() {
     request.graphics = GraphicsCompileContext{0u, {}, mesh, std::nullopt, {}};
     const auto replay = RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(request));
     require(replay.request.graphics.has_value() && replay.request.graphics->mesh.has_value() && replay.request.graphics->mesh->esgsItemSize == 12u && replay.request.graphics->mesh->primitivesPerGroup == 21u, "mesh configuration was lost in serialization");
+    {
+        RecompileRequest vertex{};
+        vertex.shader = {ShaderStage::Vertex, 0x10000u, code, 0, {}};
+        vertex.context.waveSize = 64;
+        ShaderVertexStageInfo info{};
+        info.paClVsOutCntl = 0x0040000fu;
+        vertex.context.vertex = info;
+        const auto back = RequestSerializer{}.Deserialize(RequestSerializer{}.Serialize(vertex));
+        require(back.request.context.vertex.has_value() && back.request.context.vertex->paClVsOutCntl == 0x0040000fu, "PA_CL_VS_OUT_CNTL was lost in serialization");
+        std::vector<std::uint64_t> clipped;
+        RecompileCacheKey::Build(vertex, clipped);
+        vertex.context.vertex->paClVsOutCntl = 0;
+        std::vector<std::uint64_t> unclipped;
+        RecompileCacheKey::Build(vertex, unclipped);
+        require(clipped != unclipped, "PA_CL_VS_OUT_CNTL is not part of the recompile cache key");
+    }
     std::vector<std::uint64_t> key;
     RecompileCacheKey::Build(request, key);
     const auto first = key;
@@ -2104,13 +2121,13 @@ void verifyPixelRequestSerialization() {
     minimal.context.pixel = ShaderPixelStageInfo{};
     minimal.context.pixel->rasterPrimitive = RasterPrimitive::Rectangle;
     const auto encoded = serializer.Serialize(minimal);
-    require(requestPrefix(encoded, 8u) == "NVNQQRUAAAA=", "new requests did not use serialization version 21");
+    require(requestPrefix(encoded, 8u) == "NVNQQRYAAAA=", "new requests did not use serialization version 22");
     require(serializer.Deserialize(encoded).request.context.pixel->rasterPrimitive == RasterPrimitive::Rectangle, "the pixel primitive class did not round-trip");
     constexpr std::size_t mappingOffset = 8u + 37u + 18u + 163u;
     for (std::size_t bytes = 0; bytes < 20u; ++bytes) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(requestPrefix(encoded, mappingOffset + bytes))); }, "truncated data", "a truncated pixel mapping, packing, dual-source, alpha-to-coverage, stencil reference export flag or primitive class was accepted");
     }
-    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRYAAAA="}) {
+    for (const auto unsupported : {"NVNQQQAAAAA=", "NVNQQRcAAAA="}) {
         expectFailure([&] { static_cast<void>(serializer.Deserialize(unsupported)); }, "serialization version", "an unsupported request version was accepted");
     }
     static constexpr std::string_view version18Request{
@@ -2122,6 +2139,89 @@ void verifyPixelRequestSerialization() {
     const auto version18 = serializer.Deserialize(version18Request);
     require(version18.request.context.pixel.has_value() && version18.request.context.pixel->rasterPrimitive == RasterPrimitive::Triangle, "a version 18 request read a primitive class");
     require(version18.request.target.registrationModules && version18.request.target.registrationWordLimit == 1234u && version18.request.target.vertexSubgroups, "a version 18 request trailer was misread");
+}
+
+void verifyPositionExportComponents() {
+    constexpr std::uint32_t none = 0xffffffffu;
+    struct Case {
+        std::uint32_t control;
+        std::array<std::uint32_t, 4> clip;
+        std::array<std::uint32_t, 4> cull;
+    };
+    const std::array<Case, 6> cases{{
+        {0x00400000u, {none, none, none, none}, {none, none, none, none}},
+        {0x00400001u, {0u, none, none, none}, {none, none, none, none}},
+        {0x00400002u, {none, 0u, none, none}, {none, none, none, none}},
+        {0x00400005u, {0u, none, 1u, none}, {none, none, none, none}},
+        {0x00400100u, {none, none, none, none}, {0u, none, none, none}},
+        {0x00400400u, {none, none, none, none}, {none, none, 0u, none}},
+    }};
+    for (const auto& test : cases) {
+        for (std::uint32_t component = 0; component < 4; ++component) {
+            const auto output = ShaderRecompiler::DecodePositionExportComponent(test.control, 1u, component);
+            require(output.clipDistance == test.clip[component] && output.cullDistance == test.cull[component], "PA_CL_VS_OUT_CNTL decoded a position component to the wrong clip or cull distance");
+        }
+    }
+}
+
+std::vector<std::uint8_t> decodeBase64(std::string_view text) {
+    constexpr std::string_view alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::vector<std::uint8_t> bytes;
+    std::uint32_t chunk = 0;
+    std::size_t bits = 0;
+    for (const char symbol : text) {
+        if (symbol == '=') break;
+        const auto value = alphabet.find(symbol);
+        require(value != std::string_view::npos, "invalid base64 symbol");
+        chunk = ((chunk << 6u) | static_cast<std::uint32_t>(value)) & 0xffffffu;
+        bits += 6u;
+        if (bits >= 8u) {
+            bits -= 8u;
+            bytes.push_back(static_cast<std::uint8_t>((chunk >> bits) & 0xffu));
+        }
+    }
+    return bytes;
+}
+
+std::string encodeBase64(const std::vector<std::uint8_t>& bytes) {
+    constexpr std::string_view alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string text;
+    for (std::size_t index = 0; index < bytes.size(); index += 3u) {
+        const std::size_t count = std::min<std::size_t>(3u, bytes.size() - index);
+        std::uint32_t chunk = static_cast<std::uint32_t>(bytes[index]) << 16u;
+        if (count > 1u) chunk |= static_cast<std::uint32_t>(bytes[index + 1u]) << 8u;
+        if (count > 2u) chunk |= bytes[index + 2u];
+        for (std::size_t symbol = 0; symbol < 4u; ++symbol) {
+            text.push_back(symbol <= count ? alphabet[(chunk >> (18u - 6u * symbol)) & 0x3fu] : '=');
+        }
+    }
+    return text;
+}
+
+void verifyVertexInfoVersion17() {
+    using namespace ShaderRecompiler;
+    const std::array<std::uint32_t, 1> code{0xbf810000u};
+    const RequestSerializer serializer;
+    RecompileRequest vertex{};
+    vertex.shader = {ShaderStage::Vertex, 0x10000u, code, 0, {}};
+    vertex.context.waveSize = 64;
+    vertex.context.vertex = ShaderVertexStageInfo{};
+    const auto unmarked = serializer.Serialize(vertex);
+    vertex.context.vertex->paClVsOutCntl = 0x89abcdefu;
+    const auto marked = serializer.Serialize(vertex);
+    const auto plain = decodeBase64(unmarked);
+    const auto flagged = decodeBase64(marked);
+    require(plain.size() == flagged.size(), "PA_CL_VS_OUT_CNTL changed the request size");
+    std::size_t offset = 0;
+    while (offset < plain.size() && plain[offset] == flagged[offset]) ++offset;
+    require(offset + 4u <= plain.size() && flagged[offset] == 0xefu && flagged[offset + 1u] == 0xcdu && flagged[offset + 2u] == 0xabu && flagged[offset + 3u] == 0x89u, "PA_CL_VS_OUT_CNTL is not the four bytes the version 18 vertex info adds");
+    require(std::equal(plain.begin() + offset + 4u, plain.end(), flagged.begin() + offset + 4u), "PA_CL_VS_OUT_CNTL moved the fields after it");
+    auto legacy = plain;
+    legacy.erase(legacy.begin() + offset, legacy.begin() + offset + 4u);
+    legacy[4] = 17u;
+    const auto replay = serializer.Deserialize(encodeBase64(legacy));
+    require(replay.request.context.vertex.has_value() && replay.request.context.vertex->paClVsOutCntl == 0u, "a version 17 vertex info read a PA_CL_VS_OUT_CNTL word");
+    require(serializer.Serialize(replay.request) == unmarked, "a version 17 vertex info misread the fields after it");
 }
 
 void verifyLegacyPixelRequests() {
@@ -3608,6 +3708,8 @@ int main(int argc, char** argv) {
         verifyMeshConfiguration();
         verifyPixelInputs();
         verifyPixelRequestSerialization();
+        verifyVertexInfoVersion17();
+        verifyPositionExportComponents();
         verifyLegacyPixelRequests();
         verifyPixelExportReplay();
         verifyPixelParameterSlots();
