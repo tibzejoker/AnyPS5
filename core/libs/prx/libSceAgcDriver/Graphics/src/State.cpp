@@ -1,5 +1,6 @@
 #include <cstdio>
 #include "prx/libSceAgcDriver/Graphics/include/State.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureSwizzleEquations.hpp"
@@ -364,6 +365,40 @@ bool coveredCentroidSupported(const QueueState& queue) {
     const auto ena = find(queue.context, 0x1b3);
     const auto addr = find(queue.context, 0x1b4);
     return ena != queue.context.end() && addr != queue.context.end() && (ena->second & addr->second & CentroidInputs) == 0;
+}
+
+std::array<std::uint32_t, 4> sampleMaskFields(std::uint32_t top, std::uint32_t bottom) {
+    return {top & 0xffffu, top >> 16u, bottom & 0xffffu, bottom >> 16u};
+}
+
+std::string sampleMaskRejection(const QueueState& queue, std::uint32_t config, std::uint32_t top, std::uint32_t bottom) {
+    const auto log2 = config & 7u;
+    if (log2 > 3u) return {};
+    const auto full = (1u << (1u << log2)) - 1u;
+    auto masks = sampleMaskFields(top, bottom);
+    for (auto& mask : masks) mask &= full;
+    if (std::ranges::all_of(masks, [&](std::uint32_t mask) { return mask == full; })) return {};
+    const bool uniform = std::ranges::all_of(masks, [&](std::uint32_t mask) { return mask == masks[0]; });
+    const bool wholePixels = std::ranges::all_of(masks, [&](std::uint32_t mask) { return mask == 0u || mask == full; });
+    char detail[96];
+    std::snprintf(detail, sizeof(detail), " (PA_SC_AA_MASK_X0Y0_X1Y0=0x%08x, PA_SC_AA_MASK_X0Y1_X1Y1=0x%08x)", top, bottom);
+    const auto conservative = find(queue.context, 0x313);
+    if (conservative != queue.context.end() && (conservative->second & ~0x001f6000u) != 0) return std::string("AGC graphics: sample masks with conservative rasterization are unsupported") + detail;
+    if (!wholePixels && uniform && !PixelProgramSkipped(queue)) {
+        const auto ena = find(queue.context, 0x1b3);
+        const auto addr = find(queue.context, 0x1b4);
+        if (ena != queue.context.end() && addr != queue.context.end() && (ena->second & addr->second & CentroidInputs) != 0) return std::string("AGC graphics: sample masks that remove some samples of a pixel with centroid interpolation are unsupported") + detail;
+    }
+    return {};
+}
+
+std::array<std::uint16_t, 4> decodeQuadSampleMask(const Registers& cx, std::uint32_t samples) {
+    const bool singleSample = (read(cx, 0x2f8) & 7u) == 0u;
+    const auto full = (1u << samples) - 1u;
+    const auto fields = sampleMaskFields(read(cx, 0x30e), read(cx, 0x30f));
+    std::array<std::uint16_t, 4> masks{};
+    for (std::size_t pixel = 0; pixel < masks.size(); ++pixel) masks[pixel] = static_cast<std::uint16_t>(singleSample ? ((fields[pixel] & 1u) != 0u ? full : 0u) : fields[pixel] & full);
+    return masks;
 }
 
 std::uint32_t decodeSamples(const Registers& cx) {
@@ -754,7 +789,7 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
     Require(read(cx, 0x83) == 0xffffu, "clip rectangles are unsupported");
     Require((read(cx, 0x8c) & 0xfu) == 0xau, "nonstandard triangle edge rules are unsupported");
     Require(read(cx, 0x2f9) == 0x2du, "nonstandard pixel center or vertex quantization is unsupported");
-    Require((read(cx, 0x2f8) & 7u) == 0 || (read(cx, 0x30e) == 0xffffffffu && read(cx, 0x30f) == 0xffffffffu), "sample masks of multisampled draws are unsupported");
+    if (auto reason = sampleMaskRejection(queue, read(cx, 0x2f8), read(cx, 0x30e), read(cx, 0x30f)); !reason.empty()) throw std::runtime_error(reason);
     const auto viewportControl = read(cx, 0x206);
     if (viewportControl != 0x43fu) throw std::runtime_error(vteMessage(viewportControl));
     zero(cx, 0x204, ClipControlMask, "unsupported PA_CL_CLIP_CNTL flags");
@@ -841,6 +876,8 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         APS5_LOG_OUT_DEBUG("Render extent from screen=%ux%u", result.renderExtent.width, result.renderExtent.height);
         Require(result.renderExtent.width != 0 && result.renderExtent.height != 0, "empty framebuffer extent for a draw without color writes");
     }
+    result.quadSampleMask = decodeQuadSampleMask(cx, result.samples);
+    result.pixelEarlyZ = !PixelProgramSkipped(queue) && PixelEarlyZ(read(cx, 0x203));
     if ((read(cx, 0x207) & LayerExports & ~result.layerExports & ~(1u << 21u)) != 0) {
         static bool reported = false;
         if (!reported) {
@@ -973,6 +1010,43 @@ std::array<ShaderRecompiler::ColorExportPacking, 8> ExportPackings(const State& 
         if (color.exportIndex < packings.size()) packings[color.exportIndex] = color.packing;
     }
     return packings;
+}
+
+bool PartialSampleMask(const State& state) {
+    const auto full = (1u << state.samples) - 1u;
+    return std::ranges::any_of(state.quadSampleMask, [&](std::uint16_t mask) { return (mask & full) != full; });
+}
+
+bool UniformSampleMask(const State& state) {
+    const auto full = (1u << state.samples) - 1u;
+    return std::ranges::all_of(state.quadSampleMask, [&](std::uint16_t mask) { return (mask & full) == (state.quadSampleMask[0] & full); });
+}
+
+VkSampleMask HostSampleMask(const State& state) {
+    const auto full = (1u << state.samples) - 1u;
+    return UniformSampleMask(state) ? state.quadSampleMask[0] & full : full;
+}
+
+std::uint8_t QuadPixelMask(const State& state) {
+    if (!PartialSampleMask(state) || UniformSampleMask(state)) return 0xfu;
+    const auto full = (1u << state.samples) - 1u;
+    std::uint8_t pixels = 0;
+    for (std::uint32_t pixel = 0; pixel < state.quadSampleMask.size(); ++pixel) {
+        if ((state.quadSampleMask[pixel] & full) != 0u) pixels = static_cast<std::uint8_t>(pixels | (1u << pixel));
+    }
+    return pixels;
+}
+
+std::array<std::uint16_t, 4> QuadSampleMasks(const State& state) {
+    std::array<std::uint16_t, 4> masks{0xffffu, 0xffffu, 0xffffu, 0xffffu};
+    if (!PartialSampleMask(state) || UniformSampleMask(state)) return masks;
+    const auto full = (1u << state.samples) - 1u;
+    if (std::ranges::all_of(state.quadSampleMask, [&](std::uint16_t mask) { return (mask & full) == 0u || (mask & full) == full; })) return masks;
+    for (std::size_t pixel = 0; pixel < masks.size(); ++pixel) {
+        const auto mask = state.quadSampleMask[pixel] & full;
+        masks[pixel] = static_cast<std::uint16_t>(mask == full ? 0xffffu : mask);
+    }
+    return masks;
 }
 
 ShaderRecompiler::RasterPrimitive RasterPrimitiveOf(const State& state) {
@@ -1309,8 +1383,10 @@ std::string DrawRejection(const QueueState& queue, bool indexed) {
     if (value(cx, 0x8c, word) && (word & 0xfu) != 0xau) return require(false, "nonstandard triangle edge rules are unsupported");
     if (value(cx, 0x2f9, word) && word != 0x2du) return require(false, "nonstandard pixel center or vertex quantization is unsupported");
     if (value(cx, 0x313, word) && (word & ~0x001f6000u) != 0 && word != 0x6001u) return conservativeMessage(word);
-    std::uint32_t other = 0;
-    if (value(cx, 0x2f8, word) && (word & 7u) != 0 && value(cx, 0x30e, word) && value(cx, 0x30f, other) && (word != 0xffffffffu || other != 0xffffffffu)) return require(false, "sample masks of multisampled draws are unsupported");
+    std::uint32_t config = 0, other = 0;
+    if (value(cx, 0x2f8, config) && value(cx, 0x30e, word) && value(cx, 0x30f, other)) {
+        if (auto reason = sampleMaskRejection(queue, config, word, other); !reason.empty()) return reason;
+    }
     if (value(cx, 0x206, word) && word != 0x43fu) return vteMessage(word);
     if (auto reason = nonzero(cx, 0x204, ClipControlMask, "unsupported PA_CL_CLIP_CNTL flags"); !reason.empty()) return reason;
     std::uint32_t targetMask = 0, shaderMask = 0;

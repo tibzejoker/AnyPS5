@@ -197,7 +197,7 @@ void DefineModule(SpirvEmitterState& state) {
             state.module.EmitExtension("SPV_EXT_shader_stencil_export");
             state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeStencilRefReplacingEXT);
         }
-        if (pixel.psEarlyZ && !pixel.psAlphaToCoverage && pixel.quadPixelMask == 0xf) {
+        if (pixel.psEarlyZ && !pixel.psAlphaToCoverage && !pixel.QuadMasked()) {
             state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeEarlyFragmentTests);
         }
         if (pixel.psOrderedPixelShader) {
