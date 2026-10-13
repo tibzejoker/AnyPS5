@@ -460,6 +460,23 @@ private:
         return matched && stride >= 4u && stride % 4u == 0u && key->Type() == IrType::U32;
     }
 
+    static bool MatchMaskedOffset(IrValue* value, IrValue*& key, std::uint32_t& stride) {
+        value = value->Resolve();
+        if (value->Opcode() != IrOpcode::BitwiseAnd32 || value->ArgumentCount() != 2u) {
+            return false;
+        }
+        std::uint32_t mask = 0;
+        IrValue* scaled = nullptr;
+        if (immediateU32(value->Argument(1), mask)) {
+            scaled = value->Argument(0);
+        } else if (immediateU32(value->Argument(0), mask)) {
+            scaled = value->Argument(1);
+        } else {
+            return false;
+        }
+        return MatchScale(scaled, key, stride) && std::has_single_bit(stride) && stride >= 4u && (mask & ~(stride - 1u)) != 0u && key->Type() == IrType::U32;
+    }
+
     static bool ReadsThroughDescriptor(const IrValue* value) {
         std::vector<const IrValue*> pending{value};
         std::vector<const IrValue*> seen;
@@ -554,8 +571,12 @@ private:
         IrValue* key = nullptr;
         std::uint32_t stride = 0;
         std::uint32_t addend = 0;
+        bool masked = false;
         if (!MatchAffineOffset(offset, key, stride, addend)) {
-            return false;
+            if (!MatchMaskedOffset(offset, key, stride)) {
+                return false;
+            }
+            masked = true;
         }
         DescriptorSource heapSource;
         std::uint32_t heapIndex = 0;
@@ -569,7 +590,9 @@ private:
         column.offset = first;
         column.dwordCount = words;
         column.sampler = sampler;
-        column.keyDomain = MatchKeyDomain(key);
+        if (!masked) {
+            column.keyDomain = MatchKeyDomain(key);
+        }
         DescriptorSource columnSource = heapSource;
         columnSource.tableColumn = column;
         plan.handle = &handle;
