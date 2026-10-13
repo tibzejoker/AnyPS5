@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 
 namespace {
@@ -192,6 +193,14 @@ void TestD16StencilFallback(const Context& context) {
     };
     Require(refused({d16s8, FormatR16Unorm, 256, 256, TileDepth64KB, Type2DArray, 1}), "two slices of a D16 surface stored as D24 must be refused, as the plane copy would read the wider image as 16-bit texels");
     Require(refused({d16s8, FormatR16Uint, 256, 256, TileStandard64KB}), "an R16_UINT view of a D16 surface stored as D24 must be refused");
+    std::string storageError;
+    try {
+        const auto words = tsharp({d16s8, FormatR16Unorm, 256, 256});
+        DepthSurfaceStorage(without, words, DecodeTextureResource(words), 0);
+    } catch (const std::runtime_error& error) {
+        storageError = error.what();
+    }
+    Require(storageError.find("depth plane") != std::string::npos && storageError.find("stored as") != std::string::npos, "storage access to the depth plane of a D16 surface stored as D24 must throw");
     ClearDepthSurfaces(without.device);
 
     static int onlyTag = 0;
