@@ -152,6 +152,7 @@ struct ShaderPixelStageInfo {
     RasterPrimitive rasterPrimitive = RasterPrimitive::Triangle;
     bool layerExported = false;
     std::uint8_t quadPixelMask = 0xf;
+    std::array<std::uint16_t, 4> quadSampleMask{0xffffu, 0xffffu, 0xffffu, 0xffffu};
 };
 
 struct ShaderVertexBufferResource {

@@ -1054,6 +1054,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     // Viewport and scissor are dynamic pipeline state, so their limits are checked here per draw.
     ValidateViewport(context, state.viewport);
     ValidateDepthBounds(context, state);
+    ValidateSampleMask(context, state, shaders);
     timer.phase(PhaseValidate);
     inputs.maxIndex = draw.indexed ? 0u : draw.firstVertex + draw.indexCount - 1u;
     if (draw.indexed) {

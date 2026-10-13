@@ -157,6 +157,20 @@ bool ShadersWriteMemory(std::span<const CompiledShader> shaders) {
     return false;
 }
 
+void ValidateSampleMask(const Context& context, const State& state, std::span<const CompiledShader> shaders) {
+    if (!PartialSampleMask(state)) return;
+    for (const auto& shader : shaders) {
+        if (shader.stage != ShaderRecompiler::ShaderStage::Fragment) continue;
+        Require(shader.program != nullptr, "missing compiled fragment shader");
+        if (UniformSampleMask(state)) {
+            Require(context.earlyFragmentSampleMaskTestBeforeSampleCounting || !DeclaresEarlyFragmentTests(*shader.program), "a sample mask with early fragment tests needs VkPhysicalDeviceMaintenance5Properties::earlyFragmentSampleMaskTestBeforeSampleCounting, which the device lacks");
+            continue;
+        }
+        const bool tested = state.depth.has_value() && (state.depthTest || state.stencilTest || state.depthBoundsTest);
+        Require(!state.pixelEarlyZ || !tested || !ShadersWriteMemory(std::span(&shader, 1)), "a sample mask that differs between the pixels of a quad, from a pixel program with early depth or stencil tests that writes memory, is unsupported: the masked pixels are removed in the shader, after the tests");
+    }
+}
+
 namespace {
 
 thread_local bool prebuilding = false;
@@ -234,6 +248,8 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
     }
     appendKey(keys.renderPass, state.depth.has_value());
     if (state.depth) appendKey(keys.renderPass, state.depth->format);
+    appendKey(keys.fragmentShader, HostSampleMask(state));
+    appendKey(keys.fragmentOutput, HostSampleMask(state));
     if (!resources.split) {
         appendKey(keys.layout, pushStagesOf(context));
         for (const auto word : resources.mainKey) appendKey(keys.layout, word);
@@ -441,6 +457,8 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         depthStencil.stencilTestEnable = state.stencilTest;
         depthStencil.front = state.stencilFront;
         depthStencil.back = state.stencilBack;
+        const VkSampleMask sampleMask = HostSampleMask(state);
+        if (PartialSampleMask(state) && UniformSampleMask(state)) samples.pSampleMask = &sampleMask;
         VkPipelineColorBlendStateCreateInfo blend{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
         const bool alternateAlpha = SplitsAlternateAlpha(state);
         std::vector<VkPipelineColorBlendAttachmentState> firstChannels(state.blends.begin(), state.blends.end());
@@ -834,6 +852,7 @@ void pipelineKey(std::vector<std::byte>& key, const Context& context, const Stat
         append(key, tessellation.outputTopology);
         append(key, tessellation.patchesPerGroup);
     }
+    append(key, HostSampleMask(state));
 }
 
 std::uint64_t hashKey(const std::vector<std::byte>& key) {

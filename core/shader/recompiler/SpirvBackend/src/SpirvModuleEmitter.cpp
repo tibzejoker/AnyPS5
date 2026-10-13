@@ -288,6 +288,7 @@ bool AlphaToCoverage(const SpirvEmitterState& state) {
 }
 
 void StoreCoverage(SpirvEmitterState& state, std::uint32_t mask) {
+    if (state.quadSampleCoverage != 0u) mask = Binary(state, spv::OpBitwiseAnd, TypeI32(state), mask, state.quadSampleCoverage);
     const auto pointer = state.module.AllocateId();
     state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, TypeI32(state)), pointer, state.sampleMaskVariable, ConstantU32(state, 0u));
     state.module.AddFunction(spv::OpStore, pointer, mask);
@@ -1090,14 +1091,29 @@ void EmitProgram(SpirvEmitterState& state) {
         state.module.AddFunction(spv::OpBeginInvocationInterlockEXT);
     }
     EmitMemoryOffsets(state);
-    if (state.program.Resources().stage == IrShaderStage::Pixel && state.inputInfo.pixel != nullptr && state.inputInfo.pixel->quadPixelMask != 0xfu) {
+    if (state.program.Resources().stage == IrShaderStage::Pixel && state.inputInfo.pixel != nullptr && state.inputInfo.pixel->QuadMasked()) {
+        const auto& pixel = *state.inputInfo.pixel;
         const auto coordinate = [&](std::uint32_t component) {
             const auto value = Unary(state, spv::OpBitcast, TypeF32(state), EmitBuiltinU32(state, StageInputKind::FragCoord, component));
             return EmitBinaryU32(state, spv::OpBitwiseAnd, Unary(state, spv::OpConvertFToU, TypeU32(state), value), ConstantU32(state, 1u));
         };
         const auto quad = EmitBinaryU32(state, spv::OpBitwiseOr, coordinate(0u), EmitBinaryU32(state, spv::OpShiftLeftLogical, coordinate(1u), ConstantU32(state, 1u)));
-        const auto bit = EmitBinaryU32(state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, ConstantU32(state, state.inputInfo.pixel->quadPixelMask), quad), ConstantU32(state, 1u));
-        const auto mask = static_cast<std::uint32_t>(state.inputInfo.pixel->quadPixelMask);
+        auto bit = EmitBinaryU32(state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, ConstantU32(state, pixel.quadPixelMask), quad), ConstantU32(state, 1u));
+        if (pixel.QuadSampleMaskPartial()) {
+            const auto top = ConstantU32(state, static_cast<std::uint32_t>(pixel.quadSampleMask[0]) | (static_cast<std::uint32_t>(pixel.quadSampleMask[1]) << 16u));
+            const auto bottom = ConstantU32(state, static_cast<std::uint32_t>(pixel.quadSampleMask[2]) | (static_cast<std::uint32_t>(pixel.quadSampleMask[3]) << 16u));
+            const auto lower = EmitCompareU32Constant(state, spv::OpIEqual, EmitBinaryU32(state, spv::OpBitwiseAnd, quad, ConstantU32(state, 2u)), 2u);
+            const auto row = Select(state, TypeU32(state), lower, bottom, top);
+            const auto shift = EmitBinaryU32(state, spv::OpShiftLeftLogical, EmitBinaryU32(state, spv::OpBitwiseAnd, quad, ConstantU32(state, 1u)), ConstantU32(state, 4u));
+            const auto covered = EmitBinaryU32(state, spv::OpBitwiseAnd, EmitBinaryU32(state, spv::OpShiftRightLogical, row, shift), ConstantU32(state, 0xffffu));
+            const auto pointer = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassInput, TypeI32(state)), pointer, state.sampleMaskInputVariable, ConstantU32(state, 0u));
+            const auto rasterized = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, TypeI32(state), rasterized, pointer);
+            bit = EmitBinaryU32(state, spv::OpBitwiseAnd, Unary(state, spv::OpBitcast, TypeU32(state), rasterized), covered);
+            state.quadSampleCoverage = Unary(state, spv::OpBitcast, TypeI32(state), covered);
+        }
+        const auto mask = static_cast<std::uint32_t>(pixel.quadPixelMask);
         const bool demoteCapability = std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityDemoteToHelperInvocation)) != state.supportedCapabilities.end();
         const bool demoteCore = state.spirvVersion >= 0x00010600u;
         const bool demoteExtension = std::find(state.supportedExtensions.begin(), state.supportedExtensions.end(), "SPV_EXT_demote_to_helper_invocation") != state.supportedExtensions.end();
@@ -1122,6 +1138,7 @@ void EmitProgram(SpirvEmitterState& state) {
             state.module.AddFunction(spv::OpKill);
         }
         EmitLabel(state, mergeLabel);
+        if (state.quadSampleCoverage != 0u) StoreCoverage(state, ConstantI32(state, -1));
     }
     if (program.BlockOrder().empty()) {
         if (OrderedPixelShader(state)) {
@@ -1384,10 +1401,8 @@ void EmitSetAttribute(SpirvValueEmitContext& ctx, const IrValue& inst) {
             if ((exp.en & 4u) != 0u && state.sampleMaskVariable != 0u) {
                 const auto raw = ExportRawComponent(ctx, data, 2);
                 const auto value = state.module.AllocateId();
-                const auto pointer = state.module.AllocateId();
                 state.module.AddFunction(spv::OpBitcast, TypeI32(state), value, raw);
-                state.module.AddFunction(spv::OpAccessChain, TypePointer(state, spv::StorageClassOutput, TypeI32(state)), pointer, state.sampleMaskVariable, ConstantU32(state, 0u));
-                state.module.AddFunction(spv::OpStore, pointer, value);
+                StoreCoverage(state, value);
             }
             return;
         }

@@ -144,6 +144,7 @@ ShaderStageInputInfo BuildShaderStageInputInfo(ShaderStageKind stage, const Gues
         pixelStorage.psOrderedPixelShader = pixel.orderedPixelShader;
         pixelStorage.psAlphaToCoverage = pixel.alphaToCoverage;
         pixelStorage.quadPixelMask = pixel.quadPixelMask;
+        pixelStorage.quadSampleMask = pixel.quadSampleMask;
         ShaderStageInputInfo result;
         result.pixel = &pixelStorage;
         return result;
