@@ -558,6 +558,16 @@ void verifyAtomicReplacement(const std::filesystem::path& directory) {
     const std::vector<std::byte> original{std::byte{0x12}, std::byte{0x00}, std::byte{0x34}};
     const std::vector<std::byte> replacement{std::byte{0xab}, std::byte{0xcd}, std::byte{0x00}, std::byte{0xef}};
     require(WriteFileAtomically(path, original), "cannot write the initial cache entry");
+#ifdef _WIN32
+    {
+        const auto renaming = CreateFileW(path.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        require(renaming != INVALID_HANDLE_VALUE, "cannot retain the cache entry's rename handle");
+        struct Close { HANDLE file; ~Close() { CloseHandle(file); } } close{renaming};
+        std::vector<std::byte> bytes;
+        require(ReadWholeFile(path, bytes) && bytes == original, "cache reader failed while the published entry retained its rename handle");
+    }
+#endif
     {
         Reader old(path);
         require(old.Read() == original, "the retained reader did not read the original entry");
