@@ -18,6 +18,7 @@
 #include <relinker/pipeline/RelinkerPipeline.hpp>
 #include <relinker/guest/GuestImage.hpp>
 #include <codegen/IAmd64OnlyConverter.hpp>
+#include <codegen/x86/RedZoneFramer.hpp>
 #include <map>
 #include <codegen/CodegenException.hpp>
 #include <algorithm>
@@ -40,6 +41,7 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
     if (options.Target != TargetSystem::Linux && options.Target != TargetSystem::Windows && options.Target != TargetSystem::MacOs) throw Domain::RelinkerException("Unknown target system");
     if (options.ToRosetta && (!options.ToIntel || options.Target == TargetSystem::Windows)) throw Domain::RelinkerException("Rosetta conversion requires Intel lowering and a non-Windows target");
     if (options.UnusedFilterLevel > 2) throw Domain::RelinkerException("Unused NID filter level must be 0, 1 or 2");
+    if (options.FrameRedZone && options.Target != TargetSystem::Windows) throw Domain::RelinkerException("Red-zone framing requires a Windows target: only Windows exception dispatch writes below RSP");
     if (input.InputPath.empty() || input.OutputPath.empty()) throw Domain::RelinkerException("Input and output names are required");
     if (input.InputPath.lexically_normal() == input.OutputPath.lexically_normal()) throw Domain::RelinkerException("Executable output would overwrite the input executable");
     if (!input.Modules.empty() && input.ModuleRoot.empty()) throw Domain::RelinkerException("Module root is required");
@@ -89,6 +91,15 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
         if (patch.Offset > sourceBytes.size() || patch.Bytes.size() > sourceBytes.size() - patch.Offset)
             throw Domain::RelinkerException("Relinker patch exceeds source image", patch.Offset);
         for (std::size_t index = 0; index < patch.Bytes.size(); ++index) sourceBytes[patch.Offset + index] = patch.Bytes[index];
+    }
+    if (options.FrameRedZone) {
+        std::vector<Domain::ProgramHeader> codeSegments;
+        for (const auto& header : Relinker::ElfReader(sourceBytes).ReadProgramHeaders()) if (header.Type == 1 && (header.Flags & 1) != 0) codeSegments.push_back(header);
+        Codegen::RedZoneFrameReport report;
+        auto framed = Codegen::FrameRedZoneFunctions(sourceBytes, codeSegments, trampolines, report);
+        { std::ostringstream message; message << "Red-zone framing: " << report.Functions << " functions, " << report.RedZoneFunctions << " leaf functions keep values below RSP, " << report.Framed << " framed (" << report.Exits << " exits)\n"; inputProgress.Message(message.str()); }
+        for (const auto& [reason, count] : report.Skipped) { std::ostringstream message; message << "Red-zone framing: skipped " << count << ": " << reason << '\n'; inputProgress.Message(message.str()); }
+        trampolines.insert(trampolines.end(), std::make_move_iterator(framed.begin()), std::make_move_iterator(framed.end()));
     }
 
     std::vector<Relinker::GuestArtifact> guestArtifacts;

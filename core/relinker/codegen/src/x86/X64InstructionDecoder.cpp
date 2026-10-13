@@ -387,6 +387,7 @@ DecodedInstructionInfo X64InstructionDecoder::DecodeInstruction(
         const std::uint8_t modrm = data[modrmPos];
         info.HasModRm = true;
         info.ModRmByte = modrm;
+        info.ModRmOffset = modrmPos;
         info.ModRmRegField = (modrm >> ModRmRegShift) & ModRmRegMask;
         const std::uint8_t mod = registerOnly ? ModRmModRegister : (modrm >> ModRmModShift) & ModRmModMask;
         const std::uint8_t rm = modrm & ModRmRmMask;
@@ -460,6 +461,7 @@ DecodedInstructionInfo X64InstructionDecoder::DecodeInstruction(
             std::uint8_t modrm = data[pos];
             info.HasModRm = true;
             info.ModRmByte = modrm;
+            info.ModRmOffset = pos;
             std::uint8_t reg = (modrm >> ModRmRegShift) & ModRmRegMask;
             info.ModRmRegField = reg;
             std::uint8_t mod = (modrm >> ModRmModShift) & ModRmModMask;
