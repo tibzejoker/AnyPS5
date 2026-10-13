@@ -378,7 +378,12 @@ void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes) {
 
 void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("shared mapping", pointer, bytes);
-    WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched());
+    WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), false);
+}
+
+void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection) {
+    if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("direct memory mapping", pointer, bytes);
+    WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), true);
 }
 
 void* GuestArenaMapAlias_nid_postfix(std::uintptr_t address, std::size_t bytes) {
