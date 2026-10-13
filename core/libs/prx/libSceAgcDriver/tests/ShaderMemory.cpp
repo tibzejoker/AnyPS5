@@ -1171,6 +1171,37 @@ void verifyImageTableSrtKey() {
     require((movedSnapshot.codes[3] & Abi::PoisonFlag) == 0u && movedSnapshot.codes[2] == outside && movedSnapshot.codes[1] == outside && moved.result->spirv == compiled.result->spirv && moved.key == compiled.key, "image table SRT key: a changed key did not move the snapshot alone");
 }
 
+void verifyImageTableMaskedOffset() {
+    using namespace ShaderRecompiler;
+    namespace Abi = ImageTableAbi;
+    static TableTexture textures[2];
+    alignas(4096) static TableGuest guest;
+    auto& heap = guest.heap;
+    std::fill(heap.begin(), heap.end(), std::array<std::uint32_t, 8>{});
+    heap[0] = TableT(textures[0].bytes.data(), TableFormat8888UNorm, TableType2D);
+    heap[1] = TableT(textures[1].bytes.data(), TableFormat32UInt, TableType2D);
+    heap[3] = heap[0];
+    guest.materials = {{{0u, 0x101u, 0u, 0u}, {0u, 0u, 0u, 0u}, {0u, 0x203u, 0u, 0u}}};
+    FillTableSrt(guest, heap.data(), 32u, 4u);
+    std::vector<std::uint32_t> code(TableMaterialCode);
+    const auto shift = std::find(code.begin(), code.end(), 0x8f108510u);
+    require(shift != code.end(), "image table masked offset: the program has no s_lshl_b32");
+    code.insert(shift + 1, {0x8710ff10u, 0x60u});
+    const auto userData = TableUserData(guest);
+    const auto request = TableRequest(code, userData);
+    const auto plan = GetResourcePlan(request);
+    require(plan->info.images.size() == 1u && plan->info.images[0].table == 0u && plan->info.images[0].tableOperation == TableOperation::Supported, "image table masked offset: the T# was not planned as a table");
+    const auto& column = plan->descriptorSources.at(plan->info.images[0].source).tableColumn;
+    require(column.has_value() && column->stride == 32u && column->addend == 0u && column->offset == 0u && column->dwordCount == 8u, "image table masked offset: the column is wrong");
+    require(!column->keyDomain.has_value(), "image table masked offset: the masked key was narrowed by its unmasked value");
+    const auto compiled = CompileTable(request);
+    const auto& snapshot = compiled.capture->snapshot.tables.tables.at(0);
+    const auto outside = Abi::PoisonCode(static_cast<std::uint32_t>(Abi::PoisonReason::OutsideDomain));
+    require(snapshot.records == 4u && snapshot.keys == 4u && snapshot.codes.size() == 4u && std::none_of(snapshot.codes.begin(), snapshot.codes.end(), [&](std::uint32_t entry) { return entry == outside; }), "image table masked offset: a record was left outside the domain");
+    const auto codes = TableCodes(TableMap(*compiled.result), 0);
+    require(codes.size() == 4u && codes[0] == codes[3] && codes[2] == Abi::NullCode && codes[1] != codes[0] && (codes[1] & Abi::PoisonFlag) == 0u, "image table masked offset: the whole table map is wrong");
+}
+
 void verifyImageTableRegistration() {
     using namespace ShaderRecompiler;
     namespace Abi = ImageTableAbi;
@@ -3768,6 +3799,7 @@ int main(int argc, char** argv) {
             verifyImageTables();
             verifyImageTableBulkReads();
             verifyImageTableSrtKey();
+            verifyImageTableMaskedOffset();
             verifyImageTableRegistration();
             std::cout << "Image table keys, maps, records and registration passed\n";
             return 0;
