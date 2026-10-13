@@ -167,6 +167,23 @@ bool ProgramUsesWorkgroup(const ShaderSnapshot& snapshot, std::size_t codeOffset
     return used;
 }
 
+std::uint32_t PositionExportLayout(const ShaderSnapshot* snapshot, std::size_t codeOffset, std::span<const std::uint32_t> code, std::uint32_t paClVsOutCntl) {
+    constexpr std::uint8_t Unknown = 0, Unused = 1, Used = 2;
+    const auto bits = paClVsOutCntl & Graphics::PositionExportLayoutBits;
+    if (bits == 0) return 0;
+    const bool cached = snapshot != nullptr && codeOffset == 0;
+    if (cached) {
+        const auto use = snapshot->positionVectorUse->load(std::memory_order_acquire);
+        if (use != Unknown) return use == Used ? bits : 0;
+    }
+    const auto decoded = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
+    const bool used = std::any_of(decoded.instructions.begin(), decoded.instructions.end(), [](const auto& instruction) {
+        return instruction.family == ShaderRecompiler::RdnaInstructionFamily::EXP && instruction.exportTarget >= 0x0du && instruction.exportTarget <= 0x0fu && instruction.exportEnableMask != 0;
+    });
+    if (cached) snapshot->positionVectorUse->store(used ? Used : Unused, std::memory_order_release);
+    return used ? bits : 0;
+}
+
 
 bool VertexWorkgroupRequired(const QueueState& queue, const ShaderRegistry& registry) {
     Graphics::NoteRegisterRead(Graphics::RegisterBank::Context, 0x2d5);
@@ -669,7 +686,11 @@ std::unique_ptr<RegisteredPreparation> PlanRegistered(const ShaderSnapshot& snap
         if (firstUser == 0) userCount += 8;
     }
     plan->userData.resize(userCount);
-    if (stage != Stage::Compute && stage != Stage::Fragment && snapshot.type != 6) vertex = Graphics::DecodeVertexStageInfo(snapshot.header, snapshot.headerAddress, plan->userData, nullptr, true, 8u - firstUser);
+    if (stage != Stage::Compute && stage != Stage::Fragment && snapshot.type != 6) {
+        vertex = Graphics::DecodeVertexStageInfo(snapshot.header, snapshot.headerAddress, plan->userData, nullptr, true, 8u - firstUser);
+        const auto outputs = state.context.find(0x207u);
+        if (vertex && outputs != state.context.end()) vertex->paClVsOutCntl = PositionExportLayout(&snapshot, codeOffset, std::span(snapshot.code).subspan(codeOffset), outputs->second);
+    }
     plan->swappc = {vertex.has_value(), firstUser, userCount};
     if (deferred != nullptr) {
         if (const auto counter = ShaderRecompiler::UnresolvableSwappcTarget(plan->decoded, &plan->swappc)) {
@@ -903,6 +924,7 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
         const auto wave = fragment ? decoded.state.stages.fragmentWaveSize : decoded.state.stages.vertexWaveSize;
         std::optional<ShaderRecompiler::ShaderVertexStageInfo> vertex;
         if (!fragment) vertex = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, nullptr, true, 8u - program.firstUserSgpr);
+        if (vertex) vertex->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, decoded.state.paClVsOutCntl);
         pushOffset = Graphics::StagePushOffset(pushOffset, program.binary.stage, fixedSlots);
         const auto offset = pushOffset;
         const auto room = (fixedSlots && fragment ? Graphics::PipelinePushSlotBytes : capacity) - pushOffset % Graphics::PipelinePushSlotBytes;
