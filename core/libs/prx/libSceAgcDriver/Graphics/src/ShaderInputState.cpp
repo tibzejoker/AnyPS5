@@ -145,8 +145,9 @@ ShaderRecompiler::ShaderPixelStageInfo DecodePixelStageInfo(const Registers& con
     const bool stencilRefExportEnable = ((shaderControl >> 1u) & 0x1u) != 0;
     const bool depthBeforeShader = ((shaderControl >> 12u) & 0x1u) != 0;
     const auto zOrder = (shaderControl >> 4u) & 0x3u;
-    const auto aaMask = read(context, 0x30e, RegisterBank::Context);
-    const auto aaMaskBottom = read(context, 0x30f, RegisterBank::Context);
+    const bool aaMasked = context.contains(0x30e) && context.contains(0x30f);
+    const auto aaMask = aaMasked ? read(context, 0x30e, RegisterBank::Context) : 0xffffffffu;
+    const auto aaMaskBottom = aaMasked ? read(context, 0x30f, RegisterBank::Context) : 0xffffffffu;
     const auto quadPixelMask = static_cast<std::uint8_t>((aaMask & 1u) | (((aaMask >> 16u) & 1u) << 1u) | ((aaMaskBottom & 1u) << 2u) | (((aaMaskBottom >> 16u) & 1u) << 3u));
     const auto loaded = [&](PixelInput input) { return (activeInputs & PixelInputBit(input)) != 0; };
     return ShaderRecompiler::ShaderPixelStageInfo{
