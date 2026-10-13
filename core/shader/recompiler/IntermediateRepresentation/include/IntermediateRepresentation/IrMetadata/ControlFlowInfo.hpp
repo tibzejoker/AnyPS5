@@ -35,9 +35,12 @@ struct TableColumn {
     std::uint32_t offset = 0;
     std::uint32_t dwordCount = 0;
     bool sampler = false;
-    std::optional<KeyDomain> keyDomain;
+    std::vector<KeyDomain> keyDomains;
+    bool unkeyed = false;
 
-    bool operator==(const TableColumn& other) const = default;
+    bool operator==(const TableColumn& other) const {
+        return heapSource == other.heapSource && stride == other.stride && addend == other.addend && offset == other.offset && dwordCount == other.dwordCount && sampler == other.sampler;
+    }
 };
 
 struct DescriptorSource {

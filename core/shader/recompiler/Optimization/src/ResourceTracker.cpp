@@ -151,8 +151,8 @@ public:
             }
             const auto& column = *m_sources[plan.source].tableColumn;
             KeepSourceAlive(*plan.handle, m_sources[column.heapSource], referenced);
-            if (column.keyDomain.has_value()) {
-                KeepSourceAlive(*plan.handle, m_sources[column.keyDomain->source], referenced);
+            if (plan.keyDomain.has_value()) {
+                KeepSourceAlive(*plan.handle, m_sources[plan.keyDomain->source], referenced);
             }
         }
         for (const auto index : m_tablePlanningMemory) {
@@ -186,6 +186,7 @@ private:
         IrValue* offset = nullptr;
         std::vector<std::uint32_t> memory;
         std::vector<const IrValue*> reads;
+        std::optional<KeyDomain> keyDomain;
     };
 
     void MakeSource(const IrValue& handle, std::uint32_t width, bool sampler, bool sampleAdjust, DescriptorSource& descriptor) {
@@ -569,11 +570,19 @@ private:
         column.offset = first;
         column.dwordCount = words;
         column.sampler = sampler;
-        column.keyDomain = MatchKeyDomain(key);
+        const auto domain = MatchKeyDomain(key);
         DescriptorSource columnSource = heapSource;
         columnSource.tableColumn = column;
         plan.handle = &handle;
         plan.source = InternSource(columnSource);
+        plan.keyDomain = domain;
+        auto& shared = *m_sources[plan.source].tableColumn;
+        if (!domain.has_value()) {
+            shared.unkeyed = true;
+            shared.keyDomains.clear();
+        } else if (!shared.unkeyed && std::find(shared.keyDomains.begin(), shared.keyDomains.end(), *domain) == shared.keyDomains.end()) {
+            shared.keyDomains.push_back(*domain);
+        }
         plan.offset = offset;
         return true;
     }
@@ -1186,14 +1195,15 @@ private:
 
     void CheckTableStores() {
         for (auto& source : m_sources) {
-            if (!source.tableColumn.has_value() || !source.tableColumn->keyDomain.has_value()) {
+            if (!source.tableColumn.has_value() || source.tableColumn->keyDomains.empty()) {
                 continue;
             }
-            for (const auto& buffer : m_info.buffers) {
-                if ((buffer.written || buffer.atomic) && buffer.source == source.tableColumn->keyDomain->source) {
-                    source.tableColumn->keyDomain.reset();
-                    break;
-                }
+            auto& column = *source.tableColumn;
+            const bool written = std::any_of(column.keyDomains.begin(), column.keyDomains.end(), [&](const KeyDomain& domain) {
+                return std::any_of(m_info.buffers.begin(), m_info.buffers.end(), [&](const auto& buffer) { return (buffer.written || buffer.atomic) && buffer.source == domain.source; });
+            });
+            if (written) {
+                column.keyDomains.clear();
             }
         }
     }
