@@ -32,8 +32,8 @@ struct Region {
 
     Region() {
         Require(section && first && alias, "cannot allocate shared test memory");
-        Mappings::Get().Map(first, Bytes, section, 0, PAGE_READWRITE);
-        Mappings::Get().Map(alias, Bytes, section, 0, PAGE_READWRITE);
+        Mappings::Get().Map(first, Bytes, section, 0, PAGE_READWRITE, true);
+        Mappings::Get().Map(alias, Bytes, section, 0, PAGE_READWRITE, true);
     }
     ~Region() {
         Mappings::Get().Reset(first, Bytes);
@@ -113,7 +113,7 @@ void CheckAliasesAndCapacity() {
     Require(region.Collect(Collection::Armed) == Pages(0, 1), "alias write was missed or fresh neighbors were consumed");
     Require(region.Collect(Collection::Fresh) == Pages(1, 16), "alias collection changed another view's history");
     Mappings::Get().Reset(region.first, Bytes);
-    Mappings::Get().Map(region.first, Bytes, region.section, 0, PAGE_READWRITE);
+    Mappings::Get().Map(region.first, Bytes, region.section, 0, PAGE_READWRITE, true);
     Require(region.Collect(Collection::Armed).empty(), "remapped address kept old collection history");
     Require(region.Collect(Collection::Fresh) == Pages(0, 16), "remapped memory was not fresh");
 }
