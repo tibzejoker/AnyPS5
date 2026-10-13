@@ -513,6 +513,14 @@ void RunHintedImport(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     Require(stored > compares, "hinted import: the CPU store was found without a compare");
     BumpCollectEpoch();
     Require(image->Refresh() && StorageTexture::UntrackedCompares() - stored <= 1, "hinted import: the stored image did not settle");
+    const auto settled = image->Version();
+    block[SurfaceBytes + 0x200] = 0x44;
+    std::array<void*, 1> marked{};
+    std::size_t count = marked.size();
+    Require(GuestArena::GuestArenaCollectWrites_nid_postfix(static_cast<std::uintptr_t>(address + SurfaceBytes), 4096, marked.data(), &count, true) && count == 1, "hinted import: the store to hide was not marked");
+    MarkWritten(address + SurfaceBytes + 0x200, 1);
+    BumpCollectEpoch();
+    Require(!image->Refresh() && image->Version() != settled, "hinted import: a recorded store without a write-watch mark was missed");
     Dispatch(device, WriteCode, userData);
     Require(StorageTexture::FindPending(address, BlockBytes) == image, "hinted import: the second write left no pending results");
     BumpCollectEpoch();
@@ -530,7 +538,7 @@ void RunHintedImport(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     StorageTexture::FlushPending(address, BlockBytes, nullptr, "test hinted import");
     device.WaitIdle();
     Require(Count(block, SurfaceBytes, 0xff) == Threads * 4u, "hinted import: the pending results were lost");
-    Require(block[SurfaceBytes + 0x100] == 0x33, "hinted import: the write-back lost the CPU store");
+    Require(block[SurfaceBytes + 0x100] == 0x33 && block[SurfaceBytes + 0x200] == 0x44, "hinted import: the write-back lost the CPU store");
 }
 
 void RunSharedImport(AgcDriver::VulkanDevice& device, std::uint8_t* block) {

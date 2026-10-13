@@ -261,14 +261,28 @@ void CheckUntrackedHint() {
     Require(rewritten > stored, "a store of the bytes already there did not move the hint");
     std::thread([&] { memory[2 * Block + 5 * 4096] ^= 1; }).join();
     BumpCollectEpoch();
-    const auto threaded = UntrackedHint(hinted + Block, Block);
+    const auto threaded = UntrackedHint(hinted, hintedBytes);
     Require(threaded > rewritten, "a store from another thread did not move the hint");
+    Require(UntrackedHint(hinted + Block, Block) == threaded && UntrackedHint(hinted, Block) == rewritten, "a walk stamped a store into the wrong block");
     Require(NewestStamp(hinted, hintedBytes) == stamp, "untracked hint walks advanced the block stamps");
     Unwatch(hinted, hintedBytes);
     BumpCollectEpoch();
     Require(UntrackedHint(hinted, hintedBytes) == threaded, "unwatching a hinted range again moved its hint");
     Unwatch(base, Block);
-    Require(UntrackedHint(base, Block) > threaded && UntrackedHint(hinted, hintedBytes) == threaded, "a range leaving the watch did not start a hint of its own");
+    const auto own = UntrackedHint(base, Block);
+    Require(own > threaded && UntrackedHint(hinted, hintedBytes) == threaded, "a range leaving the watch did not start a hint of its own");
+    GuestArena::GuestArenaReset_nid_postfix(const_cast<std::uint8_t*>(memory) + Block, hintedBytes);
+    GuestArena::GuestArenaCommit_nid_postfix(const_cast<std::uint8_t*>(memory) + Block, hintedBytes, PAGE_READWRITE, 16384);
+    BumpCollectEpoch();
+    const auto fresh = CollectWrites(hinted, hintedBytes);
+    Require(Watched(hinted, hintedBytes) && fresh != 0 && UnchangedSince(hinted, hintedBytes, fresh), "fresh backing of a hinted range is not watched");
+    memory[Block + 8] = 0x5a;
+    BumpCollectEpoch();
+    Require(UntrackedHint(hinted, hintedBytes) == 0, "watched fresh backing has an untracked hint");
+    CollectWritesUncached(hinted, hintedBytes);
+    Require(!UnchangedSince(hinted, Block, fresh), "an untracked hint walk took a CPU store from watched memory");
+    Unwatch(hinted, hintedBytes);
+    Require(UntrackedHint(hinted, hintedBytes) > own, "fresh backing leaving the watch did not start a new hint");
 }
 
 std::uint64_t ChildHostHole() {
