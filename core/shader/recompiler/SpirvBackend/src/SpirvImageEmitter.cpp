@@ -1568,6 +1568,36 @@ std::uint32_t TableMapPointer(SpirvEmitterState& state, std::uint32_t index) {
     return pointer;
 }
 
+std::uint32_t RegistryLength(SpirvEmitterState& state) {
+    const auto length = state.module.AllocateId();
+    state.module.AddFunction(spv::OpArrayLength, TypeU32(state), length, state.registryMapVariable, 0u);
+    return length;
+}
+
+std::uint32_t RegistryPointer(SpirvEmitterState& state, std::uint32_t index) {
+    const auto clamped = Select(state, TypeU32(state), Binary(state, spv::OpULessThan, TypeBool(state), index, RegistryLength(state)), index, ConstantU32(state, 0u));
+    const auto pointer = state.module.AllocateId();
+    state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer, state.registryMapVariable, ConstantU32(state, 0u), clamped);
+    return pointer;
+}
+
+std::uint32_t LoadRegistry(SpirvEmitterState& state, std::uint32_t index) {
+    const auto value = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, TypeU32(state), value, RegistryPointer(state, index));
+    return value;
+}
+
+struct RegistryHelper {
+    SpirvEmitterState& state;
+    std::uint32_t label;
+    ~RegistryHelper() {
+        state.module.EndHelperFunction();
+        state.currentLabel = label;
+    }
+};
+
+// Returns the registry code of the descriptor words (entry index + 1), 0 when they are not
+// registered; a miss of an active lane appends the words to the feedback ring.
 std::uint32_t DefineRegistryProbe(SpirvEmitterState& state, bool sampler) {
     namespace Registry = ImageTableRegistry;
     auto& slot = state.registryProbeFunctions[sampler ? 1u : 0u];
@@ -1576,18 +1606,9 @@ std::uint32_t DefineRegistryProbe(SpirvEmitterState& state, bool sampler) {
     const auto boolean = TypeBool(state);
     const std::uint32_t count = sampler ? 4u : 8u;
     const auto id = state.module.AllocateId();
-    const auto functionType = sampler ? state.module.Type(spv::OpTypeFunction, u32, u32, u32, u32, u32, u32, boolean) : state.module.Type(spv::OpTypeFunction, u32, u32, u32, u32, u32, u32, u32, u32, u32, u32, boolean);
-    const auto label = state.currentLabel;
-    struct Restore {
-        SpirvEmitterState& state;
-        std::uint32_t label;
-        ~Restore() {
-            state.module.EndHelperFunction();
-            state.currentLabel = label;
-        }
-    };
+    const auto functionType = sampler ? state.module.Type(spv::OpTypeFunction, u32, u32, u32, u32, u32, boolean) : state.module.Type(spv::OpTypeFunction, u32, u32, u32, u32, u32, u32, u32, u32, u32, boolean);
     state.module.BeginHelperFunction();
-    const Restore restore{state, label};
+    const RegistryHelper restore{state, state.currentLabel};
     state.module.AddName(id, sampler ? "registry_probe_sampler" : "registry_probe_image");
     state.module.AddFunction(spv::OpFunction, u32, id, spv::FunctionControlDontInlineMask, functionType);
     std::array<std::uint32_t, 8> words{};
@@ -1595,18 +1616,13 @@ std::uint32_t DefineRegistryProbe(SpirvEmitterState& state, bool sampler) {
         words[dword] = state.module.AllocateId();
         state.module.AddFunction(spv::OpFunctionParameter, u32, words[dword]);
     }
-    const auto header = state.module.AllocateId();
-    state.module.AddFunction(spv::OpFunctionParameter, u32, header);
     const auto exec = state.module.AllocateId();
     state.module.AddFunction(spv::OpFunctionParameter, boolean, exec);
     EmitLabel(state, state.module.AllocateId());
-    const auto field = [&](std::uint32_t index) { return LoadTableMap(state, Binary(state, spv::OpIAdd, u32, header, ConstantU32(state, index))); };
-    const auto slotsStart = field(ImageTableAbi::TableMapStart);
-    const auto capacity = field(ImageTableAbi::TableKeyCount);
-    const auto ringStart = field(ImageTableAbi::TableSizeLow);
-    const auto ringCapacity = field(ImageTableAbi::TableSizeHigh);
-    const auto outsideCode = field(ImageTableAbi::TableOutsideCode);
-    const auto tableFault = field(ImageTableAbi::TableFault);
+    const auto marker = LoadRegistry(state, ConstantU32(state, Registry::HeaderMarker));
+    const auto slotsStart = LoadRegistry(state, ConstantU32(state, sampler ? Registry::HeaderSamplerSlots : Registry::HeaderImageSlots));
+    const auto capacity = LoadRegistry(state, ConstantU32(state, sampler ? Registry::HeaderSamplerCapacity : Registry::HeaderImageCapacity));
+    const auto ringStart = LoadRegistry(state, ConstantU32(state, sampler ? Registry::HeaderSamplerRing : Registry::HeaderImageRing));
     auto hash = ConstantU32(state, 2166136261u);
     for (std::uint32_t dword = 0; dword < count; dword++) {
         hash = Binary(state, spv::OpBitwiseXor, u32, hash, words[dword]);
@@ -1614,67 +1630,96 @@ std::uint32_t DefineRegistryProbe(SpirvEmitterState& state, bool sampler) {
     }
     const auto powerOfTwo = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, capacity, Binary(state, spv::OpISub, u32, capacity, ConstantU32(state, 1u))), ConstantU32(state, 0u));
     const auto slotsEnd = Binary(state, spv::OpIAdd, u32, slotsStart, Binary(state, spv::OpIMul, u32, capacity, ConstantU32(state, Registry::SlotWords)));
-    const auto usable = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpLogicalAnd, boolean, powerOfTwo, Binary(state, spv::OpINotEqual, boolean, capacity, ConstantU32(state, 0u))), Binary(state, spv::OpULessThanEqual, boolean, slotsEnd, TableMapLength(state)));
+    auto usable = Binary(state, spv::OpLogicalAnd, boolean, powerOfTwo, Binary(state, spv::OpINotEqual, boolean, capacity, ConstantU32(state, 0u)));
+    usable = Binary(state, spv::OpLogicalAnd, boolean, usable, Binary(state, spv::OpULessThanEqual, boolean, slotsEnd, RegistryLength(state)));
+    usable = Binary(state, spv::OpLogicalAnd, boolean, usable, Binary(state, spv::OpIEqual, boolean, marker, ConstantU32(state, Registry::Marker)));
     const auto mask = Binary(state, spv::OpISub, u32, Select(state, u32, usable, capacity, ConstantU32(state, 1u)), ConstantU32(state, 1u));
     auto found = ConstantBool(state, false);
-    auto code = ConstantU32(state, ImageTableAbi::NullCode);
+    auto code = ConstantU32(state, 0u);
     for (std::uint32_t probe = 0; probe < Registry::Probes; probe++) {
         const auto slotIndex = Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpIAdd, u32, hash, ConstantU32(state, probe)), mask);
         const auto base = Binary(state, spv::OpIAdd, u32, slotsStart, Binary(state, spv::OpIMul, u32, slotIndex, ConstantU32(state, Registry::SlotWords)));
-        const auto slotCode = LoadTableMap(state, Binary(state, spv::OpIAdd, u32, base, ConstantU32(state, Registry::SlotCodeWord)));
-        auto match = Binary(state, spv::OpLogicalAnd, boolean, usable, Binary(state, spv::OpINotEqual, boolean, slotCode, ConstantU32(state, ImageTableAbi::NullCode)));
+        const auto slotCode = LoadRegistry(state, Binary(state, spv::OpIAdd, u32, base, ConstantU32(state, Registry::SlotCodeWord)));
+        auto match = Binary(state, spv::OpLogicalAnd, boolean, usable, Binary(state, spv::OpINotEqual, boolean, slotCode, ConstantU32(state, 0u)));
         for (std::uint32_t dword = 0; dword < count; dword++) {
-            const auto stored = LoadTableMap(state, Binary(state, spv::OpIAdd, u32, base, ConstantU32(state, dword)));
+            const auto stored = LoadRegistry(state, Binary(state, spv::OpIAdd, u32, base, ConstantU32(state, dword)));
             match = Binary(state, spv::OpLogicalAnd, boolean, match, Binary(state, spv::OpIEqual, boolean, stored, words[dword]));
         }
         const auto take = Binary(state, spv::OpLogicalAnd, boolean, match, Unary(state, spv::OpLogicalNot, boolean, found));
         code = Select(state, u32, take, slotCode, code);
         found = Binary(state, spv::OpLogicalOr, boolean, found, match);
     }
-    const auto missed = Binary(state, spv::OpLogicalAnd, boolean, Unary(state, spv::OpLogicalNot, boolean, found), Binary(state, spv::OpINotEqual, boolean, capacity, ConstantU32(state, 0u)));
-    const auto report = Binary(state, spv::OpLogicalAnd, boolean, missed, exec);
-    const auto ringValid = Binary(state, spv::OpLogicalAnd, boolean, TableMapIndexInBounds(state, ringStart), Binary(state, spv::OpULessThanEqual, boolean, ringCapacity, ConstantU32(state, Registry::RingEntries)));
+    const auto report = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpLogicalAnd, boolean, Unary(state, spv::OpLogicalNot, boolean, found), usable), exec);
+    const auto ringEnd = Binary(state, spv::OpIAdd, u32, ringStart, ConstantU32(state, Registry::RingWords));
+    const auto ringValid = Binary(state, spv::OpULessThanEqual, boolean, ringEnd, RegistryLength(state));
     EmitIfCondition(state, Binary(state, spv::OpLogicalAnd, boolean, report, ringValid), [&] {
         const auto index = state.module.AllocateId();
-        state.module.AddFunction(spv::OpAtomicIAdd, u32, index, TableMapPointer(state, ringStart), ConstantU32(state, 1u), ConstantU32(state, 0u), ConstantU32(state, 1u));
-        EmitIfCondition(state, Binary(state, spv::OpULessThan, boolean, index, ringCapacity), [&] {
+        state.module.AddFunction(spv::OpAtomicIAdd, u32, index, RegistryPointer(state, ringStart), ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0u), ConstantU32(state, 1u));
+        EmitIfCondition(state, Binary(state, spv::OpULessThan, boolean, index, ConstantU32(state, Registry::RingEntries)), [&] {
             const auto entry = Binary(state, spv::OpIAdd, u32, Binary(state, spv::OpIAdd, u32, ringStart, ConstantU32(state, 1u)), Binary(state, spv::OpIMul, u32, index, ConstantU32(state, Registry::RingEntryWords)));
-            const auto last = Binary(state, spv::OpIAdd, u32, entry, ConstantU32(state, Registry::RingEntryWords - 1u));
-            EmitIfCondition(state, TableMapIndexInBounds(state, last), [&] {
-                for (std::uint32_t dword = 0; dword < count; dword++) {
-                    state.module.AddFunction(spv::OpStore, TableMapPointer(state, Binary(state, spv::OpIAdd, u32, entry, ConstantU32(state, dword))), words[dword]);
-                }
-            });
+            for (std::uint32_t dword = 0; dword < count; dword++) {
+                state.module.AddFunction(spv::OpStore, RegistryPointer(state, Binary(state, spv::OpIAdd, u32, entry, ConstantU32(state, dword))), words[dword]);
+            }
         });
     });
-    const auto missCode = sampler ? outsideCode : ConstantU32(state, ImageTableAbi::NullCode);
-    const auto result = Select(state, u32, Binary(state, spv::OpINotEqual, boolean, tableFault, ConstantU32(state, 0u)), tableFault, Select(state, u32, found, code, missCode));
-    state.module.AddFunction(spv::OpReturnValue, result);
+    state.module.AddFunction(spv::OpReturnValue, code);
     state.module.AddFunction(spv::OpFunctionEnd);
     slot = id;
     return id;
 }
 
-TableWord EmitRegistryWord(SpirvValueEmitContext& ctx, const IrValue& handle, const TableColumn& column, std::uint32_t table, std::uint32_t exec) {
-    auto& state = ctx.state;
+// The record region the driver keeps for a runtime mode list (ImageTableRegistry::ModeSetKey), 0
+// when it has none yet.
+std::uint32_t DefineRegistryRegion(SpirvEmitterState& state) {
+    namespace Registry = ImageTableRegistry;
+    if (state.registryRegionFunction != 0u) return state.registryRegionFunction;
     const auto u32 = TypeU32(state);
     const auto boolean = TypeBool(state);
-    const std::uint32_t count = column.sampler ? 4u : 8u;
-    std::vector<std::uint32_t> words(count, ConstantU32(state, 0u));
-    for (std::uint32_t dword = 0; dword < column.dwordCount && dword < count; dword++) words[dword] = ctx.Def(handle.Argument(dword));
-    const auto function = DefineRegistryProbe(state, column.sampler);
+    const auto id = state.module.AllocateId();
+    state.module.BeginHelperFunction();
+    const RegistryHelper restore{state, state.currentLabel};
+    state.module.AddName(id, "registry_region");
+    state.module.AddFunction(spv::OpFunction, u32, id, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, u32, u32, u32));
+    const auto low = state.module.AllocateId();
+    const auto high = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionParameter, u32, low);
+    state.module.AddFunction(spv::OpFunctionParameter, u32, high);
+    EmitLabel(state, state.module.AllocateId());
+    const auto start = LoadRegistry(state, ConstantU32(state, Registry::HeaderDirectory));
+    const auto capacity = LoadRegistry(state, ConstantU32(state, Registry::HeaderDirectoryCapacity));
+    const auto mask = Binary(state, spv::OpISub, u32, Select(state, u32, Binary(state, spv::OpINotEqual, boolean, capacity, ConstantU32(state, 0u)), capacity, ConstantU32(state, 1u)), ConstantU32(state, 1u));
+    auto hash = ConstantU32(state, 2166136261u);
+    for (const auto word : {low, high}) {
+        hash = Binary(state, spv::OpBitwiseXor, u32, hash, word);
+        hash = Binary(state, spv::OpIMul, u32, hash, ConstantU32(state, 16777619u));
+    }
+    auto region = ConstantU32(state, 0u);
+    for (std::uint32_t probe = 0; probe < Registry::Probes; probe++) {
+        const auto slotIndex = Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpIAdd, u32, hash, ConstantU32(state, probe)), mask);
+        const auto base = Binary(state, spv::OpIAdd, u32, start, Binary(state, spv::OpIMul, u32, slotIndex, ConstantU32(state, Registry::DirectoryWords)));
+        const auto value = LoadRegistry(state, Binary(state, spv::OpIAdd, u32, base, ConstantU32(state, 2u)));
+        auto match = Binary(state, spv::OpINotEqual, boolean, value, ConstantU32(state, 0u));
+        match = Binary(state, spv::OpLogicalAnd, boolean, match, Binary(state, spv::OpIEqual, boolean, LoadRegistry(state, base), low));
+        match = Binary(state, spv::OpLogicalAnd, boolean, match, Binary(state, spv::OpIEqual, boolean, LoadRegistry(state, Binary(state, spv::OpIAdd, u32, base, ConstantU32(state, 1u))), high));
+        const auto take = Binary(state, spv::OpLogicalAnd, boolean, match, Binary(state, spv::OpIEqual, boolean, region, ConstantU32(state, 0u)));
+        region = Select(state, u32, take, value, region);
+    }
+    state.module.AddFunction(spv::OpReturnValue, region);
+    state.module.AddFunction(spv::OpFunctionEnd);
+    state.registryRegionFunction = id;
+    return id;
+}
+
+std::uint32_t EmitRegistryCode(SpirvValueEmitContext& ctx, const IrValue& handle, bool sampler, std::uint32_t exec) {
+    auto& state = ctx.state;
+    const std::uint32_t count = sampler ? 4u : 8u;
+    const auto function = DefineRegistryProbe(state, sampler);
     const auto result = state.module.AllocateId();
-    std::vector<std::uint32_t> call{spv::OpFunctionCall, u32, result, function};
-    call.insert(call.end(), words.begin(), words.end());
-    call.push_back(ConstantU32(state, ImageTableAbi::TableHeader(table)));
-    call.push_back(exec != 0u ? exec : ConstantBool(state, true));
+    std::vector<std::uint32_t> call{spv::OpFunctionCall, TypeU32(state), result, function};
+    for (std::uint32_t dword = 0; dword < count; dword++) call.push_back(dword < handle.ArgumentCount() ? ctx.Def(handle.Argument(dword)) : ConstantU32(state, 0u));
+    call.push_back(exec);
     state.module.AddFunction(call);
-    TableWord word;
-    word.code = result;
-    word.addressLow = ConstantU32(state, 0u);
-    word.addressHigh = ConstantU32(state, 0u);
-    word.poisoned = Binary(state, spv::OpINotEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, word.code, ConstantU32(state, ImageTableAbi::PoisonFlag)), ConstantU32(state, 0u));
-    return word;
+    return result;
 }
 
 TableWord EmitTableWord(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t source, std::uint32_t table, std::size_t argument, std::uint32_t exec = 0u) {
@@ -1683,7 +1728,7 @@ TableWord EmitTableWord(SpirvValueEmitContext& ctx, const IrValue& inst, std::ui
     const auto& sources = state.program.Resources().descriptorSources;
     if (handle->ArgumentCount() == 0u || source >= sources.size() || !sources[source].tableColumn.has_value()) ctx.Fail(inst, "has an image table handle without its column");
     const auto& column = *sources[source].tableColumn;
-    if (column.registry) return EmitRegistryWord(ctx, *handle, column, table, exec);
+    if (column.registry) ctx.Fail(inst, "reads a registry column through the table map");
     const auto offset = ctx.Def(handle->Argument(0));
     const auto u32 = TypeU32(state);
     const auto boolean = TypeBool(state);
@@ -1744,7 +1789,12 @@ struct TableAccessResult {
 
 TableAccessResult EmitTableAccess(SpirvValueEmitContext& ctx, const IrValue& inst, const MemoryInfo& memory, const ImageResource& base, bool tableSampler) {
     auto& state = ctx.state;
-    if (state.tableMapVariable == 0 || state.faultBufferVariable == 0) ctx.Fail(inst, "reads an image table without its map or fault buffer");
+    const bool registryImage = base.table != NoTable && RegistrySource(state, base.source);
+    const bool registrySampler = tableSampler && RegistrySource(state, state.program.Info().samplers.at(memory.sampler).source);
+    if ((!registryImage && base.table != NoTable) || (!registrySampler && tableSampler)) {
+        if (state.tableMapVariable == 0 || state.faultBufferVariable == 0) ctx.Fail(inst, "reads an image table without its map or fault buffer");
+    }
+    if ((registryImage || registrySampler) && state.registryMapVariable == 0) ctx.Fail(inst, "reads a registry column without the registry map");
     const auto u32 = TypeU32(state);
     const auto boolean = TypeBool(state);
     const auto both = [&](std::uint32_t left, std::uint32_t right) { return Binary(state, spv::OpLogicalAnd, boolean, left, right); };
@@ -1755,7 +1805,30 @@ TableAccessResult EmitTableAccess(SpirvValueEmitContext& ctx, const IrValue& ins
     result.valid = ConstantBool(state, true);
     auto live = ConstantBool(state, true);
     state.tableAccess = {};
-    if (base.table != NoTable) {
+    if (registryImage) {
+        namespace Registry = ImageTableRegistry;
+        if (base.tableOperation == TableOperation::Unsupported || state.program.Info().runtimeImageModes.at(memory.resource).empty()) {
+            if (inst.Type() != IrType::Void) ctx.Define(inst, ZeroResult(ctx, inst));
+            result.unsupported = true;
+            return result;
+        }
+        const IrValue* handle = inst.Argument(0)->Resolve();
+        const auto code = EmitRegistryCode(ctx, *handle, false, exec);
+        const auto key = Registry::ModeSetKey(state.program.Info().images.at(memory.resource), state.program.Info().runtimeImageModes.at(memory.resource));
+        const auto region = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionCall, u32, region, DefineRegistryRegion(state), ConstantU32(state, static_cast<std::uint32_t>(key)), ConstantU32(state, static_cast<std::uint32_t>(key >> 32u)));
+        const auto has = both(Binary(state, spv::OpINotEqual, boolean, code, ConstantU32(state, 0u)), Binary(state, spv::OpINotEqual, boolean, region, ConstantU32(state, 0u)));
+        const auto index = Select(state, u32, has, Binary(state, spv::OpISub, u32, Binary(state, spv::OpIAdd, u32, region, code), ConstantU32(state, 1u)), ConstantU32(state, 0u));
+        const auto record = Select(state, u32, has, LoadRegistry(state, index), ConstantU32(state, 0u));
+        const auto valid = Binary(state, spv::OpINotEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, record, ConstantU32(state, Registry::RecordValid)), ConstantU32(state, 0u));
+        result.valid = valid;
+        result.flags = Binary(state, spv::OpShiftLeftLogical, u32, Binary(state, spv::OpBitwiseAnd, u32, record, ConstantU32(state, Registry::RecordModeMask)), ConstantU32(state, ImageTableAbi::ModeShift));
+        live = valid;
+        state.tableAccess.element = Binary(state, spv::OpShiftRightLogical, u32, record, ConstantU32(state, Registry::RecordElementShift));
+        DecorateTableNonUniform(state, state.tableAccess.element);
+        state.tableAccess.dword3 = ctx.Def(handle->Argument(3));
+        state.tableAccess.registryImage = true;
+    } else if (base.table != NoTable) {
         const auto word = EmitTableWord(ctx, inst, base.source, base.table, 0u, exec);
         EmitTableFault(ctx, inst, word, word.code, both(exec, word.poisoned));
         if (base.tableOperation == TableOperation::Unsupported || state.program.Info().runtimeImageModes.at(memory.resource).empty()) {
@@ -1785,7 +1858,14 @@ TableAccessResult EmitTableAccess(SpirvValueEmitContext& ctx, const IrValue& ins
         DecorateTableNonUniform(state, state.tableAccess.element);
         state.tableAccess.dword3 = dword3;
     }
-    if (tableSampler) {
+    if (registrySampler) {
+        const IrValue* handle = inst.Argument(1)->Resolve();
+        const auto code = EmitRegistryCode(ctx, *handle, true, both(exec, live));
+        const auto entry = Select(state, u32, Binary(state, spv::OpINotEqual, boolean, code, ConstantU32(state, 0u)), Binary(state, spv::OpISub, u32, code, ConstantU32(state, 1u)), ConstantU32(state, 0u));
+        state.tableAccess.samplerElement = Binary(state, spv::OpIMul, u32, entry, ConstantU32(state, ImageTableRegistry::SamplerElements));
+        DecorateTableNonUniform(state, state.tableAccess.samplerElement);
+        state.tableAccess.registrySampler = true;
+    } else if (tableSampler) {
         const auto& sampler = state.program.Info().samplers.at(memory.sampler);
         const auto word = EmitTableWord(ctx, inst, sampler.source, sampler.table, 1u, Binary(state, spv::OpLogicalAnd, TypeBool(state), exec, live));
         EmitTableFault(ctx, inst, word, word.code, both(both(exec, live), word.poisoned));
@@ -1936,15 +2016,17 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
     for (std::uint32_t index = 0u; index < modes.size(); ++index) {
         if (base.table != NoTable && !TableModeEmitted(modes[index])) continue;
         if (registryImage && (modes[index].conversionFormat != IrBufferFormat::Invalid || modes[index].packedFormat != IrBufferFormat::Invalid)) continue;
-        if (registryImage && (inst.Opcode() == IrOpcode::ImageSampleRaw || inst.Opcode() == IrOpcode::ImageGatherRaw) && modes[index].numericClass != IrTextureNumericClass::Float) continue;
         if (registryImage) {
-            bool duplicate = false;
-            for (std::uint32_t earlier = 0u; earlier < index && !duplicate; ++earlier) {
+            std::uint32_t duplicate = 0u;
+            for (std::uint32_t earlier = 0u; earlier < index && duplicate == 0u; ++earlier) {
                 const auto& left = modes[earlier];
                 const auto& right = modes[index];
-                duplicate = labels[earlier] != 0u && left.numericClass == right.numericClass && left.conversionFormat == right.conversionFormat && left.packedFormat == right.packedFormat && left.dimension == right.dimension && left.cube == right.cube && left.depthBits == right.depthBits && left.depthUnorm16 == right.depthUnorm16 && left.mipCount == right.mipCount && left.shaderSwizzle == right.shaderSwizzle;
+                if (labels[earlier] != 0u && left.numericClass == right.numericClass && left.conversionFormat == right.conversionFormat && left.packedFormat == right.packedFormat && left.dimension == right.dimension && left.cube == right.cube && left.depthBits == right.depthBits && left.depthUnorm16 == right.depthUnorm16 && left.mipCount == right.mipCount && left.shaderSwizzle == right.shaderSwizzle) duplicate = labels[earlier];
             }
-            if (duplicate) continue;
+            if (duplicate != 0u) {
+                words.insert(words.end(), {index, duplicate});
+                continue;
+            }
         }
         labels[index] = state.module.AllocateId();
         words.insert(words.end(), {index, labels[index]});

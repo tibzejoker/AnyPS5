@@ -217,6 +217,14 @@ function(add_shader_recompiler target runtimeTarget)
     endif()
     set(shaderCacheReviewedNames
             ImageTableRegistry::Generation
+            DescriptorBindingForImage
+            ResourceMaterializer::TryRuntimeImageMode
+            PointFilteredSamplerWord
+            ImageTableRegistry::InitMap
+            ImageTableRegistry::InsertSlot
+            ImageTableRegistry::DirectoryInsert
+            ImageTableRegistry::ModeSetKey
+            ImageTableRegistry::RegisterModeSet
             ImageTableRegistry::AddImage
             ImageTableRegistry::AddSampler
             ImageTableRegistry::Global

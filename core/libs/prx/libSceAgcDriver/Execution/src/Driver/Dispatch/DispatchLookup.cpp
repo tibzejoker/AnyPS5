@@ -1,7 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
-#include "ImageTableRegistry.hpp"
 
 namespace AgcDriver::DriverDetail {
 
@@ -115,7 +114,6 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 case EntryOutcome::PendingMoved: ++counters.pendingMoved; break;
                 case EntryOutcome::ForgetMoved: ++counters.forgetMoved; break;
             }
-            if (current && variant != nullptr && variant->compiled != nullptr && variant->compiled->imageTableRegistryGeneration != 0u && variant->compiled->imageTableRegistryGeneration != ShaderRecompiler::ImageTableRegistry::Generation()) current = false;
             if (current) {
                 ++counters.variantHitsByRank[rank];
                 compiledResult = variant->compiled;

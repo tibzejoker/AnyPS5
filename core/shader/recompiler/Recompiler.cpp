@@ -34,6 +34,7 @@
 #include "Optimization/include/Optimization/ReadLaneEliminator.hpp"
 #include "Optimization/include/Optimization/RequestMemoryView.hpp"
 #include "Optimization/include/Optimization/ResourceMaterializer.hpp"
+#include "ImageTableRegistry.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/include/Optimization/ResourceTracker.hpp"
 #include "Optimization/include/Optimization/ShaderInfoCollector.hpp"
@@ -632,12 +633,14 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
 #endif
     auto module = std::make_shared<SpecializedModule>();
     std::map<std::uint32_t, std::uint32_t> bindingNumbers;
+    std::set<std::uint32_t> registryVariables;
     for (std::size_t cursor = 5; cursor < materialized.size();) {
         const auto count = materialized[cursor] >> 16u;
         const auto op = static_cast<spv::Op>(materialized[cursor] & 0xffffu);
         if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationBinding) bindingNumbers.emplace(materialized[cursor + 1u], materialized[cursor + 3u]);
+        if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationDescriptorSet && materialized[cursor + 3u] == ImageTableRegistry::DescriptorSet) registryVariables.insert(materialized[cursor + 1u]);
         if (op == spv::OpVariable && count >= 4u) {
-            if (const auto found = bindingNumbers.find(materialized[cursor + 2u]); found != bindingNumbers.end()) module->bindings.push_back(found->second);
+            if (const auto found = bindingNumbers.find(materialized[cursor + 2u]); found != bindingNumbers.end() && !registryVariables.contains(materialized[cursor + 2u])) module->bindings.push_back(found->second);
             module->pushData |= materialized[cursor + 3u] == spv::StorageClassPushConstant;
         }
         cursor += count;
@@ -777,6 +780,24 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
     });
     if (entry->failure) std::rethrow_exception(entry->failure);
     return entry->module;
+}
+
+void registerModeSets(const CompiledVariant& variant, const ResourceSnapshot& snapshot) {
+    const auto& info = variant.info.info;
+    if (snapshot.tables.tables.empty()) return;
+    static std::mutex mutex;
+    static std::set<std::pair<std::uint64_t, std::uint32_t>> done;
+    const auto owner = variant.artifact.variantId != 0u ? variant.artifact.variantId : static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(&variant));
+    for (std::uint32_t resource = 0; resource < info.images.size() && resource < info.runtimeImageModes.size(); ++resource) {
+        const auto& image = info.images[resource];
+        if (image.table == NoTable || image.table >= snapshot.tables.tables.size() || !snapshot.tables.tables[image.table].registry) continue;
+        {
+            std::lock_guard lock(mutex);
+            if (!done.insert({owner, resource}).second) continue;
+        }
+        const auto& modes = info.runtimeImageModes[resource];
+        ImageTableRegistry::RegisterModeSet(ImageTableRegistry::ModeSetKey(image, modes), image, modes);
+    }
 }
 
 RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults = false) {
@@ -922,8 +943,8 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         result.imageTableRanges = snapshot.tables.ranges;
         result.imageTableShader = snapshot.tables.shader;
         result.imageTableFaults = tables.faults;
-        result.imageTableRegistryGeneration = snapshot.tables.registryGeneration;
     }
+    registerModeSets(variant, snapshot);
     return result;
 }
 

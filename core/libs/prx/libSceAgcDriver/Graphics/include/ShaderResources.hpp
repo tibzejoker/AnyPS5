@@ -40,6 +40,15 @@ std::uint64_t SampledTextureCacheBudget(const Context& context);
 std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words);
 bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second);
 void CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes);
+// The device's image registry (set ImageTableRegistry::DescriptorSet): feedback drain, mode-set
+// regions and texture refresh; layouts that hold it at that set are noted and bound per command.
+void SyncImageRegistry(const Context& context);
+VkDescriptorSetLayout ImageRegistryLayout(const Context& context);
+VkDescriptorSetLayout ImageRegistryEmptyLayout(const Context& context);
+void NoteImageRegistryLayout(const Context& context, VkPipelineLayout layout);
+void BindImageRegistry(const Context& context, VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout);
+bool UsesImageRegistry(std::span<const std::uint32_t> spirv);
+void ReleaseImageRegistry(VkDevice device, PFN_vkDestroyDescriptorPool destroyPool, PFN_vkDestroyDescriptorSetLayout destroyLayout);
 
 // The cached storage image of a surface (render targets use it as their resident image); brought up
 // to date with guest memory before it is returned.
@@ -492,7 +501,6 @@ private:
     SetObjects fragment;
     std::uint32_t setOf(const Binding& binding) const;
     std::vector<Allocation> allocations;
-    std::shared_ptr<void> registryRingToken;
     std::vector<VkDescriptorBufferInfo> descriptorBuffers;
     std::vector<VkDescriptorImageInfo> descriptorImages;
     std::vector<VkWriteDescriptorSet> descriptorWrites;

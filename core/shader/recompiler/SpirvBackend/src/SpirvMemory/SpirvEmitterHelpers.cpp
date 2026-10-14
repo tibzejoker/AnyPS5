@@ -2,6 +2,7 @@
 #include "BdaAbi.hpp"
 #include "PipelineSpecialization.hpp"
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
+#include "ImageTableRegistry.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvDescriptors.hpp"
@@ -395,6 +396,45 @@ void DefineOutputs(SpirvEmitterState& state) {
     }
 }
 
+bool RegistrySource(const SpirvEmitterState& state, std::uint32_t source) {
+    const auto& sources = state.program.Resources().descriptorSources;
+    return source < sources.size() && sources[source].tableColumn.has_value() && sources[source].tableColumn->registry;
+}
+
+void DefineRegistryDescriptors(SpirvEmitterState& state) {
+    namespace Registry = ImageTableRegistry;
+    const auto Define = [&](std::uint32_t type, const char* name, std::uint32_t binding, std::uint32_t storage) {
+        const auto variable = state.module.DefineGlobalVariable(TypePointer(state, storage, type), storage);
+        state.module.AddName(variable, name);
+        state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, Registry::DescriptorSet);
+        state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
+        return variable;
+    };
+    bool images = false;
+    bool samplers = false;
+    const auto& info = state.program.Info();
+    for (std::uint32_t resource = 0; resource < info.images.size(); ++resource) {
+        const auto& image = info.images[resource];
+        if (image.table == NoTable || !RegistrySource(state, image.source) || resource >= info.runtimeImageModes.size()) continue;
+        images = true;
+        for (const auto& mode : info.runtimeImageModes[resource]) {
+            if (!TableModeEmitted(mode) || mode.resourceClass != ImageResourceClass::Sampled) continue;
+            const auto kind = DescriptorBindingForImage(mode);
+            if (std::any_of(state.registryImageVariables.begin(), state.registryImageVariables.end(), [&](const SpirvTableImageVariable& variable) { return variable.kind == kind; })) continue;
+            const auto name = "registry_images_" + std::to_string(static_cast<std::uint32_t>(kind));
+            state.registryImageVariables.push_back({kind, Define(state.module.Type(spv::OpTypeRuntimeArray, ImageType(state, mode)), name.c_str(), Registry::ImageBinding, spv::StorageClassUniformConstant)});
+            if (mode.dimension == RdnaImageDimension::Dim1D || mode.dimension == RdnaImageDimension::Dim1DArray) state.module.EmitCapability(spv::CapabilitySampled1D);
+        }
+    }
+    for (const auto& sampler : info.samplers) {
+        if (sampler.table != NoTable && RegistrySource(state, sampler.source)) samplers = true;
+    }
+    if (!images && !samplers) return;
+    RequireTableIndexing(state);
+    state.registryMapVariable = Define(StorageBufferBlockType(state), "registry_map", Registry::MapBinding, spv::StorageClassStorageBuffer);
+    if (samplers) state.registrySamplerVariable = Define(state.module.Type(spv::OpTypeRuntimeArray, state.module.Type(spv::OpTypeSampler)), "registry_samplers", Registry::SamplerBinding, spv::StorageClassUniformConstant);
+}
+
 void DefineDescriptors(SpirvEmitterState& state) {
     const IrBindingLayout& layout = state.program.Metadata().bindings;
     const IrShaderStage stage = state.program.Resources().stage;
@@ -491,6 +531,7 @@ void DefineDescriptors(SpirvEmitterState& state) {
         }
         }
     }
+    DefineRegistryDescriptors(state);
     if (LdsInDeviceMemory(state)) {
         state.ldsBufferVariable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassStorageBuffer, StorageBufferBlockType(state)), spv::StorageClassStorageBuffer);
         state.module.AddName(state.ldsBufferVariable, "workgroup_memory");

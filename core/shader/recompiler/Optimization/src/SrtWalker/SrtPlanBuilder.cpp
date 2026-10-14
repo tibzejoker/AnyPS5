@@ -59,7 +59,9 @@ void PlanBuilder::Run() {
                 const auto& memory = _program.Resources().memoryInfo[index];
                 return memory.imagePacked || memory.imageByElements != 0u;
             });
-            if (!cpuImage && ImageTableRegistry::GpuResolvedStage(_program.Resources().stage) && (handle == IrOpcode::GetBufferResource || handle == IrOpcode::GetAddressResource || handle == IrOpcode::GetImageResource || handle == IrOpcode::GetSamplerResource)) {
+            const bool gpuBuffer = ImageTableRegistry::GpuResolvedBufferStage(_program.Resources().stage) && (handle == IrOpcode::GetBufferResource || handle == IrOpcode::GetAddressResource);
+            const bool gpuImage = !cpuImage && ImageTableRegistry::GpuResolvedStage(_program.Resources().stage) && (handle == IrOpcode::GetImageResource || handle == IrOpcode::GetSamplerResource);
+            if (gpuBuffer || gpuImage) {
                 ++_gpuHandles;
                 continue;
             }
@@ -70,7 +72,7 @@ void PlanBuilder::Run() {
             }
         }
     }
-    if (!ImageTableRegistry::GpuResolvedStage(_program.Resources().stage)) {
+    if (!ImageTableRegistry::GpuResolvedBufferStage(_program.Resources().stage)) {
         for (auto& block : _program.Blocks()) {
             for (IrValue* inst : block->Instructions()) {
                 if (inst->Opcode() == IrOpcode::LoadAddressU32 && IsRawRead(_program.Resources(), *inst) && inst->Argument(1)->Resolve()->HasImmediate() && RuntimeValidator(_program.Resources(), RuntimeValueType::Any).Run(inst)) {

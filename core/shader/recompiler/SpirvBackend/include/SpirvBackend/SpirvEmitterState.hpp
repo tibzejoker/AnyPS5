@@ -83,6 +83,8 @@ struct SpirvTableAccess {
     std::uint32_t dword3 = 0;
     std::uint32_t samplerElement = 0;
     bool active = false;
+    bool registryImage = false;
+    bool registrySampler = false;
 };
 
 struct SpirvEmitterState {
@@ -171,6 +173,10 @@ struct SpirvEmitterState {
     std::vector<SpirvTableImageVariable> tableImageVariables;
     std::uint32_t tableSamplerVariable = 0;
     std::uint32_t tableMapVariable = 0;
+    std::vector<SpirvTableImageVariable> registryImageVariables;
+    std::uint32_t registrySamplerVariable = 0;
+    std::uint32_t registryMapVariable = 0;
+    std::uint32_t registryRegionFunction = 0;
     std::uint32_t mainFunc = 0;
     std::uint32_t meshGuestFunc = 0;
     std::uint32_t meshAllocation = 0;

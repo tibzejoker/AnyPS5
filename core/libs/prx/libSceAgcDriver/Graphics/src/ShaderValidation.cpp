@@ -1,3 +1,4 @@
+#include "ImageTableRegistry.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
@@ -532,6 +533,8 @@ Module Inspect(const CompiledShader& compiled, const State& state, const VkPhysi
             Require(stride.has_value() && *stride == 4, "push constant array must have an ArrayStride of 4");
         } else if (variable.storage == spv::StorageClassWorkgroup) {
             Require(mesh, "workgroup memory outside a mesh shader");
+        } else if (decoration.set && *decoration.set == ShaderRecompiler::ImageTableRegistry::DescriptorSet && (variable.storage == spv::StorageClassUniformConstant || variable.storage == spv::StorageClassStorageBuffer)) {
+            continue;
         } else if (variable.storage == spv::StorageClassUniformConstant) {
             Require(decoration.set && decoration.binding, "unbound shader resource");
             const auto key = std::make_pair(*decoration.set, *decoration.binding);

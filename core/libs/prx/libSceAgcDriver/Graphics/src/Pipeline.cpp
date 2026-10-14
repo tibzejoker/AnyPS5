@@ -2,6 +2,8 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "ImageTableRegistry.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
@@ -335,16 +337,20 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         }
         // A descriptor set layout with the same bindings as this one is compatible with the pipeline
         // layout, so later draws bind their own ShaderResources' set under it.
-        const std::array<VkDescriptorSetLayout, 2> setLayouts{resources.main, resources.fragment};
+        const bool registryUsed = std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return UsesImageRegistry(std::span<const std::uint32_t>(shader.program->spirv.data(), shader.program->spirv.size())); });
+        const auto registryLayout = registryUsed ? ImageRegistryLayout(context) : VK_NULL_HANDLE;
+        const auto emptyLayout = registryLayout != VK_NULL_HANDLE ? ImageRegistryEmptyLayout(context) : VK_NULL_HANDLE;
+        const std::array<VkDescriptorSetLayout, 3> setLayouts{registryLayout != VK_NULL_HANDLE && resources.main == VK_NULL_HANDLE ? emptyLayout : resources.main, registryLayout != VK_NULL_HANDLE && (!resources.split || resources.fragment == VK_NULL_HANDLE) ? emptyLayout : resources.fragment, registryLayout};
         const VkPushConstantRange push{pushStages, 0, PipelinePushSlotBytes};
         const std::array<VkPushConstantRange, 2> slots{{{pushStagesOf(context), 0, PipelinePushSlotBytes}, {VK_SHADER_STAGE_FRAGMENT_BIT, PipelinePushSlotBytes, PipelinePushSlotBytes}}};
         VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layoutInfo.flags = resources.split ? VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT : 0;
-        layoutInfo.setLayoutCount = resources.split ? 2u : 1u;
+        layoutInfo.setLayoutCount = registryLayout != VK_NULL_HANDLE ? 3u : resources.split ? 2u : 1u;
         layoutInfo.pSetLayouts = setLayouts.data();
         layoutInfo.pushConstantRangeCount = dynamicRendering ? static_cast<std::uint32_t>(slots.size()) : pushStages != 0 ? 1 : 0;
         layoutInfo.pPushConstantRanges = dynamicRendering ? slots.data() : pushStages != 0 ? &push : nullptr;
         Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreatePipelineLayout graphics");
+        if (registryLayout != VK_NULL_HANDLE) NoteImageRegistryLayout(context, layout);
         std::vector<VkAttachmentDescription> colors;
         std::vector<VkAttachmentReference> references(state.blends.size(), VkAttachmentReference{VK_ATTACHMENT_UNUSED, attachmentLayout});
         for (std::uint32_t index = 0; index < state.colors.size(); ++index) {
@@ -418,6 +424,9 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         viewports.scissorCount = 1;
         PipelineLibraryKeys keys;
         libraries = libraryKeys(keys, context, state, vertexInput, resources, shaders);
+        if (libraries && registryLayout != VK_NULL_HANDLE) {
+            for (auto* key : {&keys.layout, &keys.preRasterizationLayout, &keys.fragmentLayout}) appendKey(*key, ShaderRecompiler::ImageTableRegistry::Marker);
+        }
         std::vector<VkDynamicState> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
         if (depthBounds) dynamicStates.push_back(VK_DYNAMIC_STATE_DEPTH_BOUNDS);
         if (depthBias) dynamicStates.push_back(VK_DYNAMIC_STATE_DEPTH_BIAS);

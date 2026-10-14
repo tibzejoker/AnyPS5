@@ -179,6 +179,7 @@ struct Context {
     bool imageInt64Atomics = false;
     bool runtimeDescriptorArray = false;
     bool partiallyBound = false;
+    bool registryUpdateAfterBind = false;
     bool variableDescriptorCount = false;
     std::uint32_t imageTableCapacity = 0;
     std::uint32_t samplerTableCapacity = 0;
