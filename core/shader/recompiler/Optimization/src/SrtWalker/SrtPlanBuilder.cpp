@@ -50,7 +50,16 @@ void PlanBuilder::Run() {
                 }
             }
             const auto handle = inst->Opcode();
-            if (ImageTableRegistry::GpuResolvedStage(_program.Resources().stage) && (handle == IrOpcode::GetBufferResource || handle == IrOpcode::GetAddressResource || handle == IrOpcode::GetImageResource || handle == IrOpcode::GetSamplerResource)) {
+            const bool cpuImage = handle == IrOpcode::GetImageResource && std::any_of(inst->Uses().begin(), inst->Uses().end(), [&](const IrValue* use) {
+                const auto image = ImageOpcodeInfoOf(use->Opcode());
+                if (image.access == ImageAccess::None) return false;
+                if (image.resourceClass == ImageResourceClass::Storage || image.access != ImageAccess::Read) return true;
+                const auto index = use->Flags<MemoryFlags>().index;
+                if (index >= _program.Resources().memoryInfo.size()) return true;
+                const auto& memory = _program.Resources().memoryInfo[index];
+                return memory.imagePacked || memory.imageByElements != 0u;
+            });
+            if (!cpuImage && ImageTableRegistry::GpuResolvedStage(_program.Resources().stage) && (handle == IrOpcode::GetBufferResource || handle == IrOpcode::GetAddressResource || handle == IrOpcode::GetImageResource || handle == IrOpcode::GetSamplerResource)) {
                 ++_gpuHandles;
                 continue;
             }

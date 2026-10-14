@@ -1083,31 +1083,15 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
         }
         if (column.registry) {
             namespace Registry = ImageTableRegistry;
-            const auto capacity = Registry::Capacity(column.keys);
-            const auto slotsStart = static_cast<std::uint32_t>(out.map.size());
-            out.map.resize(out.map.size() + static_cast<std::size_t>(capacity) * Registry::SlotWords, 0u);
+            Registry::Global().builtTables.fetch_add(1, std::memory_order_relaxed);
+            if (out.map[header + Abi::TableFault] != 0u) Registry::Global().faultedTables.fetch_add(1, std::memory_order_relaxed);
+            std::vector<Registry::RegistryEntry> entries;
             for (std::uint32_t key = 0; key < column.keys; key++) {
-                const auto code = out.map[mapStart + key];
-                if (code == Abi::NullCode || (column.codes[key] & Abi::PoisonFlag) != 0u) continue;
+                if ((column.codes[key] & Abi::PoisonFlag) != 0u) continue;
                 const auto& words = tables.words.at(column.codes[key]);
-                const auto hash = Registry::Hash(words.dwords.data(), words.dwordCount);
-                for (std::uint32_t probe = 0; probe < Registry::Probes; probe++) {
-                    const auto slot = (hash + probe) & (capacity - 1u);
-                    const auto base = slotsStart + slot * Registry::SlotWords;
-                    if (out.map[base + Registry::SlotCodeWord] != Abi::NullCode) continue;
-                    for (std::uint32_t dword = 0; dword < words.dwordCount; dword++) out.map[base + dword] = words.dwords[dword];
-                    out.map[base + Registry::SlotCodeWord] = code;
-                    break;
-                }
+                entries.push_back({words.dwords.data(), words.dwordCount, out.map[mapStart + key]});
             }
-            const auto ringStart = static_cast<std::uint32_t>(out.map.size());
-            out.map.resize(out.map.size() + 1u + static_cast<std::size_t>(Registry::RingEntries) * Registry::RingEntryWords, 0u);
-            out.map[header + Abi::TableMapStart] = slotsStart;
-            out.map[header + Abi::TableKeyCount] = capacity;
-            out.map[header + Abi::TableSizeLow] = ringStart;
-            out.map[header + Abi::TableSizeHigh] = Registry::RingEntries;
-            out.map[header + Abi::TableBaseLow] = sampler ? 1u : 0u;
-            out.map[header + Abi::TableBaseHigh] = Registry::Marker;
+            Registry::Global().insertedSlots.fetch_add(Registry::BuildRegistryRegion(out.map, header, entries, sampler), std::memory_order_relaxed);
         }
     };
     for (std::uint32_t resource = 0; resource < info.images.size(); resource++) {

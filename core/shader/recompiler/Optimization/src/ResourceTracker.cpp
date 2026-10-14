@@ -1575,7 +1575,7 @@ private:
         const TableColumnPlan* column = FindTableColumn(*handle);
         if (column != nullptr) {
             source = column->source;
-        } else if (!MakeRegistrySource(*handle, false, false, source)) {
+        } else if (!(imageInfo.resourceClass != ImageResourceClass::Storage && imageInfo.access == ImageAccess::Read && !memory.imagePacked && memory.imageByElements == 0u && MakeRegistrySource(*handle, false, false, source))) {
             GetHandle(inst.Argument(0), IrOpcode::GetImageResource, 8, handle, source);
         }
         resource = AddImage(source, memory, op, flags.pc);
