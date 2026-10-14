@@ -287,13 +287,50 @@ bool HandleSse4a(EXCEPTION_POINTERS* info) {
     return true;
 }
 
+struct GtavFaultCounts {
+    std::atomic<std::uint64_t> n[4][2]{};
+    std::atomic<long long> last{0};
+    std::atomic<std::uintptr_t> rips[16]{};
+};
+GtavFaultCounts g_gtavFaults;
+
+void GtavCountFault(int kind, const EXCEPTION_POINTERS* info) {
+    static const bool on = std::getenv("GTAV_FAULT_STATS") != nullptr;
+    if (!on) return;
+    static const auto [base, size] = [] {
+        const auto* module = reinterpret_cast<const unsigned char*>(GetModuleHandleW(nullptr));
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(module + dos->e_lfanew);
+        return std::pair<std::uintptr_t, std::uintptr_t>{reinterpret_cast<std::uintptr_t>(module), nt->OptionalHeader.SizeOfImage};
+    }();
+    const auto rip = static_cast<std::uintptr_t>(info->ContextRecord->Rip);
+    const bool guest = rip >= base && rip < base + size;
+    ++g_gtavFaults.n[kind][guest ? 1 : 0];
+    if (guest && kind == 0) {
+        static std::atomic<int> printed{0};
+        if (printed.fetch_add(1) < 64) std::fprintf(stderr, "[gtav-fault] guest write rip eboot+0x%llx data 0x%llx thread %lu\n", static_cast<unsigned long long>(rip - base - 0x10000), static_cast<unsigned long long>(info->ExceptionRecord->ExceptionInformation[1]), GetCurrentThreadId());
+        for (auto& slot : g_gtavFaults.rips) {
+            std::uintptr_t expected = 0;
+            if (slot.load() == rip - base) break;
+            if (slot.compare_exchange_strong(expected, rip - base)) break;
+        }
+    }
+    const long long now = static_cast<long long>(GetTickCount64() / 10000);
+    long long previous = g_gtavFaults.last.load();
+    if (now != previous && g_gtavFaults.last.compare_exchange_strong(previous, now)) {
+        std::fprintf(stderr, "[gtav-faults] write host %llu guest %llu | read host %llu guest %llu | watch host %llu guest %llu | sse4a host %llu guest %llu | guest write rips:", static_cast<unsigned long long>(g_gtavFaults.n[0][0].load()), static_cast<unsigned long long>(g_gtavFaults.n[0][1].load()), static_cast<unsigned long long>(g_gtavFaults.n[1][0].load()), static_cast<unsigned long long>(g_gtavFaults.n[1][1].load()), static_cast<unsigned long long>(g_gtavFaults.n[2][0].load()), static_cast<unsigned long long>(g_gtavFaults.n[2][1].load()), static_cast<unsigned long long>(g_gtavFaults.n[3][0].load()), static_cast<unsigned long long>(g_gtavFaults.n[3][1].load()));
+        for (const auto& slot : g_gtavFaults.rips) if (const auto value = slot.load()) std::fprintf(stderr, " +0x%llx", static_cast<unsigned long long>(value));
+        std::fputc('\n', stderr);
+    }
+}
+
 LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
     const auto* fault = info->ExceptionRecord;
-    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
-    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 0 && GuestArena::GuestArenaHandleRead_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
-    if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;
-    if (HandleSse4a(info)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) { GtavCountFault(0, info); return EXCEPTION_CONTINUE_EXECUTION; }
+    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 0 && GuestArena::GuestArenaHandleRead_nid_postfix(fault->ExceptionInformation[1])) { GtavCountFault(1, info); return EXCEPTION_CONTINUE_EXECUTION; }
+    if (HandleWatch(info)) { GtavCountFault(2, info); return EXCEPTION_CONTINUE_EXECUTION; }
+    if (HandleSse4a(info)) { GtavCountFault(3, info); return EXCEPTION_CONTINUE_EXECUTION; }
     const auto* record = info->ExceptionRecord;
     if ((record->ExceptionCode & GccExceptionMask) == GccException) {
         if (const auto frame = FrameWithoutUnwindData(*info->ContextRecord)) ReportUndeliverableException(info, frame);
