@@ -1610,7 +1610,7 @@ std::uint32_t DefineRegistryProbe(SpirvEmitterState& state, bool sampler) {
     state.module.BeginHelperFunction();
     const RegistryHelper restore{state, state.currentLabel};
     state.module.AddName(id, sampler ? "registry_probe_sampler" : "registry_probe_image");
-    state.module.AddFunction(spv::OpFunction, u32, id, spv::FunctionControlMaskNone, functionType);
+    state.module.AddFunction(spv::OpFunction, u32, id, spv::FunctionControlDontInlineMask, functionType);
     std::array<std::uint32_t, 8> words{};
     for (std::uint32_t dword = 0; dword < count; dword++) {
         words[dword] = state.module.AllocateId();
@@ -1689,8 +1689,54 @@ std::uint32_t DefineRegistryProbe(SpirvEmitterState& state, bool sampler) {
     });
     state.module.AddFunction(spv::OpReturnValue, code);
     state.module.AddFunction(spv::OpFunctionEnd);
-    slot = id;
-    return id;
+    // The inlinable front: the words' first probe slot, the usual home of a registered descriptor;
+    // anything else (a later slot, a miss and its feedback) calls the full probe above, out of line.
+    const auto front = state.module.AllocateId();
+    state.module.AddName(front, sampler ? "registry_probe_sampler_front" : "registry_probe_image_front");
+    state.module.AddFunction(spv::OpFunction, u32, front, spv::FunctionControlInlineMask, functionType);
+    std::array<std::uint32_t, 8> frontWords{};
+    for (std::uint32_t dword = 0; dword < count; dword++) {
+        frontWords[dword] = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionParameter, u32, frontWords[dword]);
+    }
+    const auto frontExec = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionParameter, boolean, frontExec);
+    EmitLabel(state, state.module.AllocateId());
+    {
+        const auto frontMarker = LoadRegistry(state, ConstantU32(state, Registry::HeaderMarker));
+        const auto frontStart = LoadRegistry(state, ConstantU32(state, sampler ? Registry::HeaderSamplerSlots : Registry::HeaderImageSlots));
+        const auto frontCapacity = LoadRegistry(state, ConstantU32(state, sampler ? Registry::HeaderSamplerCapacity : Registry::HeaderImageCapacity));
+        auto frontHash = ConstantU32(state, 2166136261u);
+        for (std::uint32_t dword = 0; dword < count; dword++) {
+            frontHash = Binary(state, spv::OpBitwiseXor, u32, frontHash, frontWords[dword]);
+            frontHash = Binary(state, spv::OpIMul, u32, frontHash, ConstantU32(state, 16777619u));
+        }
+        const auto frontEnd = Binary(state, spv::OpIAdd, u32, frontStart, Binary(state, spv::OpIMul, u32, frontCapacity, ConstantU32(state, Registry::SlotWords)));
+        auto frontUsable = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, frontCapacity, Binary(state, spv::OpISub, u32, frontCapacity, ConstantU32(state, 1u))), ConstantU32(state, 0u));
+        frontUsable = Binary(state, spv::OpLogicalAnd, boolean, frontUsable, Binary(state, spv::OpINotEqual, boolean, frontCapacity, ConstantU32(state, 0u)));
+        frontUsable = Binary(state, spv::OpLogicalAnd, boolean, frontUsable, Binary(state, spv::OpULessThanEqual, boolean, frontEnd, RegistryLength(state)));
+        frontUsable = Binary(state, spv::OpLogicalAnd, boolean, frontUsable, Binary(state, spv::OpIEqual, boolean, frontMarker, ConstantU32(state, Registry::Marker)));
+        const auto frontMask = Binary(state, spv::OpISub, u32, Select(state, u32, frontUsable, frontCapacity, ConstantU32(state, 1u)), ConstantU32(state, 1u));
+        const auto base = Binary(state, spv::OpIAdd, u32, frontStart, Binary(state, spv::OpIMul, u32, Binary(state, spv::OpBitwiseAnd, u32, frontHash, frontMask), ConstantU32(state, Registry::SlotWords)));
+        const auto slotCode = LoadRegistry(state, Binary(state, spv::OpIAdd, u32, base, ConstantU32(state, Registry::SlotCodeWord)));
+        auto match = Binary(state, spv::OpLogicalAnd, boolean, frontUsable, Binary(state, spv::OpINotEqual, boolean, slotCode, ConstantU32(state, 0u)));
+        for (std::uint32_t dword = 0; dword < count; dword++) match = Binary(state, spv::OpLogicalAnd, boolean, match, Binary(state, spv::OpIEqual, boolean, LoadRegistry(state, Binary(state, spv::OpIAdd, u32, base, ConstantU32(state, dword))), frontWords[dword]));
+        const auto taken = state.module.AllocateId();
+        const auto miss = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelectionMerge, miss, spv::SelectionControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, match, taken, miss);
+        EmitLabel(state, taken);
+        state.module.AddFunction(spv::OpReturnValue, slotCode);
+        EmitLabel(state, miss);
+    }
+    std::vector<std::uint32_t> call{spv::OpFunctionCall, u32, state.module.AllocateId(), id};
+    for (std::uint32_t dword = 0; dword < count; dword++) call.push_back(frontWords[dword]);
+    call.push_back(frontExec);
+    state.module.AddFunction(call);
+    state.module.AddFunction(spv::OpReturnValue, call[2]);
+    state.module.AddFunction(spv::OpFunctionEnd);
+    slot = front;
+    return front;
 }
 
 // The record region the driver keeps for a runtime mode list (ImageTableRegistry::ModeSetKey), 0
@@ -1704,7 +1750,7 @@ std::uint32_t DefineRegistryRegion(SpirvEmitterState& state) {
     state.module.BeginHelperFunction();
     const RegistryHelper restore{state, state.currentLabel};
     state.module.AddName(id, "registry_region");
-    state.module.AddFunction(spv::OpFunction, u32, id, spv::FunctionControlMaskNone, state.module.Type(spv::OpTypeFunction, u32, u32, u32));
+    state.module.AddFunction(spv::OpFunction, u32, id, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, u32, u32, u32));
     const auto low = state.module.AllocateId();
     const auto high = state.module.AllocateId();
     state.module.AddFunction(spv::OpFunctionParameter, u32, low);
@@ -1731,8 +1777,43 @@ std::uint32_t DefineRegistryRegion(SpirvEmitterState& state) {
     }
     state.module.AddFunction(spv::OpReturnValue, region);
     state.module.AddFunction(spv::OpFunctionEnd);
-    state.registryRegionFunction = id;
-    return id;
+    // The inlinable front: the first directory slot; a later slot or a miss calls the full lookup.
+    const auto front = state.module.AllocateId();
+    state.module.AddName(front, "registry_region_front");
+    state.module.AddFunction(spv::OpFunction, u32, front, spv::FunctionControlInlineMask, state.module.Type(spv::OpTypeFunction, u32, u32, u32));
+    const auto frontLow = state.module.AllocateId();
+    const auto frontHigh = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionParameter, u32, frontLow);
+    state.module.AddFunction(spv::OpFunctionParameter, u32, frontHigh);
+    EmitLabel(state, state.module.AllocateId());
+    {
+        const auto frontStart = LoadRegistry(state, ConstantU32(state, Registry::HeaderDirectory));
+        const auto frontCapacity = LoadRegistry(state, ConstantU32(state, Registry::HeaderDirectoryCapacity));
+        const auto frontMask = Binary(state, spv::OpISub, u32, Select(state, u32, Binary(state, spv::OpINotEqual, boolean, frontCapacity, ConstantU32(state, 0u)), frontCapacity, ConstantU32(state, 1u)), ConstantU32(state, 1u));
+        auto frontHash = ConstantU32(state, 2166136261u);
+        for (const auto word : {frontLow, frontHigh}) {
+            frontHash = Binary(state, spv::OpBitwiseXor, u32, frontHash, word);
+            frontHash = Binary(state, spv::OpIMul, u32, frontHash, ConstantU32(state, 16777619u));
+        }
+        const auto base = Binary(state, spv::OpIAdd, u32, frontStart, Binary(state, spv::OpIMul, u32, Binary(state, spv::OpBitwiseAnd, u32, frontHash, frontMask), ConstantU32(state, Registry::DirectoryWords)));
+        const auto value = LoadRegistry(state, Binary(state, spv::OpIAdd, u32, base, ConstantU32(state, 2u)));
+        auto match = Binary(state, spv::OpINotEqual, boolean, value, ConstantU32(state, 0u));
+        match = Binary(state, spv::OpLogicalAnd, boolean, match, Binary(state, spv::OpIEqual, boolean, LoadRegistry(state, base), frontLow));
+        match = Binary(state, spv::OpLogicalAnd, boolean, match, Binary(state, spv::OpIEqual, boolean, LoadRegistry(state, Binary(state, spv::OpIAdd, u32, base, ConstantU32(state, 1u))), frontHigh));
+        const auto taken = state.module.AllocateId();
+        const auto miss = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelectionMerge, miss, spv::SelectionControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, match, taken, miss);
+        EmitLabel(state, taken);
+        state.module.AddFunction(spv::OpReturnValue, value);
+        EmitLabel(state, miss);
+    }
+    const auto full = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionCall, u32, full, id, frontLow, frontHigh);
+    state.module.AddFunction(spv::OpReturnValue, full);
+    state.module.AddFunction(spv::OpFunctionEnd);
+    state.registryRegionFunction = front;
+    return front;
 }
 
 std::uint32_t EmitRegistryCode(SpirvValueEmitContext& ctx, const IrValue& handle, bool sampler, std::uint32_t exec) {

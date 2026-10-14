@@ -1,7 +1,9 @@
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
+#include <array>
 #include <bit>
+#include <string>
 
 namespace ShaderRecompiler {
 
@@ -18,7 +20,7 @@ void ReturnBdaZeroIf(SpirvEmitterState& state, std::uint32_t condition) {
 }
 
 // (u64 address, u32 bytes, u32 instruction) -> u64 device address of the range holding all the bytes,
-std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool recordFaults, std::uint32_t permission = BdaAbi::Read) {
+std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool recordFaults, std::array<std::uint32_t, 3>& cache, std::uint32_t permission = BdaAbi::Read) {
     const auto u32 = TypeU32(state);
     const auto u64 = TypeScalarU64(state);
     const auto boolean = TypeBool(state);
@@ -31,7 +33,7 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     };
     const auto function = state.module.AllocateId();
     state.module.AddName(function, name);
-    state.module.AddFunction(spv::OpFunction, u64, function, spv::FunctionControlMaskNone, state.module.Type(spv::OpTypeFunction, u64, u64, u32, u32));
+    state.module.AddFunction(spv::OpFunction, u64, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, u64, u64, u32, u32));
     const auto address = state.module.AllocateId();
     const auto bytes = state.module.AllocateId();
     const auto instruction = state.module.AllocateId();
@@ -54,9 +56,8 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     fail(binary(spv::OpIEqual, boolean, bytes, constant(0)), BdaAbi::FaultReason::Overflow);
     const auto end = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
     fail(binary(spv::OpULessThanEqual, boolean, end, address), BdaAbi::FaultReason::Overflow);
-    // The range of this function's last successful lookup in this invocation: a V# table, its
-    // descriptors and the data they name sit in one range, so every lookup after the first is a
-    // compare instead of the header checks and a binary search of the table (dependent loads).
+    // The range of this function's last successful lookup in this invocation (read by its inlinable
+    // front, DefineBdaLookupFront).
     const auto privateU64 = TypePointer(state, spv::StorageClassPrivate, u64);
     const auto cached = [&] {
         const auto id = state.module.AllocateId();
@@ -66,22 +67,7 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     const auto cachedBegin = cached();
     const auto cachedEnd = cached();
     const auto cachedBase = cached();
-    const auto loadCached = [&](std::uint32_t variable) {
-        const auto value = state.module.AllocateId();
-        state.module.AddFunction(spv::OpLoad, u64, value, variable);
-        return value;
-    };
-    {
-        const auto hitBegin = loadCached(cachedBegin);
-        const auto hit = binary(spv::OpLogicalAnd, boolean, binary(spv::OpUGreaterThanEqual, boolean, address, hitBegin), binary(spv::OpULessThanEqual, boolean, end, loadCached(cachedEnd)));
-        const auto taken = state.module.AllocateId();
-        const auto next = state.module.AllocateId();
-        state.module.AddFunction(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);
-        state.module.AddFunction(spv::OpBranchConditional, hit, taken, next);
-        EmitLabel(state, taken);
-        state.module.AddFunction(spv::OpReturnValue, binary(spv::OpIAdd, u64, loadCached(cachedBase), binary(spv::OpISub, u64, address, hitBegin)));
-        EmitLabel(state, next);
-    }
+    cache = {cachedBegin, cachedEnd, cachedBase};
     const auto length = state.module.AllocateId();
     state.module.AddFunction(spv::OpArrayLength, u32, length, state.bdaPagetableVariable, 0u);
     fail(binary(spv::OpULessThan, boolean, length, constant(4)), BdaAbi::FaultReason::InvalidTable);
@@ -147,6 +133,13 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     return function;
 }
 
+
+std::uint32_t DefineBdaLookupPair(SpirvEmitterState& state, const char* name, bool recordFaults, std::uint32_t permission = BdaAbi::Read) {
+    std::array<std::uint32_t, 3> cache{};
+    const auto function = DefineBdaLookup(state, name, recordFaults, cache, permission);
+    if (!recordFaults && permission == BdaAbi::Read) state.bdaProbeCache = cache;
+    return function;
+}
 }
 
 static std::uint32_t DefineBdaNoteWrite(SpirvEmitterState& state) {
@@ -233,14 +226,14 @@ static std::uint32_t DefineBdaNoteWrite(SpirvEmitterState& state) {
 void DefineGetBdaPointer(SpirvEmitterState& state) {
     if (state.faultBufferVariable != 0) DefineBdaFaultFunction(state);
     if (!state.program.Info().usesDma) return;
-    state.bdaPointerFunction = DefineBdaLookup(state, "get_bda_pointer", true);
-    if (!BdaByteReadsForced()) state.bdaProbeFunction = DefineBdaLookup(state, "probe_bda_pointer", false);
+    state.bdaPointerFunction = DefineBdaLookupPair(state, "get_bda_pointer", true);
+    if (!BdaByteReadsForced()) state.bdaProbeFunction = DefineBdaLookupPair(state, "probe_bda_pointer", false);
     DefineBdaDwordReadFunctions(state);
     DefineBdaSpanReadFunctions(state);
     if (state.program.Info().bdaWrites) {
-        state.bdaWritePointerFunction = DefineBdaLookup(state, "get_bda_write_pointer", true, BdaAbi::Write);
-        if (!BdaByteReadsForced()) state.bdaWriteProbeFunction = DefineBdaLookup(state, "probe_bda_write_pointer", false, BdaAbi::Write);
-        state.bdaAtomicPointerFunction = DefineBdaLookup(state, "get_bda_atomic_pointer", true, BdaAbi::Read | BdaAbi::Write);
+        state.bdaWritePointerFunction = DefineBdaLookupPair(state, "get_bda_write_pointer", true, BdaAbi::Write);
+        if (!BdaByteReadsForced()) state.bdaWriteProbeFunction = DefineBdaLookupPair(state, "probe_bda_write_pointer", false, BdaAbi::Write);
+        state.bdaAtomicPointerFunction = DefineBdaLookupPair(state, "get_bda_atomic_pointer", true, BdaAbi::Read | BdaAbi::Write);
         state.bdaNoteWriteFunction = DefineBdaNoteWrite(state);
         DefineBdaByteWriteFunctions(state);
     }

@@ -1068,6 +1068,10 @@ void EmitProgram(SpirvEmitterState& state) {
     if (state.pixelValidMaskVariable != 0u) {
         state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, TypeU32(state)), state.pixelValidMaskVariable, spv::StorageClassFunction);
     }
+    if (state.bdaSiteCache[0] != 0u) {
+        for (const auto variable : state.bdaSiteCache) state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, TypeScalarU64(state)), variable, spv::StorageClassFunction, BdaConstant(state, 0u));
+        state.bdaSiteCacheDeclared = true;
+    }
     for (std::uint32_t half = 0; half < state.laneCount; half++) {
         auto& lane = half == 0u ? ctx : high;
         if (lane.scratchU32Variable != 0u) {

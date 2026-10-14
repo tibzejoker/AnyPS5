@@ -108,11 +108,6 @@ struct SpirvEmitterState {
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
     std::unordered_set<const IrValue*> sharedLaneValues;
-    // Values the same in every lane of a wave (WaveUniformValues: SGPR data), when the host subgroup
-    // holds lanes of one wave only: BDA reads with such an address broadcast it and the loaded dwords
-    // from the first active lane, so the translation and the loads run on the subgroup-uniform path.
-    std::unordered_set<const IrValue*> bdaUniformValues;
-    bool bdaUniform = false;
     std::uint32_t laneHalf = 0;
     std::uint32_t spirvVersion = 0x00010300u;
     std::span<const std::uint32_t> supportedCapabilities;
@@ -147,6 +142,14 @@ struct SpirvEmitterState {
     std::uint32_t dot2F32F16Function = 0;
     std::array<std::array<std::uint32_t, 2>, 2> bdaDwordReadFunctions {};
     std::array<std::array<std::uint32_t, 2>, 2> bdaSpanReadFunctions {};
+    // probe_bda_pointer's cached range (Private begin, end, device base), and the read sites' copy of
+    // it in main's Function variables with the functions that refill it on a miss (see
+    // EmitBdaSpanSite): the hit path at a site is inline compares and loads, with no call and no
+    // Private access in main.
+    std::array<std::uint32_t, 3> bdaProbeCache {};
+    std::array<std::uint32_t, 3> bdaSiteCache {};
+    bool bdaSiteCacheDeclared = false;
+    std::array<std::array<std::uint32_t, 2>, 2> bdaSpanMissFunctions {};
     std::uint32_t bdaStopValue = 0;
     std::uint32_t bdaPcOverride = 0;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).

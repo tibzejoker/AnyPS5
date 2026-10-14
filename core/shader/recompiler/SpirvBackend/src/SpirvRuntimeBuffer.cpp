@@ -7,6 +7,7 @@
 #include "PipelineSpecialization.hpp"
 #include <algorithm>
 #include <array>
+#include <utility>
 #include <string>
 #include <vector>
 
@@ -508,7 +509,7 @@ std::uint32_t formattedCall(SpirvValueEmitContext& context, const IrValue& instr
         };
         state.module.BeginHelperFunction();
         const Restore restore{state, element, label, byteOffset};
-        state.module.AddFunction(spv::OpFunction, resultType, id, spv::FunctionControlMaskNone, functionType);
+        state.module.AddFunction(spv::OpFunction, resultType, id, spv::FunctionControlDontInlineMask, functionType);
         std::array<std::uint32_t, 10> parameters{};
         for (std::uint32_t index = 0; index < (store ? 10u : 9u); ++index) {
             parameters[index] = state.module.AllocateId();
@@ -573,7 +574,7 @@ std::uint32_t formattedGpuCall(SpirvValueEmitContext& context, const IrValue& in
         state.module.BeginHelperFunction();
         const Restore restore{state, state.currentLabel, state.bdaStopValue};
         state.module.AddName(id, std::string(store ? "store" : "load") + "_formatted_gpu_buffer_x" + std::to_string(components));
-        state.module.AddFunction(spv::OpFunction, resultType, id, spv::FunctionControlMaskNone, functionType);
+        state.module.AddFunction(spv::OpFunction, resultType, id, spv::FunctionControlDontInlineMask, functionType);
         const std::array<std::uint32_t, 11> types{u64, u32, u32, u32, boolean, u32, boolean, u32, u32, u32, valueType};
         std::array<std::uint32_t, 11> parameters{};
         for (std::uint32_t index = 0; index < (store ? 11u : 10u); ++index) {
@@ -624,6 +625,37 @@ std::uint32_t scalarGpuCall(SpirvValueEmitContext& context, const IrValue& instr
     const auto u64 = TypeScalarU64(state);
     const auto boolean = TypeBool(state);
     const bool coherent = context.Memory(instruction).coherent;
+    // The V# words, the dword address and the pc: the read of one dword through a runtime V#.
+    const auto body = [&](const std::array<std::uint32_t, 6>& parameters) {
+        const auto word1 = parameters[1];
+        const auto high = Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, field(state, word1, 0u, 16u)), BdaConstant(state, 32u));
+        const auto base = Binary(state, spv::OpBitwiseOr, u64, Unary(state, spv::OpUConvert, u64, parameters[0]), high);
+        const auto invalid = nonzero(state, field(state, parameters[3], 30u, 2u));
+        const auto valid = both(state, Unary(state, spv::OpLogicalNot, boolean, invalid), Binary(state, spv::OpINotEqual, boolean, base, BdaConstant(state, 0u)));
+        const auto stride = field(state, word1, 16u, 14u);
+        const auto records = parameters[2];
+        const auto size = Select(state, u64, equal(state, stride, ConstantU32(state, 0u)), Unary(state, spv::OpUConvert, u64, records), Binary(state, spv::OpIMul, u64, Unary(state, spv::OpUConvert, u64, stride), Unary(state, spv::OpUConvert, u64, records)));
+        const auto address = parameters[4];
+        const auto byte = EmitAndConstant(state, address, ~3u);
+        const auto offset = Unary(state, spv::OpUConvert, u64, byte);
+        const auto inBounds = both(state, valid, Binary(state, spv::OpULessThanEqual, boolean, Binary(state, spv::OpIAdd, u64, offset, BdaConstant(state, 4u)), size));
+        return EmitValueOrZeroIfCondition(state, inBounds, [&] { return EmitBdaRead(context, instruction, Binary(state, spv::OpIAdd, u64, base, offset), 32u); });
+    };
+    const auto* handle = instruction.Argument(0)->Resolve();
+    if (handle->Opcode() != IrOpcode::GetBufferResource || handle->ArgumentCount() != 4u) context.Fail(instruction, "requires a runtime four-dword V#");
+    const auto address = EmitAddU32(state, context.Arg(instruction, 1u), ConstantU32(state, context.Memory(instruction).offset));
+    const auto noCarry = Binary(state, spv::OpUGreaterThanEqual, boolean, address, context.Arg(instruction, 1u));
+    const std::array<std::uint32_t, 6> arguments{context.Arg(*handle, 0u), context.Arg(*handle, 1u), context.Arg(*handle, 2u), context.Arg(*handle, 3u), address, BdaInstructionPc(state, instruction)};
+    // In main, the read is emitted in place: its hit path is then the inline loads of the read
+    // site (EmitBdaSpanSite), whose range variables only main holds.
+    if (state.bdaSiteCacheDeclared && !state.module.InHelperFunction()) {
+        const auto pcOverride = std::exchange(state.bdaPcOverride, arguments[5]);
+        const auto stops = std::exchange(state.bdaStopsInvocations, false);
+        const auto value = body(arguments);
+        state.bdaPcOverride = pcOverride;
+        state.bdaStopsInvocations = stops;
+        return Select(state, u32, noCarry, value, ConstantU32(state, 0u));
+    }
     auto& function = state.scalarGpuBufferFunctions[coherent ? 1u : 0u];
     if (function == 0u) {
         function = state.module.AllocateId();
@@ -642,7 +674,7 @@ std::uint32_t scalarGpuCall(SpirvValueEmitContext& context, const IrValue& instr
         state.module.BeginHelperFunction();
         const Restore restore{state, state.currentLabel, state.bdaPcOverride, state.bdaStopsInvocations};
         state.module.AddName(function, std::string("read_gpu_scalar_buffer") + (coherent ? "_coherent" : ""));
-        state.module.AddFunction(spv::OpFunction, u32, function, spv::FunctionControlMaskNone, state.module.Type(spv::OpTypeFunction, u32, u32, u32, u32, u32, u32, u32));
+        state.module.AddFunction(spv::OpFunction, u32, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, u32, u32, u32, u32, u32, u32, u32));
         std::array<std::uint32_t, 6> parameters{};
         for (auto& parameter : parameters) {
             parameter = state.module.AllocateId();
@@ -651,28 +683,11 @@ std::uint32_t scalarGpuCall(SpirvValueEmitContext& context, const IrValue& instr
         EmitLabel(state, state.module.AllocateId());
         state.bdaPcOverride = parameters[5];
         state.bdaStopsInvocations = false;
-        const auto word1 = parameters[1];
-        const auto high = Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, field(state, word1, 0u, 16u)), BdaConstant(state, 32u));
-        const auto base = Binary(state, spv::OpBitwiseOr, u64, Unary(state, spv::OpUConvert, u64, parameters[0]), high);
-        const auto invalid = nonzero(state, field(state, parameters[3], 30u, 2u));
-        const auto valid = both(state, Unary(state, spv::OpLogicalNot, boolean, invalid), Binary(state, spv::OpINotEqual, boolean, base, BdaConstant(state, 0u)));
-        const auto stride = field(state, word1, 16u, 14u);
-        const auto records = parameters[2];
-        const auto size = Select(state, u64, equal(state, stride, ConstantU32(state, 0u)), Unary(state, spv::OpUConvert, u64, records), Binary(state, spv::OpIMul, u64, Unary(state, spv::OpUConvert, u64, stride), Unary(state, spv::OpUConvert, u64, records)));
-        const auto address = parameters[4];
-        const auto byte = EmitAndConstant(state, address, ~3u);
-        const auto offset = Unary(state, spv::OpUConvert, u64, byte);
-        const auto inBounds = both(state, valid, Binary(state, spv::OpULessThanEqual, boolean, Binary(state, spv::OpIAdd, u64, offset, BdaConstant(state, 4u)), size));
-        const auto value = EmitValueOrZeroIfCondition(state, inBounds, [&] { return EmitBdaRead(context, instruction, Binary(state, spv::OpIAdd, u64, base, offset), 32u); });
-        state.module.AddFunction(spv::OpReturnValue, value);
+        state.module.AddFunction(spv::OpReturnValue, body(parameters));
         state.module.AddFunction(spv::OpFunctionEnd);
     }
-    const auto* handle = instruction.Argument(0)->Resolve();
-    if (handle->Opcode() != IrOpcode::GetBufferResource || handle->ArgumentCount() != 4u) context.Fail(instruction, "requires a runtime four-dword V#");
-    const auto address = EmitAddU32(state, context.Arg(instruction, 1u), ConstantU32(state, context.Memory(instruction).offset));
-    const auto noCarry = Binary(state, spv::OpUGreaterThanEqual, boolean, address, context.Arg(instruction, 1u));
     const auto result = state.module.AllocateId();
-    state.module.AddFunction(spv::OpFunctionCall, u32, result, function, context.Arg(*handle, 0u), context.Arg(*handle, 1u), context.Arg(*handle, 2u), context.Arg(*handle, 3u), address, BdaInstructionPc(state, instruction));
+    state.module.AddFunction(spv::OpFunctionCall, u32, result, function, arguments[0], arguments[1], arguments[2], arguments[3], arguments[4], arguments[5]);
     return Select(state, u32, noCarry, result, ConstantU32(state, 0u));
 }
 }

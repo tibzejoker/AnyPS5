@@ -135,7 +135,7 @@ std::uint32_t DefineBdaSpanLoadFunction(SpirvEmitterState& state, bool coherent)
     const auto values = TypeU32Vector(state, 4);
     const auto function = state.module.AllocateId();
     state.module.AddName(function, std::string("load_bda_span") + (coherent ? "_coherent" : ""));
-    state.module.AddFunction(spv::OpFunction, values, function, spv::FunctionControlMaskNone, state.module.Type(spv::OpTypeFunction, values, u64, u32, u32));
+    state.module.AddFunction(spv::OpFunction, values, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, values, u64, u32, u32));
     const auto physical = state.module.AllocateId();
     const auto firstBytes = state.module.AllocateId();
     const auto used = state.module.AllocateId();
@@ -174,7 +174,7 @@ std::uint32_t DefineBdaSpanReadFunction(SpirvEmitterState& state, bool coherent,
     const auto reader = state.bdaDwordReadFunctions[stops][coherent];
     const auto function = state.module.AllocateId();
     state.module.AddName(function, std::string("read_bda_span") + (stops ? "_stop" : "") + (coherent ? "_coherent" : ""));
-    state.module.AddFunction(spv::OpFunction, result, function, spv::FunctionControlMaskNone, state.module.Type(spv::OpTypeFunction, result, u64, u32, u32, u32));
+    state.module.AddFunction(spv::OpFunction, result, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, result, u64, u32, u32, u32));
     const auto address = state.module.AllocateId();
     const auto offset = state.module.AllocateId();
     const auto used = state.module.AllocateId();
@@ -237,6 +237,43 @@ std::uint32_t DefineBdaSpanReadFunction(SpirvEmitterState& state, bool coherent,
     return function;
 }
 
+
+
+std::uint32_t BdaSpanMissResultType(SpirvEmitterState& state) {
+    const auto u64 = TypeScalarU64(state);
+    return state.module.Type(spv::OpTypeStruct, BdaSpanReadResultType(state), u64, u64, u64);
+}
+
+// A read site's miss: the full span read, then the range probe_bda_pointer cached for it, which the
+// site keeps in main's variables for its later reads.
+std::uint32_t DefineBdaSpanMissFunction(SpirvEmitterState& state, bool coherent, std::uint32_t full) {
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto result = BdaSpanReadResultType(state);
+    const auto missType = BdaSpanMissResultType(state);
+    const auto function = state.module.AllocateId();
+    state.module.AddName(function, std::string("read_bda_span_miss") + (state.bdaStopsInvocations ? "_stop" : "") + (coherent ? "_coherent" : ""));
+    state.module.AddFunction(spv::OpFunction, missType, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, missType, u64, u32, u32, u32));
+    std::array<std::uint32_t, 4> parameters{};
+    const std::array<std::uint32_t, 4> types{u64, u32, u32, u32};
+    for (std::size_t index = 0; index < parameters.size(); ++index) {
+        parameters[index] = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionParameter, types[index], parameters[index]);
+    }
+    EmitLabel(state, state.module.AllocateId());
+    const auto read = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionCall, result, read, full, parameters[0], parameters[1], parameters[2], parameters[3]);
+    std::array<std::uint32_t, 3> range{};
+    for (std::size_t index = 0; index < range.size(); ++index) {
+        range[index] = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u64, range[index], state.bdaProbeCache[index]);
+    }
+    const auto value = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeConstruct, missType, value, read, range[0], range[1], range[2]);
+    state.module.AddFunction(spv::OpReturnValue, value);
+    state.module.AddFunction(spv::OpFunctionEnd);
+    return function;
+}
 }
 
 void DefineBdaDwordReadFunctions(SpirvEmitterState& state) {
@@ -253,7 +290,7 @@ void DefineBdaDwordReadFunctions(SpirvEmitterState& state) {
             if ((stop && !stops) || (coherent && !coherentAccesses)) continue;
             const auto function = state.module.AllocateId();
             state.module.AddName(function, std::string("read_bda_dword_bytes") + (stop ? "_stop" : "") + (coherent ? "_coherent" : ""));
-            state.module.AddFunction(spv::OpFunction, pair, function, spv::FunctionControlMaskNone, type);
+            state.module.AddFunction(spv::OpFunction, pair, function, spv::FunctionControlDontInlineMask, type);
             const auto address = state.module.AllocateId();
             const auto instruction = state.module.AllocateId();
             state.module.AddFunction(spv::OpFunctionParameter, u64, address);
@@ -303,6 +340,7 @@ void DefineBdaDwordReadFunctions(SpirvEmitterState& state) {
 
 void DefineBdaSpanReadFunctions(SpirvEmitterState& state) {
     if (state.bdaProbeFunction == 0) return;
+    for (auto& variable : state.bdaSiteCache) variable = state.module.AllocateId();
     const auto& memory = state.program.Resources().memoryInfo;
     const bool coherentAccesses = std::any_of(memory.begin(), memory.end(), [](const MemoryInfo& info) { return info.coherent; });
     const bool stops = state.bdaStopsInvocations;
@@ -318,6 +356,7 @@ void DefineBdaSpanReadFunctions(SpirvEmitterState& state) {
         for (const bool coherent : {false, true}) {
             if (coherent && !coherentAccesses) continue;
             state.bdaSpanReadFunctions[stop][coherent] = DefineBdaSpanReadFunction(state, coherent, loaders[coherent]);
+            state.bdaSpanMissFunctions[stop][coherent] = DefineBdaSpanMissFunction(state, coherent, state.bdaSpanReadFunctions[stop][coherent]);
         }
     }
     state.bdaStopsInvocations = stops;
@@ -374,35 +413,11 @@ bool BdaInvocationsMayStop(const IrProgram& program) {
     return true;
 }
 
-namespace {
-
-bool BdaUniformRead(const SpirvEmitterState& state, const IrValue& inst) {
-    return state.bdaUniform && state.bdaUniformValues.contains(&inst);
-}
-
-std::uint32_t BroadcastFirst(SpirvEmitterState& state, std::uint32_t value) {
-    const auto result = state.module.AllocateId();
-    state.module.AddFunction(spv::OpGroupNonUniformBroadcastFirst, TypeU32(state), result, ConstantU32(state, spv::ScopeSubgroup), value);
-    return result;
-}
-
-// An SGPR address is one value per wave: taken from the first active lane, it is uniform to the
-// host compiler too, which then runs the range lookup and the loads once per subgroup.
-std::uint32_t UniformBdaAddress(SpirvEmitterState& state, std::uint32_t address) {
-    const auto u64 = TypeScalarU64(state);
-    const auto low = BroadcastFirst(state, Unary(state, spv::OpUConvert, TypeU32(state), address));
-    const auto high = BroadcastFirst(state, Unary(state, spv::OpUConvert, TypeU32(state), Binary(state, spv::OpShiftRightLogical, u64, address, BdaConstant(state, 32u))));
-    return Binary(state, spv::OpBitwiseOr, u64, Unary(state, spv::OpUConvert, u64, low), Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, high), BdaConstant(state, 32u)));
-}
-
-}
-
 std::uint32_t EmitBdaRead(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t bits) {
     auto& state = ctx.state;
     if (bits != 8u && bits != 16u && bits != 32u) ctx.Fail(inst, "unsupported BDA read width");
     if (state.bdaPointerFunction == 0) ctx.Fail(inst, "BDA lookup function is missing");
     if (bits == 32u) return EmitBdaDwordReads(ctx, inst, address, 0u, 1u)[0];
-    if (BdaUniformRead(state, inst)) address = UniformBdaAddress(state, address);
     const auto instruction = BdaInstructionPc(state, inst);
     EmitBdaOverflowCheck(state, address, bits / 8u, instruction);
     return EmitBdaBytes(state, address, bits / 8u, instruction, BdaAccessMask(state, inst));
@@ -453,7 +468,7 @@ void DefineBdaByteWriteFunctions(SpirvEmitterState& state) {
         if (coherent && !coherentAccesses) continue;
         const auto function = state.module.AllocateId();
         state.module.AddName(function, std::string("write_bda_bytes") + (coherent ? "_coherent" : ""));
-        state.module.AddFunction(spv::OpFunction, voidType, function, spv::FunctionControlMaskNone, type);
+        state.module.AddFunction(spv::OpFunction, voidType, function, spv::FunctionControlDontInlineMask, type);
         const auto address = state.module.AllocateId();
         const auto value = state.module.AllocateId();
         const auto bytes = state.module.AllocateId();
@@ -607,6 +622,69 @@ std::uint32_t EmitBdaAtomic(SpirvValueEmitContext& ctx, const IrValue& inst, std
     });
 }
 
+// A span read at its site: inside the range the site's variables hold (the probe's last, kept in
+// main), at a 4-aligned device address, the used dwords load in place, inline; anything else calls
+// the out-of-line miss (the full span read, which records faults, and the range it found). Neither
+// the lookup nor the read is inlined at the hundreds of read sites of a GTA pixel shader (that
+// stalled the driver's pipeline compiles), and the hit path makes no call (a call per read, or calls
+// in main reaching a cache in Private variables, cost NVIDIA several times the inline loads).
+std::uint32_t EmitBdaSpanSite(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t used, std::uint32_t first, std::uint32_t last, std::uint32_t instruction) {
+    auto& state = ctx.state;
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    const bool coherent = BdaCoherent(state, inst);
+    const auto result = BdaSpanReadResultType(state);
+    const auto delta = static_cast<std::int64_t>(static_cast<std::int32_t>(offset)) + static_cast<std::int64_t>(first) * 4;
+    const auto magnitude = BdaConstant(state, static_cast<std::uint64_t>(delta < 0 ? -delta : delta));
+    const auto firstAddress = Binary(state, delta < 0 ? spv::OpISub : spv::OpIAdd, u64, address, magnitude);
+    const auto wrapped = delta < 0 ? Binary(state, spv::OpUGreaterThan, boolean, magnitude, address) : Binary(state, spv::OpULessThan, boolean, firstAddress, address);
+    const auto spanBytes = (last + 1u - first) * 4u;
+    const auto end = Binary(state, spv::OpIAdd, u64, firstAddress, BdaConstant(state, spanBytes));
+    const auto load = [&](std::uint32_t variable) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u64, value, variable);
+        return value;
+    };
+    const auto begin = load(state.bdaSiteCache[0]);
+    auto hit = Binary(state, spv::OpLogicalAnd, boolean, Unary(state, spv::OpLogicalNot, boolean, wrapped), Binary(state, spv::OpUGreaterThan, boolean, end, firstAddress));
+    hit = Binary(state, spv::OpLogicalAnd, boolean, hit, Binary(state, spv::OpUGreaterThanEqual, boolean, firstAddress, begin));
+    hit = Binary(state, spv::OpLogicalAnd, boolean, hit, Binary(state, spv::OpULessThanEqual, boolean, end, load(state.bdaSiteCache[1])));
+    const auto physical = Binary(state, spv::OpIAdd, u64, load(state.bdaSiteCache[2]), Binary(state, spv::OpISub, u64, firstAddress, begin));
+    hit = Binary(state, spv::OpLogicalAnd, boolean, hit, Unary(state, spv::OpLogicalNot, boolean, BdaAddressUnaligned(state, physical)));
+    return EmitValueIfElse(state, hit, result, [&] {
+        std::array<std::uint32_t, 4> parts{};
+        for (std::uint32_t dword = 0; dword < 4u; ++dword) {
+            if ((used & (1u << dword)) == 0u) {
+                parts[dword] = ConstantU32(state, 0u);
+                continue;
+            }
+            const auto pointer = state.module.AllocateId();
+            state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, Binary(state, spv::OpIAdd, u64, physical, BdaConstant(state, (dword - first) * 4u)));
+            parts[dword] = state.module.AllocateId();
+            if (coherent) state.module.AddFunction(spv::OpAtomicLoad, u32, parts[dword], pointer, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0u));
+            else state.module.AddFunction(spv::OpLoad, u32, parts[dword], pointer, BdaAccessMask(coherent), 4u);
+        }
+        const auto values = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), values, parts[0], parts[1], parts[2], parts[3]);
+        if (!state.bdaStopsInvocations) return values;
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeConstruct, result, value, values, ConstantU32(state, 0u));
+        return value;
+    }, [&] {
+        const auto miss = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionCall, BdaSpanMissResultType(state), miss, state.bdaSpanMissFunctions[state.bdaStopsInvocations][coherent], address, ConstantU32(state, offset), ConstantU32(state, used), instruction);
+        for (std::uint32_t index = 0; index < 3u; ++index) {
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, u64, value, miss, index + 1u);
+            state.module.AddFunction(spv::OpStore, state.bdaSiteCache[index], value);
+        }
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeExtract, result, value, miss, 0u);
+        return value;
+    });
+}
+
 // One probe of the span from the first to the last extracted dword replaces 4 lookups per dword (a
 // Bink DC pass spent ~450 dependent table levels per iteration on them). The span is loaded
 // dword-wise from the returned device address when it lies in one range and that address is
@@ -616,15 +694,6 @@ std::uint32_t EmitBdaAtomic(SpirvValueEmitContext& ctx, const IrValue& inst, std
 // fault is recorded exactly as one; the probe records none, and a span it accepts cannot fault.
 std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t dwords, bool everyDword) {
     auto& state = ctx.state;
-    const bool uniform = BdaUniformRead(state, inst);
-    if (uniform) address = UniformBdaAddress(state, address);
-    const auto broadcastUsed = [&](std::array<std::uint32_t, 4> values, std::uint32_t used) {
-        if (!uniform) return values;
-        for (std::uint32_t dword = 0; dword < 4u; ++dword) {
-            if ((used & (1u << dword)) != 0u) values[dword] = BroadcastFirst(state, values[dword]);
-        }
-        return values;
-    };
     if (dwords == 0u || dwords > 4u) ctx.Fail(inst, "unsupported BDA read width");
     if (state.bdaPointerFunction == 0) ctx.Fail(inst, "BDA lookup function is missing");
     const auto instruction = BdaInstructionPc(state, inst);
@@ -663,12 +732,18 @@ std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const
     if (state.bdaProbeFunction == 0) {
         addresses[first] = dwordAddress(first);
         readBytes(values);
-        return broadcastUsed(values, used);
+        return values;
     }
     const auto function = state.bdaSpanReadFunctions[state.bdaStopsInvocations][BdaCoherent(state, inst)];
     if (function == 0) ctx.Fail(inst, "BDA span read function is missing");
-    const auto read = state.module.AllocateId();
-    state.module.AddFunction(spv::OpFunctionCall, BdaSpanReadResultType(state), read, function, address, ConstantU32(state, offset), ConstantU32(state, used), instruction);
+    // The site variables live in main: a read emitted into a helper function calls the span read.
+    std::uint32_t read = 0;
+    if (state.bdaSiteCacheDeclared && !state.module.InHelperFunction()) {
+        read = EmitBdaSpanSite(ctx, inst, address, offset, used, first, last, instruction);
+    } else {
+        read = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionCall, BdaSpanReadResultType(state), read, function, address, ConstantU32(state, offset), ConstantU32(state, used), instruction);
+    }
     if (state.bdaStopsInvocations) {
         const auto stopped = state.module.AllocateId();
         state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), stopped, read, 1u);
@@ -680,7 +755,7 @@ std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const
         if (state.bdaStopsInvocations) state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), values[dword], read, 0u, dword);
         else state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), values[dword], read, dword);
     }
-    return broadcastUsed(values, used);
+    return values;
 }
 
 }
