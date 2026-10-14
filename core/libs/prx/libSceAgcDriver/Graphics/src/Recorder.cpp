@@ -3106,7 +3106,7 @@ bool Recorder::CompletionLabelIn(std::uint64_t address, std::size_t bytes) const
 std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) const {
     if (refusal != nullptr) *refusal = LabelRefusal::None;
     if ((labels.empty() && queuedLabels.empty()) || (bytes != 4 && bytes != 8) || address % 4 != 0) return std::nullopt;
-    LabelHit hit{0, 0, 0, false, std::numeric_limits<std::uint64_t>::max()};
+    LabelHit hit{0, 0, 0, false, std::numeric_limits<std::uint64_t>::max(), true};
     bool queued = false;
     bool candidate = false;
     const auto tag = GuestMemory::GpuLockThreadTag();
@@ -3131,11 +3131,13 @@ std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, s
             }
         }
         if (entry == nullptr) return std::nullopt;
+        const bool batchPending = entry->batch != nullptr && (entry->batch == open.get() || entry->batch->fence == VK_NULL_HANDLE || fenceStatus(entry->batch->fence) != VK_SUCCESS);
+        hit.pending = hit.pending && batchPending && !entry->behindCompletion && !entry->overwritten;
         if (entry->stamp <= afterStamp) {
             // The late rule (see NoteLabel): counted in both modes, so a control run shows the population.
             if (!candidate) ++lateCounts.candidates;
             candidate = true;
-            if (!LateTrustEnabled()) return refuse(LabelRefusal::TrustOff, nullptr, *entry);
+            if (!LateTrustEnabled() && !(batchPending && !entry->behindCompletion && !entry->overwritten)) return refuse(LabelRefusal::TrustOff, nullptr, *entry);
             if (entry->batch == nullptr) return refuse(LabelRefusal::Queued, &LateStatistics::queued, *entry);
             if (entry->overwritten) return refuse(LabelRefusal::Overwritten, &LateStatistics::overwritten, *entry);
             if (entry->generation == 0) return refuse(LabelRefusal::Unclosed, &LateStatistics::unclosed, *entry);

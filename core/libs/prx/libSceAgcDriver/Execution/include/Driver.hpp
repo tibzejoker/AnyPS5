@@ -12,6 +12,8 @@ void Submit(const Packet* packet, std::uint32_t queue);
 }
 
 extern "C" void AgcDriverWaitIdle_nid_postfix();
+// Memory waits (WAIT_REG_MEM / WAIT_REG_MEM_64) ordered on the GPU and those that blocked a queue worker.
+extern "C" void AgcDriverGpuWaitCounts_nid_postfix(std::uint64_t* orderedOnGpu, std::uint64_t* blockedOnCpu);
 extern "C" void AgcDriverRaiseWorkerThreadPriority_nid_postfix(const char* role);
 extern "C" void AgcDriverLockVulkanLoader_nid_postfix();
 extern "C" void AgcDriverUnlockVulkanLoader_nid_postfix();

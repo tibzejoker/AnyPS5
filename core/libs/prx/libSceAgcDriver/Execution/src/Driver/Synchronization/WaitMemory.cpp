@@ -6,6 +6,9 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <mutex>
 #include <set>
@@ -54,6 +57,51 @@ bool Driver::traceLateLabels() {
     return trace;
 }
 
+namespace {
+
+struct GpuWaitCounters {
+    std::atomic<std::uint64_t> orderedOnGpu{0};
+    std::atomic<std::uint64_t> blockedOnCpu{0};
+    std::atomic<std::uint64_t> landedOnCpu{0};
+    std::atomic<long long> lastReport{0};
+    std::uint64_t reportedGpu = 0, reportedBlocked = 0, reportedLanded = 0;
+    std::mutex mutex;
+};
+
+GpuWaitCounters& gpuWaitCounters() {
+    static auto* counters = new GpuWaitCounters();
+    return *counters;
+}
+
+// Every 10 s: waits the GPU orders (their producer is recorded before the work after them, in the
+// one recorder stream), waits that blocked the worker, and landed waits that still polled memory.
+void reportGpuWaits() {
+    auto& counters = gpuWaitCounters();
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    auto previous = counters.lastReport.load();
+    if (now == previous || !counters.lastReport.compare_exchange_strong(previous, now)) return;
+    std::lock_guard lock(counters.mutex);
+    const auto gpu = counters.orderedOnGpu.load() - counters.reportedGpu;
+    const auto blocked = counters.blockedOnCpu.load() - counters.reportedBlocked;
+    const auto landed = counters.landedOnCpu.load() - counters.reportedLanded;
+    counters.reportedGpu += gpu;
+    counters.reportedBlocked += blocked;
+    counters.reportedLanded += landed;
+    std::fprintf(stderr, "[gpu-waits] last 10 s: %llu memory waits ordered on the GPU, %llu blocked a queue worker, %llu landed waits polled memory\n", static_cast<unsigned long long>(gpu), static_cast<unsigned long long>(blocked), static_cast<unsigned long long>(landed));
+}
+
+}
+
+void NoteWaitOrderedOnGpu() {
+    gpuWaitCounters().orderedOnGpu.fetch_add(1, std::memory_order_relaxed);
+    reportGpuWaits();
+}
+
+void GpuWaitCounts(std::uint64_t& orderedOnGpu, std::uint64_t& blockedOnCpu) {
+    orderedOnGpu = gpuWaitCounters().orderedOnGpu.load();
+    blockedOnCpu = gpuWaitCounters().blockedOnCpu.load() + gpuWaitCounters().landedOnCpu.load();
+}
+
 std::vector<Driver::PendingWait>& Driver::pendingWaits() {
     struct WaitsTag {};
     return HostThreadLocal<std::vector<PendingWait>, WaitsTag>();
@@ -90,6 +138,16 @@ void Driver::landPendingWaits(std::uint32_t queue) {
         const auto packet = std::span<const std::uint32_t>(wait.words).first(wait.count);
         ++stats.lands;
         if (Pm4::WaitSatisfiedUnchecked(packet)) continue;
+        const std::uint64_t awaited = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+        // The producer is recorded: every later packet of this queue is recorded after it in the
+        // one recorder stream, so the GPU orders the work behind it (the batches' barriers), and a
+        // CPU read of what it wrote still syncs through the flush hook (Recorder::SyncThrough).
+        const auto awaitedBytes = Pm4::WaitAwaitedBytes(packet);
+        if (const auto hit = Graphics::Recorder::LookupLabel(awaited, awaitedBytes, wait.received); hit.has_value() && Pm4::WaitComparesValue(packet, hit->value) && (!hit->late || hit->pending || GuestMemory::UnchangedSinceCollected(awaited, awaitedBytes, hit->generation))) {
+            NoteWaitOrderedOnGpu();
+            continue;
+        }
+        gpuWaitCounters().landedOnCpu.fetch_add(1, std::memory_order_relaxed);
         const auto started = std::chrono::steady_clock::now();
         waitMemory(packet, queue, none, wait.received, false, true);
         const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
@@ -167,7 +225,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
         if (hit->late) {
             if (hit->generation == refusedGeneration) return false;
-            if (!GuestMemory::UnchangedSinceCollected(awaited, awaitedBytes, hit->generation)) {
+            if (!hit->pending && !GuestMemory::UnchangedSinceCollected(awaited, awaitedBytes, hit->generation)) {
                 ++outcomes.lateRefusedCpuStore;
                 refusedGeneration = hit->generation;
                 if (trace) traceLate("refused, CPU store since the group closed", hit, refusal);
@@ -177,6 +235,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             if (trace) traceLate("trusted", hit, refusal);
         }
         ++(polling ? outcomes.fromRecorderPolling : outcomes.fromRecorder);
+        NoteWaitOrderedOnGpu();
         if (unlockedHit) ++outcomes.fromRecorderUnlocked;
         if (hit->queue == queue) {
             ++outcomes.fromRecorderSameQueue;
@@ -318,6 +377,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
 
     if (entryTryFailed && pollService(false)) return;
 
+    gpuWaitCounters().blockedOnCpu.fetch_add(1, std::memory_order_relaxed);
+    reportGpuWaits();
     noteWaitBlocked(queue, awaited, true);
     struct BlockedWait {
         Driver& driver;

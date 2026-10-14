@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadPriority.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include <mutex>
@@ -58,6 +59,13 @@ void ReportFailure(std::exception_ptr error) {
 
 extern "C" void AgcDriverRaiseWorkerThreadPriority_nid_postfix(const char* role) {
     AgcDriver::RaiseWorkerThreadPriority(role);
+}
+
+extern "C" void AgcDriverGpuWaitCounts_nid_postfix(std::uint64_t* orderedOnGpu, std::uint64_t* blockedOnCpu) {
+    std::uint64_t gpu = 0, cpu = 0;
+    AgcDriver::DriverDetail::GpuWaitCounts(gpu, cpu);
+    if (orderedOnGpu != nullptr) *orderedOnGpu = gpu;
+    if (blockedOnCpu != nullptr) *blockedOnCpu = cpu;
 }
 
 extern "C" void AgcDriverWaitIdle_nid_postfix() try {

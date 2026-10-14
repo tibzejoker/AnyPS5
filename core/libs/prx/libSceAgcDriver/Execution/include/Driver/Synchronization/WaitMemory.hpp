@@ -47,6 +47,8 @@ struct EpochBumps {
 };
 
 void PollSleep();
+void NoteWaitOrderedOnGpu();
+void GpuWaitCounts(std::uint64_t& orderedOnGpu, std::uint64_t& blockedOnCpu);
 
 }
 

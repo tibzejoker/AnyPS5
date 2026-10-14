@@ -306,6 +306,9 @@ public:
         // Taken under the late rule: `generation` is the oldest group generation of the dwords.
         bool late;
         std::uint64_t generation;
+        // Every dword's batch is still open or unsignaled: its GPU store lands after any CPU store
+        // made since the record, so memory ends with `value`.
+        bool pending = false;
     };
     // Why a lookup refused a late candidate (an entry with stamp <= afterStamp), for the trace.
     // BehindCompletion replaces the other reasons when the refused entry's value reaches memory
