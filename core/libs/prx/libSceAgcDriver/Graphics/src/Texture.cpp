@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <array>
@@ -92,6 +93,87 @@ std::atomic<std::uint64_t> depthCopyTextures{0}, depthCopyRefreshes{0};
 std::atomic<std::uint64_t> refreshesProved{0};
 std::atomic<std::uint64_t> untrackedCompares{0};
 
+// Write tracking counters (the [track] line, printed every 10 s once a refresh ran). The backing
+// breakdown (APS5_TRACK_STATS=1) classifies each refreshed surface: write-watched (stamps answer,
+// no comparison), a host import whose range is compared (the driver's page marks were not trusted),
+// a shared view (a file mapping or multiply mapped direct memory, watched through its views or not
+// at all) and untracked memory (outside the watch: copies, unwatched arenas).
+enum class TrackBacking : std::uint8_t { Watched, ImportCompared, SharedView, Untracked, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(TrackBacking::Count)> TrackBackingNames{"watched", "import-compared", "shared-view", "untracked"};
+
+struct TrackKindCounters {
+    std::atomic<std::uint64_t> refreshes{0}, refreshedBytes{0}, compares{0}, comparedBytes{0}, uploads{0}, uploadedBytes{0};
+};
+
+struct TrackState {
+    std::atomic<std::uint64_t> refreshes{0}, proved{0}, clean{0}, compares{0}, comparedBytes{0}, originalCompares{0}, originalComparedBytes{0}, snapshotCompares{0}, snapshotComparedBytes{0}, uploads{0}, uploadedBytes{0}, flushes{0}, syncs{0}, captures{0}, capturedBytes{0};
+    std::array<TrackKindCounters, static_cast<std::size_t>(TrackBacking::Count)> kinds{};
+    std::atomic<long long> lastReport{-1};
+    std::mutex mutex;
+    StorageTexture::TrackTotals reported{};
+    std::array<std::array<std::uint64_t, 6>, static_cast<std::size_t>(TrackBacking::Count)> reportedKinds{};
+};
+
+TrackState& Track() {
+    static auto* state = new TrackState();
+    return *state;
+}
+
+bool TrackStatsEnabled() {
+    static const bool enabled = std::getenv("APS5_TRACK_STATS") != nullptr;
+    return enabled;
+}
+
+thread_local TrackBacking trackBacking = TrackBacking::Count;
+
+TrackKindCounters* trackKind() {
+    return trackBacking == TrackBacking::Count ? nullptr : &Track().kinds[static_cast<std::size_t>(trackBacking)];
+}
+
+void countTrack(std::atomic<std::uint64_t>& total, std::atomic<std::uint64_t>* bytesTotal, std::uint64_t bytes) {
+    total.fetch_add(1, std::memory_order_relaxed);
+    if (bytesTotal != nullptr) bytesTotal->fetch_add(bytes, std::memory_order_relaxed);
+}
+
+TrackBacking classifyBacking(const Context& context, std::uint64_t address, std::uint64_t bytes) {
+    if (GuestMemory::Watched(address, static_cast<std::size_t>(bytes))) return TrackBacking::Watched;
+#ifdef _WIN32
+    std::uint32_t protection = 0;
+    if (GuestArena::GuestArenaProtection_nid_postfix(static_cast<std::uintptr_t>(address), &protection)) return TrackBacking::SharedView;
+#endif
+    if (HostImportCovers(context, address, static_cast<std::size_t>(bytes))) return TrackBacking::ImportCompared;
+    return TrackBacking::Untracked;
+}
+
+struct TrackBackingScope {
+    TrackBacking previous;
+    TrackBackingScope(const Context& context, std::uint64_t address, std::uint64_t bytes) : previous(trackBacking) {
+        trackBacking = TrackStatsEnabled() ? classifyBacking(context, address, bytes) : TrackBacking::Count;
+        if (auto* kind = trackKind()) countTrack(kind->refreshes, &kind->refreshedBytes, bytes);
+    }
+    ~TrackBackingScope() { trackBacking = previous; }
+    TrackBackingScope(const TrackBackingScope&) = delete;
+    TrackBackingScope& operator=(const TrackBackingScope&) = delete;
+};
+
+void countStorageUploadTracked(std::uint64_t bytes) {
+    auto& track = Track();
+    countTrack(track.uploads, &track.uploadedBytes, bytes);
+    if (auto* kind = trackKind()) countTrack(kind->uploads, &kind->uploadedBytes, bytes);
+}
+
+void countUntrackedCompare(std::uint64_t bytes) {
+    auto& track = Track();
+    countTrack(track.compares, &track.comparedBytes, bytes);
+    if (auto* kind = trackKind()) countTrack(kind->compares, &kind->comparedBytes, bytes);
+}
+
+void countOriginalCompare(std::uint64_t bytes) {
+    auto& track = Track();
+    countTrack(track.originalCompares, &track.originalComparedBytes, bytes);
+    if (auto* kind = trackKind()) countTrack(kind->compares, &kind->comparedBytes, bytes);
+}
+
 struct StorageTraffic {
     std::mutex mutex;
     std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> writeBacks;
@@ -138,6 +220,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
 }
 
 void countStorageUpload(std::size_t path, std::uint64_t bytes) {
+    if (path != 0) countStorageUploadTracked(bytes);
     if (!LookupOutcomes::Profiled()) return;
     auto& traffic = Traffic();
     std::lock_guard lock(traffic.mutex);
@@ -170,6 +253,57 @@ struct LiveImages {
 LiveImages& Live() {
     static LiveImages live;
     return live;
+}
+
+StorageTexture::TrackTotals trackTotals() {
+    const auto& track = Track();
+    const auto load = [](const std::atomic<std::uint64_t>& value) { return value.load(std::memory_order_relaxed); };
+    return {load(track.refreshes), load(track.proved), load(track.clean), load(track.compares), load(track.comparedBytes), load(track.originalCompares), load(track.originalComparedBytes), load(track.snapshotCompares), load(track.snapshotComparedBytes), load(track.uploads), load(track.uploadedBytes), load(track.flushes), load(track.syncs), load(track.captures), load(track.capturedBytes)};
+}
+
+void reportTrack(const Context& context) {
+    auto& track = Track();
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    auto previous = track.lastReport.load(std::memory_order_relaxed);
+    if (previous == now || !track.lastReport.compare_exchange_strong(previous, now)) return;
+    std::lock_guard lock(track.mutex);
+    const auto current = trackTotals();
+    if (previous < 0) {
+        track.reported = current;
+        return;
+    }
+    const auto& last = track.reported;
+    const auto mib = [](std::uint64_t bytes) { return bytes / 1048576.0; };
+    const auto delta = [](std::uint64_t now, std::uint64_t before) { return static_cast<unsigned long long>(now - before); };
+    std::string kinds;
+    char text[256];
+    if (TrackStatsEnabled()) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> surfaces;
+        {
+            auto& live = Live();
+            std::lock_guard liveLock(live.mutex);
+            surfaces.reserve(live.textures.size());
+            for (const auto* texture : live.textures) surfaces.emplace_back(texture->Descriptor().baseAddress, texture->GuestBytes());
+        }
+        std::array<std::pair<std::uint64_t, std::uint64_t>, static_cast<std::size_t>(TrackBacking::Count)> alive{};
+        for (const auto& [address, bytes] : surfaces) {
+            if (bytes == 0) continue;
+            auto& slot = alive[static_cast<std::size_t>(classifyBacking(context, address, bytes))];
+            ++slot.first;
+            slot.second += bytes;
+        }
+        kinds = "; by backing (refreshes/MiB, compares/MiB, uploads/MiB, live images/MiB):";
+        for (std::size_t kind = 0; kind < TrackBackingNames.size(); ++kind) {
+            const auto& counters = track.kinds[kind];
+            auto& seen = track.reportedKinds[kind];
+            const std::array<std::uint64_t, 6> values{counters.refreshes.load(), counters.refreshedBytes.load(), counters.compares.load(), counters.comparedBytes.load(), counters.uploads.load(), counters.uploadedBytes.load()};
+            std::snprintf(text, sizeof(text), " %s %llu/%.1f %llu/%.1f %llu/%.1f %llu/%.1f;", TrackBackingNames[kind], delta(values[0], seen[0]), mib(values[1] - seen[1]), delta(values[2], seen[2]), mib(values[3] - seen[3]), delta(values[4], seen[4]), mib(values[5] - seen[5]), static_cast<unsigned long long>(alive[kind].first), mib(alive[kind].second));
+            kinds += text;
+            seen = values;
+        }
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[track] last 10 s: refreshes %llu (proved %llu, clean by stamps %llu), untracked compares %llu/%.1f MiB, original compares %llu/%.1f MiB, sampled snapshot compares %llu/%.1f MiB, uploads %llu/%.1f MiB, other images flushed first %llu, GPU syncs inside refreshes %llu, guest snapshots %llu/%.1f MiB%s\n", delta(current.refreshes, last.refreshes), delta(current.proved, last.proved), delta(current.clean, last.clean), delta(current.compares, last.compares), mib(current.comparedBytes - last.comparedBytes), delta(current.originalCompares, last.originalCompares), mib(current.originalComparedBytes - last.originalComparedBytes), delta(current.snapshotCompares, last.snapshotCompares), mib(current.snapshotComparedBytes - last.snapshotComparedBytes), delta(current.uploads, last.uploads), mib(current.uploadedBytes - last.uploadedBytes), delta(current.flushes, last.flushes), delta(current.syncs, last.syncs), delta(current.captures, last.captures), mib(current.capturedBytes - last.capturedBytes), kinds.c_str());
+    track.reported = current;
 }
 
 // Per-layer validity of array surfaces (see StorageTexture::layerBegin): a fill of one layer clears
@@ -1713,12 +1847,23 @@ LookupOutcomes& ThreadLookupOutcomes() {
 
 bool StorageTexture::Refresh() {
     const bool profile = LookupOutcomes::Profiled();
+    countTrack(Track().refreshes, nullptr, 0);
+    const TrackBackingScope backing(context, descriptor.baseAddress, guestBytes);
+    struct Report {
+        const Context& context;
+        std::uint64_t syncs = Recorder::AnnouncedSyncs();
+        ~Report() {
+            Track().syncs.fetch_add(Recorder::AnnouncedSyncs() - syncs, std::memory_order_relaxed);
+            reportTrack(context);
+        }
+    } report{context};
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
     if (refreshProved()) {
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
+        countTrack(Track().proved, nullptr, 0);
         if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshProved, start);
         return true;
     }
@@ -1754,6 +1899,7 @@ bool StorageTexture::Refresh() {
     // No publish: the upload below reads the stored units from the unit shadow itself.
     const bool flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.get(), "storage refresh", PublishScope::None);
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
+    if (flushed) countTrack(Track().flushes, nullptr, 0);
     // `original` holds the guest bytes the image was last uploaded from or written back as; while the
     // guest memory and the DCC keys still match, the image content is current. Pages nobody wrote
     // since `generation` need no comparison.
@@ -1779,6 +1925,7 @@ bool StorageTexture::Refresh() {
         const auto equalsOriginal = [&] {
             // Named for the [hooksync] attribution: the compare goes through the flush hook.
             const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
+            countOriginalCompare(guestBytes);
             return GuestMemory::EqualsCommitted(descriptor.baseAddress, original);
         };
         const auto scanBlocks = [&] {
@@ -1879,6 +2026,7 @@ bool StorageTexture::Refresh() {
     }
     if (unchanged) {
         ++Profile().storageReused;
+        if (stamped && !compared) countTrack(Track().clean, nullptr, 0);
         layerGeneration.assign(trackedLayers, current);
         refreshGeneration();
         takeRefreshProof(alias != nullptr);
@@ -2044,6 +2192,15 @@ std::uint64_t StorageTexture::UntrackedCompares() {
     return untrackedCompares.load(std::memory_order_relaxed);
 }
 
+StorageTexture::TrackTotals StorageTexture::TrackCounters() {
+    return trackTotals();
+}
+
+void StorageTexture::CountSnapshotCompare(std::size_t bytes) {
+    auto& track = Track();
+    countTrack(track.snapshotCompares, &track.snapshotComparedBytes, bytes);
+}
+
 bool StorageTexture::ServesKeysAt(std::uint64_t dccAddress) const {
     const bool locked = GuestMemory::GpuMutex().HeldByThisThread();
     const auto readFollowed = [&] {
@@ -2079,6 +2236,7 @@ void traceKeyStore(const char* path, const GuestTextureResource& descriptor, std
 }
 
 void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
+    Track().captures.fetch_add(1, std::memory_order_relaxed);
     original.resize(static_cast<std::size_t>(guestBytes));
     comparedGuestBytes = {};
     std::vector<bool> selected(trackedLayers, true);
@@ -2089,6 +2247,7 @@ void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
         const auto offset = static_cast<std::size_t>(layerBegin(layer) - descriptor.baseAddress);
         GuestMemory::ReadCommittedUnsynced(layerBegin(layer), std::span(original).subspan(offset, static_cast<std::size_t>(layerBytes(layer))));
         layerOriginal[layer] = true;
+        Track().capturedBytes.fetch_add(layerBytes(layer), std::memory_order_relaxed);
     }
 }
 
@@ -2125,6 +2284,7 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
         return true;
     }
     untrackedCompares.fetch_add(1, std::memory_order_relaxed);
+    countUntrackedCompare(bytes);
     const auto saved = std::span(original).subspan(static_cast<std::size_t>(address - descriptor.baseAddress), bytes);
     if (GuestMemory::EqualsCommittedUnsynced(address, saved)) {
         std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);
@@ -2132,6 +2292,7 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
         return true;
     }
     comparedGuestBytes = {};
+    countUntrackedCompare(bytes);
     for (std::size_t index = 0; index < changed.size(); ++index) {
         const auto begin = std::max(address, (first + index) * blockBytes);
         const auto stop = std::min(end, (first + index + 1) * blockBytes);

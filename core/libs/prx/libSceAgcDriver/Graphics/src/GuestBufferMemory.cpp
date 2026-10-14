@@ -520,11 +520,11 @@ const char* createImport(const Context& context, HostImport& entry, VkResult& fa
     return step;
 }
 
-#ifndef _WIN32
 enum class ImportWatchRequest : std::uint8_t { Probe, Watch, Unwatch };
 
 ImportWatchRequest importWatchRequest() {
     static const auto request = [] {
+        if (std::getenv("APS5_POC_NO_WRITE_TRACKING") != nullptr) return ImportWatchRequest::Unwatch;
         const char* value = std::getenv("APS5_WRITE_WATCH_IMPORTS");
         if (value == nullptr || std::strcmp(value, "probe") == 0) return ImportWatchRequest::Probe;
         if (std::strcmp(value, "watch") == 0) return ImportWatchRequest::Watch;
@@ -533,16 +533,13 @@ ImportWatchRequest importWatchRequest() {
     }();
     return request;
 }
-#endif
+
+bool importProbeKeepsWatch(const ImportProbe& probe) {
+    return probe.failure == nullptr && probe.writtenAfterSubmit == 0 && probe.writtenAfterFill == 0 && probe.writtenLate == 0 && probe.writtenByCpu != 0;
+}
 
 void decideImportWatch(const Context& context, HostImports& state) {
     if (state.watchDevice == context.device) return;
-#ifdef _WIN32
-    state.watchDevice = context.device;
-    state.unwatchImports = true;
-    state.unwatchDmaBufImports = false;
-    if (context.hostImportAlignment != 0 && GuestMemory::WriteWatched()) std::fprintf(stderr, "[write-watch] Windows direct host imports use comparisons; separate shared aliases retain guest write tracking\n");
-#else
     const auto request = importWatchRequest();
     state.watchDevice = context.device;
     state.unwatchImports = false;
@@ -555,18 +552,19 @@ void decideImportWatch(const Context& context, HostImports& state) {
     if (request == ImportWatchRequest::Unwatch) {
         state.unwatchImports = true;
         state.unwatchDmaBufImports = true;
-        std::fprintf(stderr, "[write-watch] host imports are compared, not watched (APS5_WRITE_WATCH_IMPORTS=unwatch)\n");
+        std::fprintf(stderr, "[write-watch] host imports are compared, not watched (%s)\n", std::getenv("APS5_POC_NO_WRITE_TRACKING") != nullptr ? "APS5_POC_NO_WRITE_TRACKING" : "APS5_WRITE_WATCH_IMPORTS=unwatch");
         return;
     }
     const auto probe = ProbeImportWriteProtection(context);
     if (probe.failure != nullptr) {
         state.unwatchImports = true;
-        std::fprintf(stderr, "[write-watch] host imports resolve write protection: unknown (probe failed at %s, %d); imported ranges are compared\n", probe.failure, static_cast<int>(probe.result));
+        std::fprintf(stderr, "[write-watch] host import probe failed at %s (%d); imported ranges are compared\n", probe.failure, static_cast<int>(probe.result));
     } else {
-        state.unwatchImports = probe.writtenAfterSubmit != 0 || probe.writtenAfterFill != 0;
-        std::fprintf(stderr, "[write-watch] host imports resolve write protection: %s (%u of %u scratch pages written after a GPU read, %u after a GPU write, %u after the import); imported ranges %s\n", state.unwatchImports ? "yes" : "no", probe.writtenAfterSubmit, probe.pages, probe.writtenAfterFill, probe.writtenAtImport, state.unwatchImports ? "are compared" : "stay watched");
+        state.unwatchImports = !importProbeKeepsWatch(probe);
+        std::fprintf(stderr, "[write-watch] host imports leave page marks to CPU stores: %s (%u of %u scratch pages marked after a GPU read, %u after a GPU write, %u late after the import, %u by the import, %u after a CPU store); imported ranges %s\n", state.unwatchImports ? "no" : "yes", probe.writtenAfterSubmit, probe.pages, probe.writtenAfterFill, probe.writtenLate, probe.writtenAtImport, probe.writtenByCpu, state.unwatchImports ? "are compared" : "stay watched");
     }
     state.unwatchDmaBufImports = state.unwatchImports;
+#ifndef _WIN32
     if (!context.dmaBufImport) return;
     const auto dmaBuf = ProbeDmaBufImportWriteProtection(context);
     if (dmaBuf.failure != nullptr) {
@@ -574,8 +572,8 @@ void decideImportWatch(const Context& context, HostImports& state) {
         std::fprintf(stderr, "[write-watch] dma-buf imports keep write protection: unknown (probe failed at %s, %d); imported ranges are compared\n", dmaBuf.failure, static_cast<int>(dmaBuf.result));
         return;
     }
-    state.unwatchDmaBufImports = dmaBuf.writtenAfterSubmit != 0 || dmaBuf.writtenAfterFill != 0 || dmaBuf.writtenByCpu == 0;
-    std::fprintf(stderr, "[write-watch] dma-buf imports keep write protection: %s (%u of %u scratch pages written after a GPU read, %u after a GPU write, %u after the import, %u seen after a CPU store); imported ranges %s\n", state.unwatchDmaBufImports ? "no" : "yes", dmaBuf.writtenAfterSubmit, dmaBuf.pages, dmaBuf.writtenAfterFill, dmaBuf.writtenAtImport, dmaBuf.writtenByCpu, state.unwatchDmaBufImports ? "are compared" : "stay watched");
+    state.unwatchDmaBufImports = !importProbeKeepsWatch(dmaBuf);
+    std::fprintf(stderr, "[write-watch] dma-buf imports keep write protection: %s (%u of %u scratch pages written after a GPU read, %u after a GPU write, %u late, %u after the import, %u seen after a CPU store); imported ranges %s\n", state.unwatchDmaBufImports ? "no" : "yes", dmaBuf.writtenAfterSubmit, dmaBuf.pages, dmaBuf.writtenAfterFill, dmaBuf.writtenLate, dmaBuf.writtenAtImport, dmaBuf.writtenByCpu, state.unwatchDmaBufImports ? "are compared" : "stay watched");
 #endif
 }
 
@@ -2011,21 +2009,41 @@ void ClearHostImports(VkDevice device) {
     ++state.epoch;
 }
 
-#ifndef _WIN32
 namespace {
 
+#ifndef _WIN32
+bool collectScratch(std::uint64_t base, std::uint64_t bytes, std::uint32_t& pages) {
+    pages = 0;
+    return GuestWriteWatch::GuestWriteWatchCollect_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes), [](void* count, std::uintptr_t begin, std::uintptr_t end) { *static_cast<std::uint32_t*>(count) += static_cast<std::uint32_t>((end - begin) / 4096); }, &pages);
+}
+#else
+bool collectScratch(std::uint64_t base, std::uint64_t bytes, std::uint32_t& pages) {
+    std::vector<void*> written(static_cast<std::size_t>((bytes + 4095) / 4096));
+    ULONG_PTR count = written.size();
+    DWORD granularity = 0;
+    pages = 0;
+    if (GetWriteWatch(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void*>(base), static_cast<SIZE_T>(bytes), written.data(), &count, &granularity) != 0) return false;
+    pages = static_cast<std::uint32_t>(count);
+    return true;
+}
+#endif
+
+std::chrono::milliseconds importProbeLateWindow() {
+    static const auto window = [] {
+        const char* value = std::getenv("APS5_IMPORT_PROBE_LATE_MS");
+        return std::chrono::milliseconds(value != nullptr ? std::strtoul(value, nullptr, 10) : 20ul);
+    }();
+    return window;
+}
+
 void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t bytes, const std::function<const char*(HostImport&, VkResult&)>& importStep, ImportProbe& probe) {
-    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(base), bytes);
     HostImport import{base, bytes, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
     VkBuffer destination = VK_NULL_HANDLE;
     VkDeviceMemory destinationMemory = VK_NULL_HANDLE;
     VkCommandBuffer commands[2]{};
     VkFence fence = VK_NULL_HANDLE;
     bool submitted = false;
-    const auto collect = [&](std::uint32_t& pages) {
-        pages = 0;
-        return GuestWriteWatch::GuestWriteWatchCollect_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes), [](void* count, std::uintptr_t begin, std::uintptr_t end) { *static_cast<std::uint32_t*>(count) += static_cast<std::uint32_t>((end - begin) / 4096); }, &pages);
-    };
+    const auto collect = [&](std::uint32_t& pages) { return collectScratch(base, bytes, pages); };
     const auto run = [&]() -> const char* {
         std::uint32_t quiet = 0;
         if (!collect(quiet)) return "the first collect";
@@ -2033,6 +2051,12 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
         if (quiet != 0) return "an unwritten scratch range";
         if (const char* step = importStep(import, probe.result)) return step;
         if (!collect(probe.writtenAtImport)) return "the collect after the import";
+        for (const auto until = std::chrono::steady_clock::now() + importProbeLateWindow(); std::chrono::steady_clock::now() < until;) {
+            std::uint32_t late = 0;
+            if (!collect(late)) return "the collect after the import window";
+            probe.writtenLate += late;
+            std::this_thread::yield();
+        }
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = bytes;
         info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -2088,17 +2112,31 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
     if (destination != VK_NULL_HANDLE) context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, destination, nullptr);
     if (destinationMemory != VK_NULL_HANDLE) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, destinationMemory, nullptr);
     if (import.buffer != VK_NULL_HANDLE) destroyImport(context, import);
-    GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(base), bytes);
 }
 
 }
-#endif
 
 ImportProbe ProbeImportWriteProtection(const Context& context) {
     ImportProbe probe;
 #ifdef _WIN32
-    static_cast<void>(context);
-    probe.failure = "the Linux write watch";
+    if (context.hostImportAlignment == 0) {
+        probe.failure = "host import support";
+        return probe;
+    }
+    constexpr std::uint64_t page = 4096;
+    const std::uint64_t alignment = std::max<std::uint64_t>(context.hostImportAlignment, 65536);
+    const std::uint64_t bytes = (16 * page + alignment - 1) / alignment * alignment;
+    probe.pages = static_cast<std::uint32_t>(bytes / page);
+    void* scratch = VirtualAlloc(nullptr, static_cast<SIZE_T>(bytes), MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE);
+    if (scratch == nullptr) {
+        probe.failure = "VirtualAlloc with MEM_WRITE_WATCH";
+        return probe;
+    }
+    const auto base = reinterpret_cast<std::uint64_t>(scratch);
+    auto* pages = static_cast<volatile std::uint8_t*>(scratch);
+    for (std::uint64_t offset = 0; offset < bytes; offset += page) pages[offset] = 1;
+    runImportProbe(context, base, bytes, [&](HostImport& import, VkResult& result) { return createHostPointerImport(context, import, result); }, probe);
+    VirtualFree(scratch, 0, MEM_RELEASE);
     return probe;
 #else
     if (context.hostImportAlignment == 0) {
@@ -2121,7 +2159,9 @@ ImportProbe ProbeImportWriteProtection(const Context& context) {
     const auto base = (reinterpret_cast<std::uint64_t>(raw) + alignment - 1) / alignment * alignment;
     auto* scratch = reinterpret_cast<volatile std::uint8_t*>(base);
     for (std::uint64_t offset = 0; offset < bytes; offset += page) scratch[offset] = 1;
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(base), bytes);
     runImportProbe(context, base, bytes, [&](HostImport& import, VkResult& result) { return createImport(context, import, result); }, probe);
+    GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(base), bytes);
     munmap(raw, bytes + alignment);
     return probe;
 #endif
@@ -2161,6 +2201,7 @@ ImportProbe ProbeDmaBufImportWriteProtection(const Context& context) {
     const auto base = reinterpret_cast<std::uint64_t>(mapped);
     auto* scratch = reinterpret_cast<volatile std::uint8_t*>(base);
     for (std::uint64_t offset = 0; offset < bytes; offset += page) scratch[offset] = 1;
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(base), bytes);
     runImportProbe(context, base, bytes, [&](HostImport& import, VkResult& result) -> const char* {
         const int copy = dup(file);
         if (copy < 0) {
@@ -2169,6 +2210,7 @@ ImportProbe ProbeDmaBufImportWriteProtection(const Context& context) {
         }
         return createDmaBufImport(context, import, copy, 0, result);
     }, probe);
+    GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(base), bytes);
     munmap(mapped, bytes);
     close(file);
     return probe;

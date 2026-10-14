@@ -1446,8 +1446,17 @@ bool Recorder::SnapshotOverlaps(const WriteRanges* snapshot, std::uint64_t addre
     return AgcDriver::Graphics::SnapshotOverlaps(snapshot, address, bytes);
 }
 
+namespace {
+thread_local std::uint64_t announcedSyncs = 0;
+}
+
+std::uint64_t Recorder::AnnouncedSyncs() {
+    return announcedSyncs;
+}
+
 void Recorder::CountSync(int source, const void* site) {
     if (source < 0 || source >= 5) return;
+    ++announcedSyncs;
     if (drawCpu.active) {
         ++drawCpu.syncs;
         auto& totals = drawCpuTotals();

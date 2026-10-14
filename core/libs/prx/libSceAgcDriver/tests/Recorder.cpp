@@ -3145,8 +3145,18 @@ void importWatchTests(const Device& device) {
     using namespace AgcDriver::GuestMemory;
     const auto& context = device.GetContext();
 #ifdef _WIN32
-    Require(PrepareImportWatch(context) == ImportWatch::Unwatch, "Windows host imports stayed watched by default");
-    std::cout << "import watch decisions: Windows host imports use comparisons\n";
+    if (context.hostImportAlignment == 0 || !WriteWatched()) {
+        std::cout << "host imports or write watching unavailable: import watch decisions not tested\n";
+        return;
+    }
+    const auto probe = ProbeImportWriteProtection(context);
+    Require(probe.failure == nullptr, std::string("(u) the import probe failed at ") + (probe.failure != nullptr ? probe.failure : "") + " (" + std::to_string(static_cast<int>(probe.result)) + ")");
+    std::cout << "import probe: " << probe.writtenAtImport << " of " << probe.pages << " scratch pages marked by the import, " << probe.writtenLate << " late, " << probe.writtenAfterSubmit << " after a GPU read, " << probe.writtenAfterFill << " after a GPU write, " << probe.writtenByCpu << " after a CPU store\n";
+    Require(probe.writtenByCpu != 0, "(u) a CPU store after the import probe's GPU work was not marked");
+    const bool keeps = probe.writtenLate == 0 && probe.writtenAfterSubmit == 0 && probe.writtenAfterFill == 0;
+    const bool forced = std::getenv("APS5_POC_NO_WRITE_TRACKING") != nullptr || std::getenv("APS5_WRITE_WATCH_IMPORTS") != nullptr;
+    Require(forced || PrepareImportWatch(context) == (keeps ? ImportWatch::Watch : ImportWatch::Unwatch), "(u) the Windows import watch decision does not follow the probe");
+    std::cout << "import watch decisions: Windows host imports " << (PrepareImportWatch(context) == ImportWatch::Watch ? "stay write-watched" : "use comparisons") << "\n";
 #else
     if (context.hostImportAlignment == 0 || !WriteWatched()) {
         std::cout << "host imports or write watching unavailable: import watch decisions not tested\n";
@@ -6647,6 +6657,11 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--unchanged-cpu-stamps-only") {
             unchangedCpuStampTests(device, recorder);
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--import-watch-only") {
+            importWatchTests(device);
+            staleGenerationTests(device, recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--integer-clear-only") {

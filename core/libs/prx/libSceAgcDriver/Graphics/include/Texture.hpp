@@ -344,6 +344,29 @@ public:
     static std::uint64_t SinglePassMoves();
     static std::uint64_t RefreshesProved();
     static std::uint64_t UntrackedCompares();
+    // Write tracking totals since start (the [track] line prints them per 10 s): refreshes and how
+    // they settled, guest byte comparisons (untracked surfaces and `original` checks), uploads,
+    // flushes of other images' results the refresh had to make, and guest snapshots taken.
+    struct TrackTotals {
+        std::uint64_t refreshes = 0;
+        std::uint64_t proved = 0;
+        std::uint64_t clean = 0;
+        std::uint64_t compares = 0;
+        std::uint64_t comparedBytes = 0;
+        std::uint64_t originalCompares = 0;
+        std::uint64_t originalComparedBytes = 0;
+        std::uint64_t snapshotCompares = 0;
+        std::uint64_t snapshotComparedBytes = 0;
+        std::uint64_t uploads = 0;
+        std::uint64_t uploadedBytes = 0;
+        std::uint64_t flushes = 0;
+        std::uint64_t syncs = 0;
+        std::uint64_t captures = 0;
+        std::uint64_t capturedBytes = 0;
+    };
+    static TrackTotals TrackCounters();
+    // A sampled texture's snapshot compared with guest memory (ShaderResources), for the [track] line.
+    static void CountSnapshotCompare(std::size_t bytes);
     std::uint64_t GuestBytes() const;
     std::size_t OriginalSnapshotBytes() const { return original.capacity(); }
     VkDeviceSize AllocationBytes() const { return memoryBytes; }

@@ -684,6 +684,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             const auto equalsCommitted = [&] {
                 if (Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
+                StorageTexture::CountSnapshotCompare(it->bytes.size());
                 return GuestMemory::EqualsCommitted(address, it->bytes);
             };
             const auto unchanged = [&] {
