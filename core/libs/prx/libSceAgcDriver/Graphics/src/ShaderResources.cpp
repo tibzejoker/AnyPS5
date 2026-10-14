@@ -1203,6 +1203,7 @@ struct RegistryDevice {
     std::chrono::steady_clock::time_point lastRefresh{};
     std::unordered_set<VkPipelineLayout> layouts;
     VkCommandBuffer lastCommands = VK_NULL_HANDLE;
+    std::set<std::array<std::uint32_t, 4>> refusedSamplers;
     bool failed = false;
 
     std::span<std::uint32_t> Words() {
@@ -1227,10 +1228,11 @@ void createRegistryDevice(const Context& context, RegistryDevice& registry) {
     registry.imageCapacity = clampTo(clampTo(Registry::MaxImageElements, limits.maxDescriptorSetUpdateAfterBindSampledImages / 2u), limits.maxPerStageDescriptorUpdateAfterBindSampledImages / 2u);
     registry.samplerCapacity = clampTo(clampTo(Registry::MaxSamplerElements, limits.maxDescriptorSetUpdateAfterBindSamplers / 2u), limits.maxPerStageDescriptorUpdateAfterBindSamplers / 2u);
     registry.samplerCapacity -= registry.samplerCapacity % Registry::SamplerElements;
+    constexpr VkShaderStageFlags stages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_COMPUTE_BIT;
     const std::array<VkDescriptorSetLayoutBinding, 3> bindings{{
-        {Registry::MapBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1u, VK_SHADER_STAGE_ALL, nullptr},
-        {Registry::ImageBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, registry.imageCapacity, VK_SHADER_STAGE_ALL, nullptr},
-        {Registry::SamplerBinding, VK_DESCRIPTOR_TYPE_SAMPLER, registry.samplerCapacity, VK_SHADER_STAGE_ALL, nullptr},
+        {Registry::MapBinding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1u, stages, nullptr},
+        {Registry::ImageBinding, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, registry.imageCapacity, stages, nullptr},
+        {Registry::SamplerBinding, VK_DESCRIPTOR_TYPE_SAMPLER, registry.samplerCapacity, stages, nullptr},
     }};
     constexpr VkDescriptorBindingFlags grown = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT | VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT;
     const std::array<VkDescriptorBindingFlags, 3> flags{0u, grown, grown};
@@ -1298,6 +1300,41 @@ void writeRegistryImage(const Context& context, RegistryDevice& registry, std::u
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, 1u, &write, 0u, nullptr);
 }
 
+bool registryDebug() {
+    static const bool enabled = std::getenv("APS5_REG_DEBUG") != nullptr;
+    return enabled;
+}
+
+// APS5_REG_DEBUG=1: each distinct registry refusal once, with its reason.
+void registryRefusal(const std::uint32_t* words, std::uint32_t count, const char* what, const std::string& reason) {
+    Registry::Global().failedRecords.fetch_add(1, std::memory_order_relaxed);
+    if (!registryDebug()) return;
+    static std::mutex mutex;
+    static std::set<std::pair<std::string, std::vector<std::uint32_t>>> seen;
+    std::lock_guard lock(mutex);
+    if (seen.size() > 4096u || !seen.emplace(reason, std::vector<std::uint32_t>(words, words + count)).second) return;
+    std::string text;
+    char word[16];
+    for (std::uint32_t dword = 0; dword < count; ++dword) {
+        std::snprintf(word, sizeof(word), " %08x", words[dword]);
+        text += word;
+    }
+    std::fprintf(stderr, "[reg-debug] %s%s: %s\n", what, text.c_str(), reason.c_str());
+}
+
+ShaderRecompiler::DescriptorImageShape registryShape(ShaderRecompiler::RdnaImageDimension dimension) {
+    using ShaderRecompiler::DescriptorImageShape;
+    using ShaderRecompiler::RdnaImageDimension;
+    switch (dimension) {
+        case RdnaImageDimension::Dim1D: return DescriptorImageShape::Image1D;
+        case RdnaImageDimension::Dim1DArray: return DescriptorImageShape::Image1DArray;
+        case RdnaImageDimension::Dim2D: return DescriptorImageShape::Image2D;
+        case RdnaImageDimension::Dim2DArray: return DescriptorImageShape::Image2DArray;
+        case RdnaImageDimension::Dim3D: return DescriptorImageShape::Image3D;
+        default: throw std::runtime_error("the mode has no sampled image shape");
+    }
+}
+
 // The element (global image array slot) that serves `words` under `mode`, made on first use.
 std::optional<std::uint32_t> registryElement(const Context& context, RegistryDevice& registry, const std::array<std::uint32_t, 8>& words, const ShaderRecompiler::ImageResource& mode) {
     auto element = words;
@@ -1309,10 +1346,12 @@ std::optional<std::uint32_t> registryElement(const Context& context, RegistryDev
     RegistryElement entry;
     entry.words = element;
     entry.resource = DecodeTextureResource(element);
-    entry.firstLayer = mode.dimension == ShaderRecompiler::RdnaImageDimension::Dim2D && entry.resource.dimension == TextureDimension::k2DArray;
+    const auto shape = registryShape(mode.dimension);
+    entry.firstLayer = shape == ShaderRecompiler::DescriptorImageShape::Image2D && entry.resource.dimension == TextureDimension::k2DArray;
+    if (!entry.firstLayer && !MatchesGuestDimension(shape, entry.resource.dimension)) throw std::runtime_error("the texture dimension " + std::to_string(static_cast<int>(entry.resource.dimension)) + " does not serve the mode's shape " + std::to_string(static_cast<int>(shape)));
     entry.guestBytes = DescribeSurface(entry.resource).guestBytes;
-    if (entry.resource.baseAddress == 0u || entry.guestBytes == 0u) return std::nullopt;
-    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(entry.resource.baseAddress), static_cast<std::size_t>(entry.guestBytes)) && GuestMemory::CommittedRanges(entry.resource.baseAddress, static_cast<std::size_t>(entry.guestBytes), false).empty()) return std::nullopt;
+    if (entry.resource.baseAddress == 0u || entry.guestBytes == 0u) throw std::runtime_error("empty surface");
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(entry.resource.baseAddress), static_cast<std::size_t>(entry.guestBytes)) && GuestMemory::CommittedRanges(entry.resource.baseAddress, static_cast<std::size_t>(entry.guestBytes), false).empty()) throw std::runtime_error("unmapped surface");
     static_cast<void>(ResolveTextureFormat(entry.resource.format));
     CompletePendingCpuWrites(context, entry.resource.baseAddress, static_cast<std::size_t>(entry.guestBytes));
     entry.components = ViewComponents(entry.resource);
@@ -1332,34 +1371,35 @@ std::uint32_t registryRecord(const Context& context, RegistryDevice& registry, c
     std::copy(words.begin(), words.end(), value.dwords.begin());
     try {
         const auto match = ShaderRecompiler::ResourceMaterializer::TryRuntimeImageMode(set.image, value, set.modes);
-        static const bool debug = std::getenv("APS5_REG_DEBUG") != nullptr;
-        if (debug) std::fprintf(stderr, "[reg-debug] words %08x %08x %08x %08x mode %d reason %u %s\n", words[0], words[1], words[2], words[3], match.mode.has_value() ? static_cast<int>(*match.mode) : -1, static_cast<unsigned>(match.reason), match.detail.c_str());
-        if (!match.mode.has_value() || *match.mode > Registry::RecordModeMask) return 0u;
+        if (!match.mode.has_value()) {
+            registryRefusal(words.data(), 8u, "image mode", std::string(ShaderRecompiler::ImageTableAbi::PoisonReasonName(match.reason)) + (match.detail.empty() ? "" : ": " + match.detail));
+            return 0u;
+        }
+        if (*match.mode > Registry::RecordModeMask) return 0u;
         const auto& mode = set.modes.at(*match.mode);
-        if (mode.resourceClass != ShaderRecompiler::ImageResourceClass::Sampled || mode.conversionFormat != ShaderRecompiler::IrBufferFormat::Invalid || mode.packedFormat != ShaderRecompiler::IrBufferFormat::Invalid) return 0u;
-        if (mode.dimension == ShaderRecompiler::RdnaImageDimension::Dim2DMsaa || mode.dimension == ShaderRecompiler::RdnaImageDimension::Dim2DMsaaArray) return 0u;
+        if (mode.resourceClass != ShaderRecompiler::ImageResourceClass::Sampled || mode.conversionFormat != ShaderRecompiler::IrBufferFormat::Invalid || mode.packedFormat != ShaderRecompiler::IrBufferFormat::Invalid) throw std::runtime_error("the matched mode converts or unpacks (not served by the registry)");
+        if (mode.dimension == ShaderRecompiler::RdnaImageDimension::Dim2DMsaa || mode.dimension == ShaderRecompiler::RdnaImageDimension::Dim2DMsaaArray) throw std::runtime_error("multisampled mode");
         const auto element = registryElement(context, registry, words, mode);
-        if (!element.has_value()) return 0u;
+        if (!element.has_value()) throw std::runtime_error("the registry image array is full");
         Registry::Global().records.fetch_add(1, std::memory_order_relaxed);
         return (*element << Registry::RecordElementShift) | Registry::RecordValid | *match.mode;
     } catch (const std::exception& error) {
-        if (std::getenv("APS5_REG_DEBUG") != nullptr) std::fprintf(stderr, "[reg-debug] record failed: %s\n", error.what());
+        registryRefusal(words.data(), 8u, "image element", error.what());
         return 0u;
     }
 }
 
 bool registrySamplerAccepted(const Context& context, const std::array<std::uint32_t, 4>& words) {
-    if ((words[0] & (1u << 15u)) != 0u || ((words[0] >> 29u) & 3u) != 0u) return false;
     try {
+        if ((words[0] & (1u << 15u)) != 0u) throw std::runtime_error("unnormalized coordinates");
+        if (((words[0] >> 29u) & 3u) != 0u) throw std::runtime_error("min or max reduction");
         for (const bool compare : {false, true}) {
             auto resource = DecodeSamplerResource(std::span<const std::uint32_t, 4>(words.data(), 4u));
             resource.compareEnable = compare;
             Sampler::Validate(context, resource);
-            if (Sampler::ReadsOpaqueBlackBorder(resource)) return false;
-            if (resource.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER || resource.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER || resource.addressModeW == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER) return false;
-            if (resource.nonSeamlessCube && !context.nonSeamlessCubeMap) return false;
         }
-    } catch (const std::exception&) {
+    } catch (const std::exception& error) {
+        registryRefusal(words.data(), 4u, "sampler", error.what());
         return false;
     }
     return true;
@@ -1443,19 +1483,17 @@ void syncRegistry(const Context& context, RegistryDevice& registry) {
     }
     for (const auto& image : drainRing<8>(words, Registry::ImageRingStart)) {
         if (std::all_of(image.begin(), image.end(), [](std::uint32_t word) { return word == 0u; })) continue;
-        bool accepted = false;
-        try {
-            const auto resource = DecodeTextureResource(image);
-            const auto guestBytes = DescribeSurface(resource).guestBytes;
-            accepted = resource.baseAddress != 0u && guestBytes != 0u && (GuestMemory::Accessible(reinterpret_cast<const void*>(resource.baseAddress), static_cast<std::size_t>(guestBytes)) || !GuestMemory::CommittedRanges(resource.baseAddress, static_cast<std::size_t>(guestBytes), false).empty());
-            if (accepted) static_cast<void>(ResolveTextureFormat(resource.format));
-        } catch (const std::exception&) {
-            accepted = false;
-        }
-        if (!accepted || !Registry::AddImage(image)) state.rejected.fetch_add(accepted ? 0u : 1u, std::memory_order_relaxed);
+        static_cast<void>(Registry::AddImage(image));
     }
     for (const auto& sampler : drainRing<4>(words, Registry::SamplerRingStart)) {
-        if (!registrySamplerAccepted(context, sampler) || !Registry::AddSampler(sampler)) state.rejected.fetch_add(1u, std::memory_order_relaxed);
+        if (registry.refusedSamplers.contains(sampler)) continue;
+        if (registrySamplerAccepted(context, sampler)) {
+            static_cast<void>(Registry::AddSampler(sampler));
+            continue;
+        }
+        registry.refusedSamplers.insert(sampler);
+        state.rejected.fetch_add(1u, std::memory_order_relaxed);
+        Registry::InsertSlot(words, Registry::SamplerSlotsStart, Registry::SamplerSlotCapacity, sampler.data(), 4u, 1u);
     }
     std::vector<std::array<std::uint32_t, 8>> images;
     std::vector<std::array<std::uint32_t, 4>> samplers;
@@ -1492,9 +1530,10 @@ void syncRegistry(const Context& context, RegistryDevice& registry) {
         } catch (const std::exception&) {
             continue;
         }
-        if (entry != 0u) Registry::InsertSlot(words, Registry::SamplerSlotsStart, Registry::SamplerSlotCapacity, sampler.data(), 4u, entry + 1u);
+        Registry::InsertSlot(words, Registry::SamplerSlotsStart, Registry::SamplerSlotCapacity, sampler.data(), 4u, entry + 1u);
     }
     refreshRegistry(context, registry);
+    if (registryDebug()) std::fprintf(stderr, "[reg-debug] sync: image ring %u, %zu images %zu samplers %zu elements %zu regions, drained %llu, binds %llu\n", words[Registry::ImageRingStart], registry.images.size(), registry.samplerWords.size(), registry.elements.size(), registry.regionBases.size(), static_cast<unsigned long long>(state.drained.load()), static_cast<unsigned long long>(state.binds.load()));
     Registry::Report();
 }
 

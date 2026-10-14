@@ -217,6 +217,8 @@ function(add_shader_recompiler target runtimeTarget)
     endif()
     set(shaderCacheReviewedNames
             ImageTableRegistry::Generation
+            DescriptorImageShape
+            RdnaImageDimension
             DescriptorBindingForImage
             ResourceMaterializer::TryRuntimeImageMode
             PointFilteredSamplerWord

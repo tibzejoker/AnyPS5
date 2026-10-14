@@ -1966,7 +1966,7 @@ void EmitImage(SpirvValueEmitContext& ctx, const IrValue& inst) {
             const auto mode = Binary(state, spv::OpBitwiseAnd, TypeU32(state), Binary(state, spv::OpShiftRightLogical, TypeU32(state), access.flags, ConstantU32(state, ImageTableAbi::ModeShift)), ConstantU32(state, ImageTableAbi::ModeMask));
             tableSelector = Select(state, TypeU32(state), access.valid, mode, ConstantU32(state, InvalidTableSelector));
         } else {
-            tableSelector = state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ImageBase + memory.resource * PipelineSpecialization::ImageWords, 0u);
+            tableSelector = !state.registrationModules ? state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::ImageBase + memory.resource * PipelineSpecialization::ImageWords, 0u) : RuntimeImageMode(state, memory.resource);
             samplerGuard = access.valid;
         }
     }

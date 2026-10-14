@@ -196,6 +196,7 @@ struct State {
     std::atomic<std::uint64_t> rejected{0};
     std::atomic<std::uint64_t> regions{0};
     std::atomic<std::uint64_t> records{0};
+    std::atomic<std::uint64_t> failedRecords{0};
     std::atomic<std::uint64_t> elements{0};
     std::atomic<std::uint64_t> refreshed{0};
     std::atomic<std::uint64_t> builds{0};
@@ -287,8 +288,8 @@ inline void Report() {
         state.reportedBinds += binds;
         state.reportedCommandBuffers += commandBuffers;
     }
-    std::fprintf(stderr, "[gpu-reg3] registry: %zu images, %zu samplers, %llu elements, %zu mode sets in %llu regions (%llu records); feedback drained %llu (added %llu images, %llu samplers, %llu rejected); refreshed %llu; handles planned on the GPU %llu; last 10 s: %llu draws/dispatches prepared, %llu with zero CPU descriptor work, %llu registry binds over %llu command buffers (%.1f per command buffer)\n",
-        images, samplers, static_cast<unsigned long long>(state.elements.load()), modeSets, static_cast<unsigned long long>(state.regions.load()), static_cast<unsigned long long>(state.records.load()),
+    std::fprintf(stderr, "[gpu-reg3] registry: %zu images, %zu samplers, %llu elements, %zu mode sets in %llu regions (%llu records, %llu refused); feedback drained %llu (added %llu images, %llu samplers, %llu samplers refused); refreshed %llu; handles planned on the GPU %llu; last 10 s: %llu draws/dispatches prepared, %llu with zero CPU descriptor work, %llu registry binds over %llu command buffers (%.1f per command buffer)\n",
+        images, samplers, static_cast<unsigned long long>(state.elements.load()), modeSets, static_cast<unsigned long long>(state.regions.load()), static_cast<unsigned long long>(state.records.load()), static_cast<unsigned long long>(state.failedRecords.load()),
         static_cast<unsigned long long>(state.drained.load()), static_cast<unsigned long long>(state.addedImages.load()), static_cast<unsigned long long>(state.addedSamplers.load()), static_cast<unsigned long long>(state.rejected.load()),
         static_cast<unsigned long long>(state.refreshed.load()), static_cast<unsigned long long>(RegistryHandles().load()),
         static_cast<unsigned long long>(builds), static_cast<unsigned long long>(zeroCpu), static_cast<unsigned long long>(binds), static_cast<unsigned long long>(commandBuffers), commandBuffers != 0u ? static_cast<double>(binds) / static_cast<double>(commandBuffers) : 0.0);
