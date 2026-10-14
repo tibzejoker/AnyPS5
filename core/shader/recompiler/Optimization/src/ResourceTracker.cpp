@@ -1,3 +1,4 @@
+#include "ImageTableRegistry.hpp"
 #include "Optimization/ResourceTracker.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
@@ -1147,7 +1148,7 @@ private:
 
     void PlanTableColumns() {
         static const bool enabled = std::getenv("APS5_NO_IMAGE_TABLES") == nullptr;
-        if (!enabled || m_program.Resources().stage == IrShaderStage::Compute) {
+        if (!enabled || ImageTableRegistry::GpuResolvedStage(m_program.Resources().stage)) {
             return;
         }
         IndexMemoryUsers();
@@ -1271,6 +1272,21 @@ private:
         source = InternSource(descriptor);
     }
 
+    static bool ReadsMemory(const IrValue& handle) {
+        std::vector<const IrValue*> pending;
+        for (std::size_t index = 0; index < handle.ArgumentCount(); index++) pending.push_back(handle.Argument(index));
+        std::vector<const IrValue*> seen;
+        while (!pending.empty() && seen.size() < 256u) {
+            const IrValue* current = pending.back()->Resolve();
+            pending.pop_back();
+            if (std::find(seen.begin(), seen.end(), current) != seen.end()) continue;
+            seen.push_back(current);
+            if (current->Opcode() == IrOpcode::LoadAddressU32 || current->Opcode() == IrOpcode::ReadConstBuffer) return true;
+            for (std::size_t index = 0; index < current->ArgumentCount(); index++) pending.push_back(current->Argument(index));
+        }
+        return false;
+    }
+
     bool HandleValid(const IrValue& handle, std::uint32_t width, bool sampler, bool sampleAdjust) {
         DescriptorSource descriptor;
         MakeSource(handle, width, sampler, sampleAdjust, descriptor);
@@ -1284,11 +1300,11 @@ private:
     }
 
     bool MakeRegistrySource(IrValue& handle, bool sampler, bool sampleAdjust, std::uint32_t& source) {
-        if (m_program.Resources().stage != IrShaderStage::Compute) return false;
+        if (!ImageTableRegistry::GpuResolvedStage(m_program.Resources().stage)) return false;
         const std::uint32_t width = sampler ? 4u : 8u;
         const auto expected = sampler ? IrOpcode::GetSamplerResource : IrOpcode::GetImageResource;
         if (handle.Opcode() != expected || handle.ArgumentCount() != width) return false;
-        if (HandleValid(handle, width, sampler, sampleAdjust)) return false;
+        if (!ReadsMemory(handle) && HandleValid(handle, width, sampler, sampleAdjust)) return false;
         DescriptorSource descriptor;
         descriptor.dwordCount = width;
         for (std::uint32_t dword = 0; dword < width; dword++) descriptor.dwords[dword] = handle.Argument(dword);
@@ -1299,6 +1315,7 @@ private:
         column.unkeyed = true;
         descriptor.tableColumn = column;
         source = InternSource(descriptor);
+        ImageTableRegistry::RegistryHandles().fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 

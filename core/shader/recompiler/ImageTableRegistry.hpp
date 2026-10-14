@@ -10,7 +10,11 @@
 #include <set>
 #include <vector>
 
+#include "IntermediateRepresentation/IrMetadata/ShaderStage.hpp"
+
 namespace ShaderRecompiler::ImageTableRegistry {
+
+using ShaderRecompiler::IrShaderStage;
 
 inline constexpr std::uint32_t SlotWords = 9u;
 inline constexpr std::uint32_t SlotCodeWord = 8u;
@@ -43,6 +47,15 @@ struct State {
     std::atomic<std::uint64_t> rejected{0};
     std::atomic<long long> lastReport{0};
 };
+
+inline bool GpuResolvedStage(IrShaderStage stage) {
+    return stage == IrShaderStage::Compute || stage == IrShaderStage::Vertex || stage == IrShaderStage::Pixel;
+}
+
+inline std::atomic<std::uint64_t>& RegistryHandles() {
+    static std::atomic<std::uint64_t> handles{0};
+    return handles;
+}
 
 inline State& Global() {
     static auto* state = new State();
@@ -105,7 +118,7 @@ inline void Report() {
         images = state.images.size();
         samplers = state.samplers.size();
     }
-    std::fprintf(stderr, "[gpu-texreg] registry: %zu images, %zu samplers, generation %llu; feedback entries drained %llu (added %llu images, %llu samplers, %llu rejected); registry table columns snapshotted %llu\n", images, samplers, static_cast<unsigned long long>(state.generation.load()), static_cast<unsigned long long>(state.drained.load()), static_cast<unsigned long long>(state.addedImages.load()), static_cast<unsigned long long>(state.addedSamplers.load()), static_cast<unsigned long long>(state.rejected.load()), static_cast<unsigned long long>(state.registryColumns.load()));
+    std::fprintf(stderr, "[gpu-reg2] registry: %zu images, %zu samplers, generation %llu; feedback entries drained %llu (added %llu images, %llu samplers, %llu rejected); registry table columns snapshotted %llu; image/sampler handles planned on the GPU %llu\n", images, samplers, static_cast<unsigned long long>(state.generation.load()), static_cast<unsigned long long>(state.drained.load()), static_cast<unsigned long long>(state.addedImages.load()), static_cast<unsigned long long>(state.addedSamplers.load()), static_cast<unsigned long long>(state.rejected.load()), static_cast<unsigned long long>(state.registryColumns.load()), static_cast<unsigned long long>(RegistryHandles().load()));
 }
 
 }

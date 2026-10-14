@@ -4,6 +4,7 @@
 #include "Optimization/SrtWalker/SrtRuntimeValidator.hpp"
 
 #include "IntermediateRepresentation/IrBuilder.hpp"
+#include "ImageTableRegistry.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -49,7 +50,7 @@ void PlanBuilder::Run() {
                 }
             }
             const auto handle = inst->Opcode();
-            if (_program.Resources().stage == IrShaderStage::Compute && (handle == IrOpcode::GetBufferResource || handle == IrOpcode::GetAddressResource || handle == IrOpcode::GetImageResource || handle == IrOpcode::GetSamplerResource)) {
+            if (ImageTableRegistry::GpuResolvedStage(_program.Resources().stage) && (handle == IrOpcode::GetBufferResource || handle == IrOpcode::GetAddressResource || handle == IrOpcode::GetImageResource || handle == IrOpcode::GetSamplerResource)) {
                 ++_gpuHandles;
                 continue;
             }
@@ -60,7 +61,7 @@ void PlanBuilder::Run() {
             }
         }
     }
-    if (_program.Resources().stage != IrShaderStage::Compute) {
+    if (!ImageTableRegistry::GpuResolvedStage(_program.Resources().stage)) {
         for (auto& block : _program.Blocks()) {
             for (IrValue* inst : block->Instructions()) {
                 if (inst->Opcode() == IrOpcode::LoadAddressU32 && IsRawRead(_program.Resources(), *inst) && inst->Argument(1)->Resolve()->HasImmediate() && RuntimeValidator(_program.Resources(), RuntimeValueType::Any).Run(inst)) {

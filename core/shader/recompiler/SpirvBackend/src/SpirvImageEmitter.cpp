@@ -1531,9 +1531,20 @@ ScalarBufferDword EmitScalarBufferDword(SpirvEmitterState& state, std::uint32_t 
     return dword;
 }
 
+std::uint32_t TableMapLength(SpirvEmitterState& state) {
+    const auto length = state.module.AllocateId();
+    state.module.AddFunction(spv::OpArrayLength, TypeU32(state), length, state.tableMapVariable, 0u);
+    return length;
+}
+
+std::uint32_t TableMapIndexInBounds(SpirvEmitterState& state, std::uint32_t index) {
+    return Binary(state, spv::OpULessThan, TypeBool(state), index, TableMapLength(state));
+}
+
 std::uint32_t LoadTableMap(SpirvEmitterState& state, std::uint32_t index) {
+    const auto clamped = Select(state, TypeU32(state), TableMapIndexInBounds(state, index), index, ConstantU32(state, 0u));
     const auto pointer = state.module.AllocateId();
-    state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer, state.tableMapVariable, ConstantU32(state, 0u), index);
+    state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer, state.tableMapVariable, ConstantU32(state, 0u), clamped);
     const auto value = state.module.AllocateId();
     state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
     return value;
@@ -1576,14 +1587,17 @@ TableWord EmitRegistryWord(SpirvValueEmitContext& ctx, const IrValue& handle, co
         hash = Binary(state, spv::OpBitwiseXor, u32, hash, words[dword]);
         hash = Binary(state, spv::OpIMul, u32, hash, ConstantU32(state, 16777619u));
     }
-    const auto mask = Binary(state, spv::OpISub, u32, Select(state, u32, Binary(state, spv::OpIEqual, boolean, capacity, ConstantU32(state, 0u)), ConstantU32(state, 1u), capacity), ConstantU32(state, 1u));
+    const auto powerOfTwo = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, capacity, Binary(state, spv::OpISub, u32, capacity, ConstantU32(state, 1u))), ConstantU32(state, 0u));
+    const auto slotsEnd = Binary(state, spv::OpIAdd, u32, slotsStart, Binary(state, spv::OpIMul, u32, capacity, ConstantU32(state, Registry::SlotWords)));
+    const auto usable = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpLogicalAnd, boolean, powerOfTwo, Binary(state, spv::OpINotEqual, boolean, capacity, ConstantU32(state, 0u))), Binary(state, spv::OpULessThanEqual, boolean, slotsEnd, TableMapLength(state)));
+    const auto mask = Binary(state, spv::OpISub, u32, Select(state, u32, usable, capacity, ConstantU32(state, 1u)), ConstantU32(state, 1u));
     auto found = ConstantBool(state, false);
     auto code = ConstantU32(state, ImageTableAbi::NullCode);
     for (std::uint32_t probe = 0; probe < Registry::Probes; probe++) {
         const auto slot = Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpIAdd, u32, hash, ConstantU32(state, probe)), mask);
         const auto base = Binary(state, spv::OpIAdd, u32, slotsStart, Binary(state, spv::OpIMul, u32, slot, ConstantU32(state, Registry::SlotWords)));
         const auto slotCode = LoadTableMap(state, Binary(state, spv::OpIAdd, u32, base, ConstantU32(state, Registry::SlotCodeWord)));
-        auto match = Binary(state, spv::OpINotEqual, boolean, slotCode, ConstantU32(state, ImageTableAbi::NullCode));
+        auto match = Binary(state, spv::OpLogicalAnd, boolean, usable, Binary(state, spv::OpINotEqual, boolean, slotCode, ConstantU32(state, ImageTableAbi::NullCode)));
         for (std::uint32_t dword = 0; dword < column.dwordCount; dword++) {
             const auto stored = LoadTableMap(state, Binary(state, spv::OpIAdd, u32, base, ConstantU32(state, dword)));
             match = Binary(state, spv::OpLogicalAnd, boolean, match, Binary(state, spv::OpIEqual, boolean, stored, words[dword]));
@@ -1594,14 +1608,18 @@ TableWord EmitRegistryWord(SpirvValueEmitContext& ctx, const IrValue& handle, co
     }
     const auto missed = Binary(state, spv::OpLogicalAnd, boolean, Unary(state, spv::OpLogicalNot, boolean, found), Binary(state, spv::OpINotEqual, boolean, capacity, ConstantU32(state, 0u)));
     const auto report = exec != 0u ? Binary(state, spv::OpLogicalAnd, boolean, missed, exec) : missed;
-    EmitIfCondition(state, report, [&] {
+    const auto ringValid = Binary(state, spv::OpLogicalAnd, boolean, TableMapIndexInBounds(state, ringStart), Binary(state, spv::OpULessThanEqual, boolean, ringCapacity, ConstantU32(state, Registry::RingEntries)));
+    EmitIfCondition(state, Binary(state, spv::OpLogicalAnd, boolean, report, ringValid), [&] {
         const auto index = state.module.AllocateId();
         state.module.AddFunction(spv::OpAtomicIAdd, u32, index, TableMapPointer(state, ringStart), ConstantU32(state, 1u), ConstantU32(state, 0u), ConstantU32(state, 1u));
         EmitIfCondition(state, Binary(state, spv::OpULessThan, boolean, index, ringCapacity), [&] {
             const auto entry = Binary(state, spv::OpIAdd, u32, Binary(state, spv::OpIAdd, u32, ringStart, ConstantU32(state, 1u)), Binary(state, spv::OpIMul, u32, index, ConstantU32(state, Registry::RingEntryWords)));
-            for (std::uint32_t dword = 0; dword < column.dwordCount; dword++) {
-                state.module.AddFunction(spv::OpStore, TableMapPointer(state, Binary(state, spv::OpIAdd, u32, entry, ConstantU32(state, dword))), words[dword]);
-            }
+            const auto last = Binary(state, spv::OpIAdd, u32, entry, ConstantU32(state, Registry::RingEntryWords - 1u));
+            EmitIfCondition(state, TableMapIndexInBounds(state, last), [&] {
+                for (std::uint32_t dword = 0; dword < column.dwordCount; dword++) {
+                    state.module.AddFunction(spv::OpStore, TableMapPointer(state, Binary(state, spv::OpIAdd, u32, entry, ConstantU32(state, dword))), words[dword]);
+                }
+            });
         });
     });
     TableWord word;
