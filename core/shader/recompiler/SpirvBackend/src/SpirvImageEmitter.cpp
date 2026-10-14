@@ -1619,6 +1619,12 @@ std::uint32_t DefineRegistryProbe(SpirvEmitterState& state, bool sampler) {
     const auto exec = state.module.AllocateId();
     state.module.AddFunction(spv::OpFunctionParameter, boolean, exec);
     EmitLabel(state, state.module.AllocateId());
+    const auto searching = state.module.AllocateId();
+    const auto foundVariable = state.module.AllocateId();
+    const auto codeVariable = state.module.AllocateId();
+    state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, boolean), searching, spv::StorageClassFunction);
+    state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, boolean), foundVariable, spv::StorageClassFunction);
+    state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, u32), codeVariable, spv::StorageClassFunction);
     const auto marker = LoadRegistry(state, ConstantU32(state, Registry::HeaderMarker));
     const auto slotsStart = LoadRegistry(state, ConstantU32(state, sampler ? Registry::HeaderSamplerSlots : Registry::HeaderImageSlots));
     const auto capacity = LoadRegistry(state, ConstantU32(state, sampler ? Registry::HeaderSamplerCapacity : Registry::HeaderImageCapacity));
@@ -1634,21 +1640,40 @@ std::uint32_t DefineRegistryProbe(SpirvEmitterState& state, bool sampler) {
     usable = Binary(state, spv::OpLogicalAnd, boolean, usable, Binary(state, spv::OpULessThanEqual, boolean, slotsEnd, RegistryLength(state)));
     usable = Binary(state, spv::OpLogicalAnd, boolean, usable, Binary(state, spv::OpIEqual, boolean, marker, ConstantU32(state, Registry::Marker)));
     const auto mask = Binary(state, spv::OpISub, u32, Select(state, u32, usable, capacity, ConstantU32(state, 1u)), ConstantU32(state, 1u));
-    auto found = ConstantBool(state, false);
-    auto code = ConstantU32(state, 0u);
+    // Probes in order until the words' slot or an empty one (InsertSlot fills the first empty slot
+    // of the sequence and nothing is ever removed, so the words cannot sit past it): a hit on the
+    // first probe loads one slot instead of all eight.
+    state.module.AddFunction(spv::OpStore, searching, usable);
+    state.module.AddFunction(spv::OpStore, foundVariable, ConstantBool(state, false));
+    state.module.AddFunction(spv::OpStore, codeVariable, ConstantU32(state, 0u));
+    const auto loadVariable = [&](std::uint32_t type, std::uint32_t variable) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, type, value, variable);
+        return value;
+    };
     for (std::uint32_t probe = 0; probe < Registry::Probes; probe++) {
-        const auto slotIndex = Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpIAdd, u32, hash, ConstantU32(state, probe)), mask);
-        const auto base = Binary(state, spv::OpIAdd, u32, slotsStart, Binary(state, spv::OpIMul, u32, slotIndex, ConstantU32(state, Registry::SlotWords)));
-        const auto slotCode = LoadRegistry(state, Binary(state, spv::OpIAdd, u32, base, ConstantU32(state, Registry::SlotCodeWord)));
-        auto match = Binary(state, spv::OpLogicalAnd, boolean, usable, Binary(state, spv::OpINotEqual, boolean, slotCode, ConstantU32(state, 0u)));
-        for (std::uint32_t dword = 0; dword < count; dword++) {
-            const auto stored = LoadRegistry(state, Binary(state, spv::OpIAdd, u32, base, ConstantU32(state, dword)));
-            match = Binary(state, spv::OpLogicalAnd, boolean, match, Binary(state, spv::OpIEqual, boolean, stored, words[dword]));
-        }
-        const auto take = Binary(state, spv::OpLogicalAnd, boolean, match, Unary(state, spv::OpLogicalNot, boolean, found));
-        code = Select(state, u32, take, slotCode, code);
-        found = Binary(state, spv::OpLogicalOr, boolean, found, match);
+        EmitIfCondition(state, loadVariable(boolean, searching), [&] {
+            const auto slotIndex = Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpIAdd, u32, hash, ConstantU32(state, probe)), mask);
+            const auto base = Binary(state, spv::OpIAdd, u32, slotsStart, Binary(state, spv::OpIMul, u32, slotIndex, ConstantU32(state, Registry::SlotWords)));
+            const auto slotCode = LoadRegistry(state, Binary(state, spv::OpIAdd, u32, base, ConstantU32(state, Registry::SlotCodeWord)));
+            const auto filled = Binary(state, spv::OpINotEqual, boolean, slotCode, ConstantU32(state, 0u));
+            state.module.AddFunction(spv::OpStore, searching, filled);
+            EmitIfCondition(state, filled, [&] {
+                auto match = ConstantBool(state, true);
+                for (std::uint32_t dword = 0; dword < count; dword++) {
+                    const auto stored = LoadRegistry(state, Binary(state, spv::OpIAdd, u32, base, ConstantU32(state, dword)));
+                    match = Binary(state, spv::OpLogicalAnd, boolean, match, Binary(state, spv::OpIEqual, boolean, stored, words[dword]));
+                }
+                EmitIfCondition(state, match, [&] {
+                    state.module.AddFunction(spv::OpStore, codeVariable, slotCode);
+                    state.module.AddFunction(spv::OpStore, foundVariable, ConstantBool(state, true));
+                    state.module.AddFunction(spv::OpStore, searching, ConstantBool(state, false));
+                });
+            });
+        });
     }
+    const auto found = loadVariable(boolean, foundVariable);
+    const auto code = loadVariable(u32, codeVariable);
     const auto report = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpLogicalAnd, boolean, Unary(state, spv::OpLogicalNot, boolean, found), usable), exec);
     const auto ringEnd = Binary(state, spv::OpIAdd, u32, ringStart, ConstantU32(state, Registry::RingWords));
     const auto ringValid = Binary(state, spv::OpULessThanEqual, boolean, ringEnd, RegistryLength(state));

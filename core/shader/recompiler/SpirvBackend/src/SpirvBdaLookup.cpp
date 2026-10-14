@@ -51,6 +51,37 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
             ReturnBdaZeroIf(state, condition);
         }
     };
+    fail(binary(spv::OpIEqual, boolean, bytes, constant(0)), BdaAbi::FaultReason::Overflow);
+    const auto end = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
+    fail(binary(spv::OpULessThanEqual, boolean, end, address), BdaAbi::FaultReason::Overflow);
+    // The range of this function's last successful lookup in this invocation: a V# table, its
+    // descriptors and the data they name sit in one range, so every lookup after the first is a
+    // compare instead of the header checks and a binary search of the table (dependent loads).
+    const auto privateU64 = TypePointer(state, spv::StorageClassPrivate, u64);
+    const auto cached = [&] {
+        const auto id = state.module.AllocateId();
+        state.module.EmitGlobalVariable({spv::OpVariable, privateU64, id, spv::StorageClassPrivate, BdaConstant(state, 0u)});
+        return id;
+    };
+    const auto cachedBegin = cached();
+    const auto cachedEnd = cached();
+    const auto cachedBase = cached();
+    const auto loadCached = [&](std::uint32_t variable) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u64, value, variable);
+        return value;
+    };
+    {
+        const auto hitBegin = loadCached(cachedBegin);
+        const auto hit = binary(spv::OpLogicalAnd, boolean, binary(spv::OpUGreaterThanEqual, boolean, address, hitBegin), binary(spv::OpULessThanEqual, boolean, end, loadCached(cachedEnd)));
+        const auto taken = state.module.AllocateId();
+        const auto next = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, hit, taken, next);
+        EmitLabel(state, taken);
+        state.module.AddFunction(spv::OpReturnValue, binary(spv::OpIAdd, u64, loadCached(cachedBase), binary(spv::OpISub, u64, address, hitBegin)));
+        EmitLabel(state, next);
+    }
     const auto length = state.module.AllocateId();
     state.module.AddFunction(spv::OpArrayLength, u32, length, state.bdaPagetableVariable, 0u);
     fail(binary(spv::OpULessThan, boolean, length, constant(4)), BdaAbi::FaultReason::InvalidTable);
@@ -61,9 +92,6 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     const auto available = binary(spv::OpISub, u32, length, constant(4));
     fail(binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, available, constant(7)), constant(0)), BdaAbi::FaultReason::InvalidTable);
     fail(binary(spv::OpINotEqual, boolean, count, binary(spv::OpShiftRightLogical, u32, available, constant(3))), BdaAbi::FaultReason::InvalidTable);
-    fail(binary(spv::OpIEqual, boolean, bytes, constant(0)), BdaAbi::FaultReason::Overflow);
-    const auto end = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
-    fail(binary(spv::OpULessThanEqual, boolean, end, address), BdaAbi::FaultReason::Overflow);
     state.module.AddFunction(spv::OpStore, low, constant(0));
     state.module.AddFunction(spv::OpStore, high, count);
     const auto header = state.module.AllocateId();
@@ -109,6 +137,11 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     fail(binary(spv::OpULessThan, boolean, result, base), BdaAbi::FaultReason::Overflow);
     const auto deviceEnd = binary(spv::OpIAdd, u64, result, Unary(state, spv::OpUConvert, u64, bytes));
     fail(binary(spv::OpULessThanEqual, boolean, deviceEnd, result), BdaAbi::FaultReason::Overflow);
+    // Cached only when the whole range maps without wrapping (a hit then needs no overflow check).
+    const auto rangeEnd = binary(spv::OpIAdd, u64, base, binary(spv::OpISub, u64, finish, begin));
+    state.module.AddFunction(spv::OpStore, cachedBegin, begin);
+    state.module.AddFunction(spv::OpStore, cachedEnd, Select(state, u64, binary(spv::OpUGreaterThan, boolean, rangeEnd, base), finish, BdaConstant(state, 0u)));
+    state.module.AddFunction(spv::OpStore, cachedBase, base);
     state.module.AddFunction(spv::OpReturnValue, result);
     state.module.AddFunction(spv::OpFunctionEnd);
     return function;
