@@ -49,7 +49,7 @@ struct State {
 };
 
 inline bool GpuResolvedStage(IrShaderStage stage) {
-    return stage == IrShaderStage::Compute || stage == IrShaderStage::Vertex || stage == IrShaderStage::Pixel;
+    return stage == IrShaderStage::Compute;
 }
 
 inline std::atomic<std::uint64_t>& RegistryHandles() {
