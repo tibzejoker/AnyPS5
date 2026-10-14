@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <set>
@@ -216,8 +217,23 @@ inline bool GpuResolvedStage(IrShaderStage stage) {
 
 // Buffer and address handles read from guest memory are resolved on the GPU (BDA) in compute only:
 // graphics draws have no BDA page table.
+// TEMPORARY bisection switches (POC): APS5_POC_NO_GRAPHICS_BDA keeps vertex and pixel buffer/address
+// handles on the CPU path (v8 behaviour); APS5_POC_NO_VERTEX_PULL does so for the vertex stage only.
+inline bool PocNoGraphicsBda() {
+    static const bool off = std::getenv("APS5_POC_NO_GRAPHICS_BDA") != nullptr;
+    return off;
+}
+
+inline bool PocNoVertexPull() {
+    static const bool off = std::getenv("APS5_POC_NO_VERTEX_PULL") != nullptr;
+    return off;
+}
+
 inline bool GpuResolvedBufferStage(IrShaderStage stage) {
-    return stage == IrShaderStage::Compute || stage == IrShaderStage::Vertex || stage == IrShaderStage::Pixel;
+    if (stage == IrShaderStage::Compute) return true;
+    if (PocNoGraphicsBda()) return false;
+    if (stage == IrShaderStage::Vertex) return !PocNoVertexPull();
+    return stage == IrShaderStage::Pixel;
 }
 
 inline std::atomic<std::uint64_t>& RegistryHandles() {

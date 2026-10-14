@@ -1330,7 +1330,7 @@ private:
         auto& memory = m_program.Resources().memoryInfo[memoryIndex];
         const auto access = BufferAccessOf(inst.Opcode());
         const auto stage = m_program.Resources().stage;
-        const bool gpuWords = (stage == IrShaderStage::Vertex || stage == IrShaderStage::Pixel) && ReadsMemory(*handle);
+        const bool gpuWords = (stage == IrShaderStage::Vertex || stage == IrShaderStage::Pixel) && ImageTableRegistry::GpuResolvedBufferStage(stage) && ReadsMemory(*handle);
         if (!gpuWords && ValidateSource(descriptor, badDword)) {
             const auto source = InternSource(descriptor);
             const auto resource = AddBuffer(source, memory, inst.Opcode(), inst.Flags<MemoryFlags>().pc);

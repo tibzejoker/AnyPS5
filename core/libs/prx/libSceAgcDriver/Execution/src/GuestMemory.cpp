@@ -283,6 +283,34 @@ std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned 
 #endif
 }
 
+std::string DescribeCallers(unsigned skip, unsigned count) {
+    std::string chain;
+#ifdef _WIN32
+    void* raw[16];
+    const auto wanted = static_cast<DWORD>(std::min<unsigned>(count, 16u));
+    const auto captured = RtlCaptureStackBackTrace(1 + skip, wanted, raw, nullptr);
+    for (unsigned index = 0; index < captured; ++index) {
+        HMODULE handle = nullptr;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(raw[index]), &handle) && handle != nullptr) {
+            const auto length = GetModuleFileNameA(handle, name, sizeof(name));
+            if (length == 0) std::snprintf(name, sizeof(name), "?");
+        }
+        const char* base = name;
+        for (const char* cursor = name; *cursor != '\0'; ++cursor) {
+            if (*cursor == '\\' || *cursor == '/') base = cursor + 1;
+        }
+        char text[MAX_PATH + 32];
+        std::snprintf(text, sizeof(text), "%s%s+0x%llx", index == 0 ? "" : "<", base, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(raw[index]) - reinterpret_cast<std::uintptr_t>(handle)));
+        chain += text;
+    }
+#else
+    static_cast<void>(skip);
+    static_cast<void>(count);
+#endif
+    return chain;
+}
+
 void CountReadCaller(const void* returnAddress) {
     thread_local std::uint32_t sampled = 0;
     // Sampled at the same rate as the callers, in step with them (CountCaller advances the counter).

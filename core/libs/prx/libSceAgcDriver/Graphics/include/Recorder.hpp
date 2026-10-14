@@ -57,6 +57,9 @@ struct DrawCpuCounts {
     std::uint64_t syncs = 0;
 };
 DrawCpuCounts DrawCpuTotals();
+// TEMPORARY bisection switch (POC): APS5_POC_NO_GPU_WAITS turns 704a1f8b6 off (pending-batch late
+// labels are refused again and landed cross-queue waits poll memory as before).
+bool PocNoGpuWaits();
 bool DrawCpuScopeActive();
 
 class Recorder {

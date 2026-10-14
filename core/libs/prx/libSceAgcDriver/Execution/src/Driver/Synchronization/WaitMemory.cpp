@@ -143,7 +143,7 @@ void Driver::landPendingWaits(std::uint32_t queue) {
         // one recorder stream, so the GPU orders the work behind it (the batches' barriers), and a
         // CPU read of what it wrote still syncs through the flush hook (Recorder::SyncThrough).
         const auto awaitedBytes = Pm4::WaitAwaitedBytes(packet);
-        if (const auto hit = Graphics::Recorder::LookupLabel(awaited, awaitedBytes, wait.received); hit.has_value() && Pm4::WaitComparesValue(packet, hit->value) && (!hit->late || hit->pending || GuestMemory::UnchangedSinceCollected(awaited, awaitedBytes, hit->generation))) {
+        if (const auto hit = Graphics::Recorder::LookupLabel(awaited, awaitedBytes, wait.received); !Graphics::PocNoGpuWaits() && hit.has_value() && Pm4::WaitComparesValue(packet, hit->value) && (!hit->late || hit->pending || GuestMemory::UnchangedSinceCollected(awaited, awaitedBytes, hit->generation))) {
             NoteWaitOrderedOnGpu();
             continue;
         }

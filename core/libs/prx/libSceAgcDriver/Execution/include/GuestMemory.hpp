@@ -7,6 +7,7 @@
 #include <functional>
 #include <mutex>
 #include <span>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -241,6 +242,9 @@ private:
 // is written as 0), newest first, skipping `skip` frames above the caller; returns how many were
 // written. Stack unwinding, so only for rare, profiled events.
 std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned skip);
+// The `count` frames above the caller (after `skip`), each as module name + offset, innermost first,
+// joined by '<'. Resolves the module of every frame: for sampled diagnostics only.
+std::string DescribeCallers(unsigned skip, unsigned count);
 
 }
 
