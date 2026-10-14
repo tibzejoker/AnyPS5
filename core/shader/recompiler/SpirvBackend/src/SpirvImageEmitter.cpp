@@ -1610,7 +1610,7 @@ std::uint32_t DefineRegistryProbe(SpirvEmitterState& state, bool sampler) {
     state.module.BeginHelperFunction();
     const RegistryHelper restore{state, state.currentLabel};
     state.module.AddName(id, sampler ? "registry_probe_sampler" : "registry_probe_image");
-    state.module.AddFunction(spv::OpFunction, u32, id, spv::FunctionControlDontInlineMask, functionType);
+    state.module.AddFunction(spv::OpFunction, u32, id, spv::FunctionControlMaskNone, functionType);
     std::array<std::uint32_t, 8> words{};
     for (std::uint32_t dword = 0; dword < count; dword++) {
         words[dword] = state.module.AllocateId();
@@ -1704,7 +1704,7 @@ std::uint32_t DefineRegistryRegion(SpirvEmitterState& state) {
     state.module.BeginHelperFunction();
     const RegistryHelper restore{state, state.currentLabel};
     state.module.AddName(id, "registry_region");
-    state.module.AddFunction(spv::OpFunction, u32, id, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, u32, u32, u32));
+    state.module.AddFunction(spv::OpFunction, u32, id, spv::FunctionControlMaskNone, state.module.Type(spv::OpTypeFunction, u32, u32, u32));
     const auto low = state.module.AllocateId();
     const auto high = state.module.AllocateId();
     state.module.AddFunction(spv::OpFunctionParameter, u32, low);

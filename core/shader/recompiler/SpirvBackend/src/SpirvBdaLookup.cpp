@@ -31,7 +31,7 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     };
     const auto function = state.module.AllocateId();
     state.module.AddName(function, name);
-    state.module.AddFunction(spv::OpFunction, u64, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, u64, u64, u32, u32));
+    state.module.AddFunction(spv::OpFunction, u64, function, spv::FunctionControlMaskNone, state.module.Type(spv::OpTypeFunction, u64, u64, u32, u32));
     const auto address = state.module.AllocateId();
     const auto bytes = state.module.AllocateId();
     const auto instruction = state.module.AllocateId();

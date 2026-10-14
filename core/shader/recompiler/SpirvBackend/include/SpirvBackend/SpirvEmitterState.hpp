@@ -108,6 +108,11 @@ struct SpirvEmitterState {
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
     std::unordered_set<const IrValue*> sharedLaneValues;
+    // Values the same in every lane of a wave (WaveUniformValues: SGPR data), when the host subgroup
+    // holds lanes of one wave only: BDA reads with such an address broadcast it and the loaded dwords
+    // from the first active lane, so the translation and the loads run on the subgroup-uniform path.
+    std::unordered_set<const IrValue*> bdaUniformValues;
+    bool bdaUniform = false;
     std::uint32_t laneHalf = 0;
     std::uint32_t spirvVersion = 0x00010300u;
     std::span<const std::uint32_t> supportedCapabilities;
