@@ -960,7 +960,7 @@ std::uint32_t ApertureAtomic32(SpirvValueEmitContext& ctx, const IrValue& inst, 
     auto& state = ctx.state;
     const auto instruction = ConstantU32(state, inst.Flags<MemoryFlags>().pc);
     const auto unaligned = Binary(state, spv::OpINotEqual, TypeBool(state), Binary(state, spv::OpBitwiseAnd, TypeU32(state), byteOffset, ConstantU32(state, 3u)), ConstantU32(state, 0u));
-    EmitIfCondition(state, unaligned, [&] { RecordBdaFault(state, address, ConstantU32(state, 4u), instruction, BdaAbi::FaultReason::Unaligned); });
+    if (!state.bdaFaultsElided) EmitIfCondition(state, unaligned, [&] { RecordBdaFault(state, address, ConstantU32(state, 4u), instruction, BdaAbi::FaultReason::Unaligned); });
     if (kind == ResourceKind::Scratch && state.program.Info().scratchDwords == 0u) return ConstantU32(state, 0u);
     MemoryInfo storage{};
     storage.kind = kind;
@@ -1031,7 +1031,7 @@ std::uint32_t ApertureAtomic64(SpirvValueEmitContext& ctx, const IrValue& inst, 
     auto& state = ctx.state;
     const auto instruction = ConstantU32(state, inst.Flags<MemoryFlags>().pc);
     const auto unaligned = Binary(state, spv::OpINotEqual, TypeBool(state), Binary(state, spv::OpBitwiseAnd, TypeU32(state), byteOffset, ConstantU32(state, 7u)), ConstantU32(state, 0u));
-    EmitIfCondition(state, unaligned, [&] { RecordBdaFault(state, address, ConstantU32(state, 8u), instruction, BdaAbi::FaultReason::Unaligned); });
+    if (!state.bdaFaultsElided) EmitIfCondition(state, unaligned, [&] { RecordBdaFault(state, address, ConstantU32(state, 8u), instruction, BdaAbi::FaultReason::Unaligned); });
     if (kind == ResourceKind::Scratch && state.program.Info().scratchDwords == 0u) return ConstantU64(state, 0u);
     if (kind == ResourceKind::Lds && !state.requirements.ldsLock) ctx.Fail(inst, "64-bit LDS atomic reached through a flat address without the workgroup lock");
     MemoryInfo storage{};

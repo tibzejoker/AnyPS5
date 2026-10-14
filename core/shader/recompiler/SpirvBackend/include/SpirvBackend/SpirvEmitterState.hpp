@@ -119,7 +119,10 @@ struct SpirvEmitterState {
     std::vector<std::uint32_t> memoryByteOffsets;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedBufferFunctions;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedGpuBufferFunctions;
+    std::map<std::pair<std::uint32_t, std::uint32_t>, std::pair<std::uint32_t, std::uint32_t>>* formatAddresses = nullptr;
     std::array<std::uint32_t, 2> registryProbeFunctions{};
+    std::map<std::array<std::uint32_t, 3>, std::uint32_t> bvhIntersectFunctions;
+    std::array<std::uint32_t, 2> scalarGpuBufferFunctions{};
     std::uint32_t bdaPagetableVariable = 0;
     std::uint32_t faultBufferVariable = 0;
     std::uint32_t bdaPointerFunction = 0;
@@ -141,6 +144,7 @@ struct SpirvEmitterState {
     std::uint32_t bdaPcOverride = 0;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).
     bool bdaStopsInvocations = true;
+    bool bdaFaultsElided = false;
     bool continueTarget = false;
     // Execution scope of the barriers that keep one guest wave's LDS accesses in program order across
     // host invocations (see WaveLdsScope); 0 when none are emitted.

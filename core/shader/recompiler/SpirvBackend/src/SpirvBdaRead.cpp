@@ -13,6 +13,7 @@ namespace ShaderRecompiler {
 namespace {
 
 void EmitBdaOverflowCheck(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction) {
+    if (state.bdaFaultsElided) return;
     const auto overflow = Binary(state, spv::OpUGreaterThan, TypeBool(state), address, BdaConstant(state, std::numeric_limits<std::uint64_t>::max() - bytes));
     EmitIfCondition(state, overflow, [&] { RecordBdaFault(state, address, ConstantU32(state, bytes), instruction, BdaAbi::FaultReason::Overflow); });
     StopBdaInvocationIf(state, overflow);
@@ -116,6 +117,7 @@ std::uint32_t AddBdaSignedOffset(SpirvEmitterState& state, std::uint32_t address
     const auto magnitude = Unary(state, spv::OpUConvert, u64, Select(state, u32, negative, Binary(state, spv::OpISub, u32, ConstantU32(state, 0u), offset), offset));
     const auto sum = Binary(state, spv::OpIAdd, u64, address, magnitude);
     const auto result = Select(state, u64, negative, Binary(state, spv::OpISub, u64, address, magnitude), sum);
+    if (state.bdaFaultsElided) return result;
     const auto overflow = Select(state, boolean, negative, Binary(state, spv::OpUGreaterThan, boolean, magnitude, address), Binary(state, spv::OpULessThan, boolean, sum, address));
     EmitIfCondition(state, overflow, [&] { RecordBdaFault(state, address, ConstantU32(state, 0u), instruction, BdaAbi::FaultReason::Overflow); });
     StopBdaInvocationIf(state, overflow);
@@ -335,6 +337,7 @@ std::uint32_t BdaInstructionPc(SpirvEmitterState& state, const IrValue& inst) {
 std::uint32_t AddBdaAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, bool subtract) {
     auto& state = ctx.state;
     const auto result = Binary(state, subtract ? spv::OpISub : spv::OpIAdd, TypeScalarU64(state), address, offset);
+    if (state.bdaFaultsElided) return result;
     const auto overflow = subtract ? Binary(state, spv::OpUGreaterThan, TypeBool(state), offset, address) : Binary(state, spv::OpULessThan, TypeBool(state), result, address);
     EmitIfCondition(state, overflow, [&] { RecordBdaFault(state, address, ConstantU32(state, 0u), BdaInstructionPc(state, inst), BdaAbi::FaultReason::Overflow); });
     StopBdaInvocationIf(state, overflow);
@@ -566,7 +569,7 @@ std::uint32_t EmitBdaAtomic(SpirvValueEmitContext& ctx, const IrValue& inst, std
     const auto type = bytes == 8u ? TypeScalarU64(state) : TypeU32(state);
     const auto zero = bytes == 8u ? BdaConstant(state, 0u) : ConstantU32(state, 0u);
     const auto unaligned = Binary(state, spv::OpINotEqual, TypeBool(state), Binary(state, spv::OpBitwiseAnd, TypeScalarU64(state), address, BdaConstant(state, bytes - 1u)), BdaConstant(state, 0u));
-    EmitIfCondition(state, unaligned, [&] { RecordBdaFault(state, address, ConstantU32(state, bytes), instruction, BdaAbi::FaultReason::Unaligned); });
+    if (!state.bdaFaultsElided) EmitIfCondition(state, unaligned, [&] { RecordBdaFault(state, address, ConstantU32(state, bytes), instruction, BdaAbi::FaultReason::Unaligned); });
     return EmitValueOrDefaultIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), unaligned), type, zero, [&] {
         const auto physical = state.module.AllocateId();
         state.module.AddFunction(spv::OpFunctionCall, TypeScalarU64(state), physical, state.bdaWritePointerFunction, address, ConstantU32(state, bytes), instruction);

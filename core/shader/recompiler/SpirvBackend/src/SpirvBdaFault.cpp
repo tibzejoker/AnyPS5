@@ -71,11 +71,13 @@ void DefineBdaFaultFunction(SpirvEmitterState& state) {
 }
 
 void RecordBdaFault(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, BdaAbi::FaultReason reason) {
+    if (state.bdaFaultsElided) return;
     if (state.bdaFaultFunction == 0 || !state.program.Info().usesDma) throw std::runtime_error("BDA fault function is missing");
     state.module.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.module.AllocateId(), state.bdaFaultFunction, ConstantU32(state, static_cast<std::uint32_t>(reason)), address, bytes, instruction);
 }
 
 void RecordBdaFaultWords(SpirvEmitterState& state, std::uint32_t addressLow, std::uint32_t addressHigh, std::uint32_t bytes, std::uint32_t instruction, BdaAbi::FaultReason reason) {
+    if (state.bdaFaultsElided) return;
     if (state.program.Info().usesDma) {
         const auto u64 = TypeScalarU64(state);
         const auto high = Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, addressHigh), BdaConstant(state, 32u));
@@ -98,7 +100,7 @@ void ReturnBdaFailureIf(SpirvEmitterState& state, std::uint32_t condition, std::
 }
 
 void StopBdaInvocationIf(SpirvEmitterState& state, std::uint32_t condition) {
-    if (!state.bdaStopsInvocations) return;
+    if (!state.bdaStopsInvocations || state.bdaFaultsElided) return;
     const auto failed = state.module.AllocateId();
     const auto next = state.module.AllocateId();
     state.module.AddFunction(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);

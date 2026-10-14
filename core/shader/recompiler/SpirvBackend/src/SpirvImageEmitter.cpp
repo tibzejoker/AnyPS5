@@ -2160,18 +2160,12 @@ void EmitImageBvhIntersectRay(SpirvValueEmitContext& ctx, const IrValue& inst) {
     const auto widen = [&](std::uint32_t value) { return Unary(state, spv::OpUConvert, u64, value); };
     const auto pair = [&](std::uint32_t low, std::uint32_t high) { return op(spv::OpBitwiseOr, u64, widen(low), op(spv::OpShiftLeftLogical, u64, widen(high), BdaConstant(state, 32u))); };
 
-    const auto query = [&] {
-        const auto descriptor = ctx.Arg(inst, 0);
-        std::array<std::uint32_t, 4> word{};
-        for (std::uint32_t i = 0; i < 4u; ++i) {
-            word[i] = state.module.AllocateId();
-            state.module.AddFunction(spv::OpCompositeExtract, u32, word[i], descriptor, i);
-        }
-        const IrValue* address = ctx.ImageAddress(inst.Argument(1));
-        const auto component = [&](std::uint32_t index) { return ctx.Arg(*address, index); };
-        const bool a16 = (ctx.Memory(inst).imageSampleFlags & RdnaImageSampleFlagA16) != 0u;
-        const bool node64 = ctx.Memory(inst).addressIsFull;
-        const std::uint32_t ray = node64 ? 2u : 1u;
+    const bool a16 = (ctx.Memory(inst).imageSampleFlags & RdnaImageSampleFlagA16) != 0u;
+    const bool node64 = ctx.Memory(inst).addressIsFull;
+    const std::uint32_t ray = node64 ? 2u : 1u;
+    const std::uint32_t componentCount = ray + (a16 ? 7u : 10u);
+    const auto query = [&](const std::array<std::uint32_t, 4>& word, const std::vector<std::uint32_t>& components) {
+        const auto component = [&](std::uint32_t index) { return components.at(index); };
 
         const auto nodeLow = component(0);
         const auto node = node64 ? pair(nodeLow, component(1)) : widen(nodeLow);
@@ -2220,12 +2214,12 @@ void EmitImageBvhIntersectRay(SpirvValueEmitContext& ctx, const IrValue& inst) {
                 }
                 return dwords;
             }
-            const auto pc = uint(inst.Flags<MemoryFlags>().pc);
+            const auto pc = BdaInstructionPc(state, inst);
             const auto bytes = uint(count * 4u);
             const auto physical = state.module.AllocateId();
             state.module.AddFunction(spv::OpFunctionCall, u64, physical, state.bdaProbeFunction, nodeAddress, bytes, pc);
             const auto mapped = both(op(spv::OpINotEqual, boolean, physical, BdaConstant(state, 0u)), op(spv::OpIEqual, boolean, op(spv::OpBitwiseAnd, u64, physical, BdaConstant(state, 3u)), BdaConstant(state, 0u)));
-            EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, mapped), [&] { RecordBdaFault(state, nodeAddress, bytes, pc, BdaAbi::FaultReason::Unmapped); });
+            if (!state.bdaFaultsElided) EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, mapped), [&] { RecordBdaFault(state, nodeAddress, bytes, pc, BdaAbi::FaultReason::Unmapped); });
             for (std::uint32_t first = 0; first < count; first += 4u) {
                 const auto quad = EmitValueOrDefaultIfCondition(state, mapped, result4, ConstantU32CompositeZero(state, 4u), [&] {
                     std::array<std::uint32_t, 4> values{};
@@ -2355,8 +2349,56 @@ void EmitImageBvhIntersectRay(SpirvValueEmitContext& ctx, const IrValue& inst) {
         const auto box16 = EmitValueOrDefaultIfCondition(state, isBox16, result4, tested, [&] { return boxes(true); });
         return EmitValueOrDefaultIfCondition(state, isBox32, result4, box16, [&] { return boxes(false); });
     };
+    const std::array<std::uint32_t, 3> key{a16 ? 1u : 0u, node64 ? 1u : 0u, ctx.Memory(inst).coherent ? 1u : 0u};
+    auto function = state.bvhIntersectFunctions.find(key);
+    if (function == state.bvhIntersectFunctions.end()) {
+        const auto id = state.module.AllocateId();
+        std::vector<std::uint32_t> parameterTypes(5u + componentCount, u32);
+        const auto functionType = state.module.Type(spv::OpTypeFunction, result4, std::span<const std::uint32_t>(parameterTypes));
+        struct Restore {
+            SpirvEmitterState& state;
+            std::uint32_t label;
+            std::uint32_t pcOverride;
+            bool stops;
+            ~Restore() {
+                state.module.EndHelperFunction();
+                state.currentLabel = label;
+                state.bdaPcOverride = pcOverride;
+                state.bdaStopsInvocations = stops;
+            }
+        };
+        state.module.BeginHelperFunction();
+        const Restore restore{state, state.currentLabel, state.bdaPcOverride, state.bdaStopsInvocations};
+        state.module.AddName(id, std::string("bvh_intersect_ray") + (a16 ? "_a16" : "") + (node64 ? "_node64" : ""));
+        state.module.AddFunction(spv::OpFunction, result4, id, spv::FunctionControlDontInlineMask, functionType);
+        std::vector<std::uint32_t> parameters(5u + componentCount);
+        for (auto& parameter : parameters) {
+            parameter = state.module.AllocateId();
+            state.module.AddFunction(spv::OpFunctionParameter, u32, parameter);
+        }
+        EmitLabel(state, state.module.AllocateId());
+        state.bdaPcOverride = parameters[4];
+        state.bdaStopsInvocations = false;
+        const auto value = query({parameters[0], parameters[1], parameters[2], parameters[3]}, std::vector<std::uint32_t>(parameters.begin() + 5, parameters.end()));
+        state.module.AddFunction(spv::OpReturnValue, value);
+        state.module.AddFunction(spv::OpFunctionEnd);
+        function = state.bvhIntersectFunctions.emplace(key, id).first;
+    }
     const auto inactive = compose({invalid, invalid, invalid, invalid});
-    ctx.Define(inst, EmitValueOrDefaultIfCondition(state, ctx.Arg(inst, 2), result4, inactive, query));
+    ctx.Define(inst, EmitValueOrDefaultIfCondition(state, ctx.Arg(inst, 2), result4, inactive, [&] {
+        const auto descriptor = ctx.Arg(inst, 0);
+        const IrValue* address = ctx.ImageAddress(inst.Argument(1));
+        std::vector<std::uint32_t> call{spv::OpFunctionCall, result4, state.module.AllocateId(), function->second};
+        for (std::uint32_t i = 0; i < 4u; ++i) {
+            const auto word = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, u32, word, descriptor, i);
+            call.push_back(word);
+        }
+        call.push_back(BdaInstructionPc(state, inst));
+        for (std::uint32_t i = 0; i < componentCount; ++i) call.push_back(ctx.Arg(*address, i));
+        state.module.AddFunction(call);
+        return call[2];
+    }));
 }
 
 }
