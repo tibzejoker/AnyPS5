@@ -49,7 +49,7 @@ void PlanBuilder::Run() {
                 }
             }
             const auto handle = inst->Opcode();
-            if (_program.Resources().stage == IrShaderStage::Compute && (handle == IrOpcode::GetBufferResource || handle == IrOpcode::GetAddressResource)) {
+            if (_program.Resources().stage == IrShaderStage::Compute && (handle == IrOpcode::GetBufferResource || handle == IrOpcode::GetAddressResource || handle == IrOpcode::GetImageResource || handle == IrOpcode::GetSamplerResource)) {
                 ++_gpuHandles;
                 continue;
             }

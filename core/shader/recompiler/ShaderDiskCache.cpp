@@ -142,7 +142,7 @@ static_assert(fieldCount<IrResourcePlan>() == 21, "IrResourcePlan changed: updat
 static_assert(fieldCount<GuestRegister>() == 2, "GuestRegister changed: update the plan value encoder");
 static_assert(fieldCount<MemoryInfo>() == 30, "MemoryInfo changed: update the plan encoder");
 static_assert(fieldCount<DescriptorSource>() == 3, "DescriptorSource changed: update the plan encoder");
-static_assert(fieldCount<TableColumn>() == 8, "TableColumn changed: update the plan encoder");
+static_assert(fieldCount<TableColumn>() == 9, "TableColumn changed: update the plan encoder");
 static_assert(fieldCount<KeyDomain>() == 4, "KeyDomain changed: update the plan encoder");
 static_assert(fieldCount<ResourceBlock>() == 4, "ResourceBlock changed: update the plan encoder");
 static_assert(fieldCount<SrtRead>() == 2, "SrtRead changed: update the plan encoder");
@@ -925,6 +925,7 @@ bool encodePlan(Writer& writer, const IrResourcePlan& plan) {
             domains.Value(domain.value);
         });
         out.Value(column.unkeyed);
+        out.Value(column.registry);
     });
     writer.List(plan.controlFlow, [&](Writer& out, const ResourceBlock& block) {
         out.Value(valueIndex(block.condition));
@@ -1073,6 +1074,7 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
             domains.Value(domain.value);
         });
         in.Value(column.unkeyed);
+        in.Value(column.registry);
         source.tableColumn = table ? std::optional(std::move(column)) : std::nullopt;
     });
     reader.List(plan.controlFlow, 28, [&](Reader& in, ResourceBlock& block) {

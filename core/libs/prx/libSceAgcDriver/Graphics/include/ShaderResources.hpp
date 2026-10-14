@@ -492,6 +492,7 @@ private:
     SetObjects fragment;
     std::uint32_t setOf(const Binding& binding) const;
     std::vector<Allocation> allocations;
+    std::shared_ptr<void> registryRingToken;
     std::vector<VkDescriptorBufferInfo> descriptorBuffers;
     std::vector<VkDescriptorImageInfo> descriptorImages;
     std::vector<VkWriteDescriptorSet> descriptorWrites;

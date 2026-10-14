@@ -42,6 +42,7 @@ struct ImageTableColumnSnapshot {
     std::uint32_t keys = 0;
     std::uint32_t fault = 0;
     bool outside = false;
+    bool registry = false;
     std::vector<std::uint32_t> codes;
 
     bool operator==(const ImageTableColumnSnapshot& other) const = default;
@@ -52,6 +53,7 @@ struct ImageTableSnapshot {
     std::vector<DescriptorValue> words;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     std::uint64_t shader = 0;
+    std::uint64_t registryGeneration = 0;
 
     bool operator==(const ImageTableSnapshot& other) const = default;
 };

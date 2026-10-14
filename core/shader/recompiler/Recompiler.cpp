@@ -922,6 +922,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         result.imageTableRanges = snapshot.tables.ranges;
         result.imageTableShader = snapshot.tables.shader;
         result.imageTableFaults = tables.faults;
+        result.imageTableRegistryGeneration = snapshot.tables.registryGeneration;
     }
     return result;
 }

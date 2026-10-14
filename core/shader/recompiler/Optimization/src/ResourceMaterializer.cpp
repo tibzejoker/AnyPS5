@@ -1,3 +1,4 @@
+#include "ImageTableRegistry.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
@@ -534,6 +535,36 @@ private:
             records.fault = ImageTableAbi::PoisonCode(static_cast<std::uint32_t>(PoisonReason::Inactive));
             return records;
         }
+        if (column.registry) {
+            std::vector<DescriptorValue> list;
+            if (column.sampler) {
+                std::vector<std::array<std::uint32_t, 4>> samplers;
+                tables.registryGeneration = ImageTableRegistry::Samplers(samplers);
+                for (const auto& words : samplers) {
+                    DescriptorValue value;
+                    value.dwordCount = 4u;
+                    std::copy(words.begin(), words.end(), value.dwords.begin());
+                    list.push_back(value);
+                }
+            } else {
+                std::vector<std::array<std::uint32_t, 8>> images;
+                tables.registryGeneration = ImageTableRegistry::Images(images);
+                for (const auto& words : images) {
+                    DescriptorValue value;
+                    value.dwordCount = 8u;
+                    std::copy(words.begin(), words.end(), value.dwords.begin());
+                    list.push_back(value);
+                }
+            }
+            records.keys = static_cast<std::uint32_t>(std::min<std::size_t>(list.size(), ImageTableAbi::MaxKeys));
+            records.records = records.keys;
+            records.states.assign(records.keys, RecordState::Read);
+            records.words.assign(records.keys, 0u);
+            for (std::uint32_t key = 0; key < records.keys; key++) records.words[key] = WordsIndex(list[key]);
+            ImageTableRegistry::Global().registryColumns.fetch_add(1, std::memory_order_relaxed);
+            ImageTableRegistry::Report();
+            return records;
+        }
         const auto heap = EvaluateBuffer(column.heapSource);
         if (heap.Type() != 0u) {
             records.fault = ImageTableAbi::PoisonCode(static_cast<std::uint32_t>(PoisonReason::NotBuffer));
@@ -635,6 +666,7 @@ private:
         out.keys = records.keys;
         out.fault = records.fault;
         out.outside = records.outside;
+        out.registry = column.registry;
         out.codes.assign(records.keys, 0u);
         TableTrace trace{records.base, records.size, records.records, records.keys, 0u, records.narrowed};
         auto& counters = tableCounters();
@@ -1048,6 +1080,34 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
             DescriptorValue zero;
             zero.dwordCount = 4u;
             out.map[header + Abi::TableOutsideCode] = samplerRecord(resource, zero);
+        }
+        if (column.registry) {
+            namespace Registry = ImageTableRegistry;
+            const auto capacity = Registry::Capacity(column.keys);
+            const auto slotsStart = static_cast<std::uint32_t>(out.map.size());
+            out.map.resize(out.map.size() + static_cast<std::size_t>(capacity) * Registry::SlotWords, 0u);
+            for (std::uint32_t key = 0; key < column.keys; key++) {
+                const auto code = out.map[mapStart + key];
+                if (code == Abi::NullCode || (column.codes[key] & Abi::PoisonFlag) != 0u) continue;
+                const auto& words = tables.words.at(column.codes[key]);
+                const auto hash = Registry::Hash(words.dwords.data(), words.dwordCount);
+                for (std::uint32_t probe = 0; probe < Registry::Probes; probe++) {
+                    const auto slot = (hash + probe) & (capacity - 1u);
+                    const auto base = slotsStart + slot * Registry::SlotWords;
+                    if (out.map[base + Registry::SlotCodeWord] != Abi::NullCode) continue;
+                    for (std::uint32_t dword = 0; dword < words.dwordCount; dword++) out.map[base + dword] = words.dwords[dword];
+                    out.map[base + Registry::SlotCodeWord] = code;
+                    break;
+                }
+            }
+            const auto ringStart = static_cast<std::uint32_t>(out.map.size());
+            out.map.resize(out.map.size() + 1u + static_cast<std::size_t>(Registry::RingEntries) * Registry::RingEntryWords, 0u);
+            out.map[header + Abi::TableMapStart] = slotsStart;
+            out.map[header + Abi::TableKeyCount] = capacity;
+            out.map[header + Abi::TableSizeLow] = ringStart;
+            out.map[header + Abi::TableSizeHigh] = Registry::RingEntries;
+            out.map[header + Abi::TableBaseLow] = sampler ? 1u : 0u;
+            out.map[header + Abi::TableBaseHigh] = Registry::Marker;
         }
     };
     for (std::uint32_t resource = 0; resource < info.images.size(); resource++) {

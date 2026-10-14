@@ -216,6 +216,19 @@ function(add_shader_recompiler target runtimeTarget)
         string(APPEND shaderCacheExtra " system-deps=${ANYPS5_SYSTEM_DEPS_STAMP}")
     endif()
     set(shaderCacheReviewedNames
+            ImageTableRegistry::Generation
+            ImageTableRegistry::AddImage
+            ImageTableRegistry::AddSampler
+            ImageTableRegistry::Global
+            ImageTableRegistry::Report
+            ImageTableRegistry::Images
+            ImageTableRegistry::Samplers
+            ImageTableRegistry::Hash
+            ImageTableRegistry::Capacity
+            Generation
+            AddImage
+            AddSampler
+            Report
             BuildBarycentricGeometryShader
             BuildPreparedShaderKey
             BuildRectListShaders

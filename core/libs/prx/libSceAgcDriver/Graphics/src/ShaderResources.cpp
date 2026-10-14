@@ -28,6 +28,7 @@
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "IntermediateRepresentation/IrMetadata/ShaderStage.hpp"
 #include "ImageTableAbi.hpp"
+#include "ImageTableRegistry.hpp"
 #include <cstring>
 #include <limits>
 #include <list>
@@ -42,6 +43,76 @@
 
 namespace AgcDriver::Graphics {
 namespace {
+struct RegistryRing {
+    std::uint64_t owner = 0;
+    Buffer* buffer = nullptr;
+    std::uint32_t ringStart = 0;
+    bool sampler = false;
+};
+
+std::mutex& registryRingMutex() {
+    static auto* mutex = new std::mutex();
+    return *mutex;
+}
+
+std::vector<RegistryRing>& registryRings() {
+    static auto* rings = new std::vector<RegistryRing>();
+    return *rings;
+}
+
+std::atomic<std::uint64_t>& registryRingOwners() {
+    static std::atomic<std::uint64_t> owners{1};
+    return owners;
+}
+
+void drainRegistryRings() {
+    namespace Registry = ShaderRecompiler::ImageTableRegistry;
+    std::vector<std::array<std::uint32_t, 8>> images;
+    std::vector<std::array<std::uint32_t, 4>> samplerWords;
+    {
+        std::lock_guard lock(registryRingMutex());
+        for (const auto& ring : registryRings()) {
+            if (ring.buffer == nullptr || !ring.buffer->Mapped()) continue;
+            auto bytes = ring.buffer->Bytes();
+            if (bytes.size() < (static_cast<std::size_t>(ring.ringStart) + 1u) * sizeof(std::uint32_t)) continue;
+            auto* words = reinterpret_cast<volatile std::uint32_t*>(bytes.data()) + ring.ringStart;
+            const std::uint32_t pending = words[0];
+            const auto count = std::min<std::uint32_t>(pending, Registry::RingEntries);
+            if (count == 0u) continue;
+            if (bytes.size() < (static_cast<std::size_t>(ring.ringStart) + 1u + static_cast<std::size_t>(Registry::RingEntries) * Registry::RingEntryWords) * sizeof(std::uint32_t)) continue;
+            for (std::uint32_t entry = 0; entry < count; entry++) {
+                const auto* source = words + 1u + entry * Registry::RingEntryWords;
+                if (ring.sampler) {
+                    std::array<std::uint32_t, 4> value{};
+                    for (std::uint32_t dword = 0; dword < 4u; dword++) value[dword] = source[dword];
+                    samplerWords.push_back(value);
+                } else {
+                    std::array<std::uint32_t, 8> value{};
+                    for (std::uint32_t dword = 0; dword < 8u; dword++) value[dword] = source[dword];
+                    images.push_back(value);
+                }
+            }
+            words[0] = 0u;
+            Registry::Global().drained.fetch_add(count, std::memory_order_relaxed);
+        }
+    }
+    for (const auto& words : images) {
+        if (std::all_of(words.begin(), words.end(), [](std::uint32_t word) { return word == 0u; })) continue;
+        try {
+            const auto resource = DecodeTextureResource(words);
+            const auto guestBytes = DescribeSurface(resource).guestBytes;
+            if (resource.baseAddress == 0u || guestBytes == 0u) throw std::runtime_error("empty surface");
+            if (!GuestMemory::Accessible(reinterpret_cast<const void*>(resource.baseAddress), static_cast<std::size_t>(guestBytes)) && GuestMemory::CommittedRanges(resource.baseAddress, static_cast<std::size_t>(guestBytes), false).empty()) throw std::runtime_error("unmapped surface");
+            static_cast<void>(ResolveTextureFormat(resource.format));
+            Registry::AddImage(words);
+        } catch (const std::exception&) {
+            Registry::Global().rejected.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    for (const auto& words : samplerWords) Registry::AddSampler(words);
+    Registry::Report();
+}
+
 
 bool overlap(std::uint64_t first, std::size_t firstSize, std::uint64_t second, std::size_t secondSize) {
     return first < second + secondSize && second < first + firstSize;
@@ -3870,6 +3941,7 @@ void ShaderResources::addSamplerTable(const ShaderRecompiler::DescriptorBinding&
 }
 
 void ShaderResources::resolveImageTables() {
+    drainRegistryRings();
     if (tableBindings[0] == std::numeric_limits<std::size_t>::max() && tableBindings[1] == std::numeric_limits<std::size_t>::max()) return;
     auto& counters = TextureCounts();
     for (std::size_t set = 0; set < tableBindings.size(); ++set) {
@@ -4027,6 +4099,21 @@ void ShaderResources::finishImageTables() {
         auto& allocation = allocations.at(table.mapAllocation);
         Require(allocation.buffer != nullptr && allocation.size == map.size() * sizeof(std::uint32_t), "image table map buffer disagrees with the map");
         std::memcpy(allocation.buffer->Bytes().data(), map.data(), allocation.size);
+        for (std::uint32_t index = 0; index < map[Abi::HeaderTableCount]; ++index) {
+            const auto header = Abi::TableHeader(index);
+            if (map[header + Abi::TableBaseHigh] != ShaderRecompiler::ImageTableRegistry::Marker) continue;
+            if (registryRingToken == nullptr) {
+                const auto owner = registryRingOwners().fetch_add(1, std::memory_order_relaxed);
+                registryRingToken = std::shared_ptr<void>(reinterpret_cast<void*>(static_cast<std::uintptr_t>(owner)), [owner](void*) {
+                    std::lock_guard lock(registryRingMutex());
+                    std::erase_if(registryRings(), [owner](const RegistryRing& ring) { return ring.owner == owner; });
+                });
+            }
+            const auto owner = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(registryRingToken.get()));
+            std::lock_guard lock(registryRingMutex());
+            const RegistryRing ring{owner, allocation.buffer.get(), map[header + Abi::TableSizeLow], map[header + Abi::TableBaseLow] != 0u};
+            if (std::none_of(registryRings().begin(), registryRings().end(), [&](const RegistryRing& known) { return known.owner == ring.owner && known.buffer == ring.buffer && known.ringStart == ring.ringStart; })) registryRings().push_back(ring);
+        }
         faults.push_back({IrStage(table.stage), table.program->imageTableShader, table.poison, table.messages});
         ranges.insert(ranges.end(), table.program->imageTableRanges.begin(), table.program->imageTableRanges.end());
     }

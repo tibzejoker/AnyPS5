@@ -1147,7 +1147,7 @@ private:
 
     void PlanTableColumns() {
         static const bool enabled = std::getenv("APS5_NO_IMAGE_TABLES") == nullptr;
-        if (!enabled) {
+        if (!enabled || m_program.Resources().stage == IrShaderStage::Compute) {
             return;
         }
         IndexMemoryUsers();
@@ -1269,6 +1269,37 @@ private:
             fail(std::string(IrOpcodeName(expected)) + " dword " + std::to_string(badDword) + " is not a valid runtime value; chain: " + describeValueChain(descriptor.dwords[badDword], 8u));
         }
         source = InternSource(descriptor);
+    }
+
+    bool HandleValid(const IrValue& handle, std::uint32_t width, bool sampler, bool sampleAdjust) {
+        DescriptorSource descriptor;
+        MakeSource(handle, width, sampler, sampleAdjust, descriptor);
+        if (!sampler) {
+            for (std::uint32_t dword = 0; dword < descriptor.dwordCount; dword++) {
+                if (descriptor.dwords[dword]->Resolve()->Opcode() == IrOpcode::ReadConstBuffer) return false;
+            }
+        }
+        std::uint32_t badDword = 0;
+        return ValidateSource(descriptor, badDword);
+    }
+
+    bool MakeRegistrySource(IrValue& handle, bool sampler, bool sampleAdjust, std::uint32_t& source) {
+        if (m_program.Resources().stage != IrShaderStage::Compute) return false;
+        const std::uint32_t width = sampler ? 4u : 8u;
+        const auto expected = sampler ? IrOpcode::GetSamplerResource : IrOpcode::GetImageResource;
+        if (handle.Opcode() != expected || handle.ArgumentCount() != width) return false;
+        if (HandleValid(handle, width, sampler, sampleAdjust)) return false;
+        DescriptorSource descriptor;
+        descriptor.dwordCount = width;
+        for (std::uint32_t dword = 0; dword < width; dword++) descriptor.dwords[dword] = handle.Argument(dword);
+        TableColumn column;
+        column.dwordCount = width;
+        column.sampler = sampler;
+        column.registry = true;
+        column.unkeyed = true;
+        descriptor.tableColumn = column;
+        source = InternSource(descriptor);
+        return true;
     }
 
     bool TakeGpuDescriptor(IrValue& inst, std::uint32_t memoryIndex) {
@@ -1527,7 +1558,7 @@ private:
         const TableColumnPlan* column = FindTableColumn(*handle);
         if (column != nullptr) {
             source = column->source;
-        } else {
+        } else if (!MakeRegistrySource(*handle, false, false, source)) {
             GetHandle(inst.Argument(0), IrOpcode::GetImageResource, 8, handle, source);
         }
         resource = AddImage(source, memory, op, flags.pc);
@@ -1548,7 +1579,9 @@ private:
                 samplerSource = samplerColumn->source;
             } else {
                 const bool sampleAdjust = (memory.imageSampleFlags & RdnaImageSampleFlagAdjust) != 0;
-                GetHandle(inst.Argument(1), IrOpcode::GetSamplerResource, 4, samplerHandle, samplerSource, true, sampleAdjust);
+                if (!MakeRegistrySource(*samplerHandle, true, sampleAdjust, samplerSource)) {
+                    GetHandle(inst.Argument(1), IrOpcode::GetSamplerResource, 4, samplerHandle, samplerSource, true, sampleAdjust);
+                }
             }
             sampler = AddSampler(samplerSource, flags.pc);
             if (sampler == std::numeric_limits<std::uint32_t>::max()) {
