@@ -1022,6 +1022,7 @@ struct DrawCpuTotalsState {
     std::uint64_t reportedZero = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::ReadSite::Count)> reportedSites{};
     std::array<std::uint64_t, 5> reportedSources{};
+    std::map<unsigned long long, std::uint64_t> unknownCallers;
 };
 
 DrawCpuTotalsState& drawCpuTotals() {
@@ -1052,7 +1053,17 @@ void reportDrawCpu() {
         totals.reportedSources[source] += count;
         if (count != 0) sources += " " + std::string(sourceNames[source]) + "=" + std::to_string(count);
     }
-    std::fprintf(stderr, "[gpu-cpu-reads] last 10 s: %llu draws, %llu with zero CPU guest reads and zero GPU syncs; CPU guest reads by site:%s; GPU syncs by source:%s\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(zero), sites.empty() ? " none" : sites.c_str(), sources.empty() ? " none" : sources.c_str());
+    std::vector<std::pair<std::uint64_t, unsigned long long>> callers;
+    for (const auto& [offset, count] : totals.unknownCallers) callers.emplace_back(count, offset);
+    totals.unknownCallers.clear();
+    std::sort(callers.rbegin(), callers.rend());
+    std::string unknown;
+    char text[48];
+    for (std::size_t index = 0; index < callers.size() && index < 8u; ++index) {
+        std::snprintf(text, sizeof(text), " +0x%llx=%llu", callers[index].second, static_cast<unsigned long long>(callers[index].first));
+        unknown += text;
+    }
+    std::fprintf(stderr, "[gpu-cpu-reads] last 10 s: %llu draws, %llu with zero CPU guest reads and zero GPU syncs; CPU guest reads by site:%s; GPU syncs by source:%s; unknown reads by driver caller (module offsets, symbolize with nm):%s\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(zero), sites.empty() ? " none" : sites.c_str(), sources.empty() ? " none" : sources.c_str(), unknown.empty() ? " none" : unknown.c_str());
 }
 
 }
@@ -1089,6 +1100,14 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         totals.reads.fetch_add(1, std::memory_order_relaxed);
         const auto site = static_cast<std::size_t>(GuestMemory::CurrentReadSite());
         if (site < totals.readsBySite.size()) totals.readsBySite[site].fetch_add(1, std::memory_order_relaxed);
+        if (site == static_cast<std::size_t>(GuestMemory::ReadSite::Unknown)) {
+            std::array<unsigned long long, 4> frames{};
+            const auto count = GuestMemory::CaptureCallerOffsets(frames, 1u);
+            unsigned long long caller = 0;
+            for (std::size_t frame = 0; frame < count && caller == 0; ++frame) caller = frames[frame];
+            std::lock_guard lock(totals.mutex);
+            if (totals.unknownCallers.size() < 4096u || totals.unknownCallers.contains(caller)) ++totals.unknownCallers[caller];
+        }
     }
     hookCalls.fetch_add(1, std::memory_order_relaxed);
     // A label this worker queued but has not recorded writes the range: in queue order the label

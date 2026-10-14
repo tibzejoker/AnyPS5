@@ -65,6 +65,7 @@ std::shared_ptr<const ShaderSnapshot> ReadRawShader(std::uint64_t address) {
         const auto found = std::find_if(cache.begin(), cache.end(), [address](const auto& entry) { return entry->codeAddress == address; });
         if (found != cache.end()) cached = *found;
     }
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::ShaderCode);
     if (cached) {
         const auto code = std::as_bytes(std::span(cached->code));
         GuestMemory::FlushGpuWrites(address, code.size());

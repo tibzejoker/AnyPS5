@@ -2701,6 +2701,18 @@ void quadPixelMaskTests() {
     varying.depthTest = true;
     expectFailure([&] { AgcDriver::Graphics::ValidateSampleMask(context, varying, storing); }, "differs between the pixels of a quad");
     AgcDriver::Graphics::ValidateSampleMask(context, varying, vertexStoring);
+    ShaderRecompiler::RecompileResult bdaReads;
+    ShaderRecompiler::DescriptorBinding pagetable{};
+    pagetable.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    pagetable.role = ShaderRecompiler::DescriptorRole::BdaPagetable;
+    pagetable.count = 1;
+    bdaReads.bindings.push_back(pagetable);
+    const std::array<AgcDriver::Graphics::CompiledShader, 2> bdaReading{{{Stage::Vertex, &late, 0}, {Stage::Fragment, &bdaReads, 0}}};
+    AgcDriver::Graphics::ValidateSampleMask(context, varying, bdaReading);
+    auto bdaWrites = bdaReads;
+    bdaWrites.bdaWrites = true;
+    const std::array<AgcDriver::Graphics::CompiledShader, 2> bdaWriting{{{Stage::Vertex, &late, 0}, {Stage::Fragment, &bdaWrites, 0}}};
+    expectFailure([&] { AgcDriver::Graphics::ValidateSampleMask(context, varying, bdaWriting); }, "differs between the pixels of a quad");
     for (const auto change : {0, 1, 2}) {
         auto relaxed = varying;
         if (change == 0) relaxed.pixelEarlyZ = false;

@@ -522,6 +522,9 @@ struct CompiledShaderArtifact {
     std::vector<FragmentParameter> fragmentParameters;
     BarycentricEmulation barycentricEmulation;
     std::uint64_t variantId = 0;
+    // The program stores to guest memory through BDA (FLAT/GLOBAL stores, GPU-selected V# stores or
+    // atomics); BDA loads alone do not make it a memory writer.
+    bool bdaWrites = false;
 };
 
 struct ShaderInvocation {

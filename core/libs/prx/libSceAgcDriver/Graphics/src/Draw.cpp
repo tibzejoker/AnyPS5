@@ -123,6 +123,7 @@ void storeSingleTexels(const Context& context, const ColorTarget& color) {
     Require(surface.Bytes() == color.bytes, "comp-to-single DCC keys over a color target whose layout differs from its surface");
     StorageTexture::FlushPending(color.address, color.bytes, nullptr, "comp-to-single expansion");
     std::vector<std::byte> texels(color.bytes);
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::ColorTarget);
     GuestMemory::Read(color.address, texels, surface.Alignment());
     constexpr std::size_t BlockBytes = 256;
     for (std::uint32_t y = 0; y < color.extent.height; ++y) {
@@ -211,6 +212,7 @@ CmaskState readCmask(const ColorTarget& color, const CmaskLayout& layout, std::v
         }
     }
     std::vector<std::byte> mask(bytes);
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::ColorTarget);
     GuestMemory::Read(address, mask, CmaskLayout::Alignment);
     const auto uniform = [&](std::byte value) { return std::all_of(mask.begin(), mask.end(), [&](std::byte entry) { return entry == value; }); };
     if (uniform(std::byte{0xff})) return CmaskState::Expanded;
@@ -232,6 +234,7 @@ void storeCmaskClearTexels(const ColorTarget& color, const CmaskLayout& layout, 
     const ColorTargetLayout surface(color.extent.width, color.extent.height, color.tileMode, color.elementBytes);
     Require(surface.Bytes() == color.bytes, "CMASK fast clear over a color target whose layout differs from its surface");
     std::vector<std::byte> texels(surface.Bytes());
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::ColorTarget);
     GuestMemory::Read(color.address, texels, surface.Alignment());
     const auto fill = [&](std::uint32_t tile) {
         const auto x0 = (tile % layout.TilesX()) * 8u;
@@ -889,6 +892,7 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
 
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use) {
     Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
+    const GuestMemory::ReadSiteScope site(use != Recorder::SnapshotUse::Vertex ? GuestMemory::ReadSite::IndexBuffer : GuestMemory::ReadSite::DrawInput);
     DrawInputCopy copy;
     if (recorder != nullptr && bytes != 0) {
         GuestMemory::FlushGpuWrites(address, bytes);
@@ -907,6 +911,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
 
 DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t validBytes) {
     Require(validBytes <= bytes, "the valid bytes of a vertex fetch exceed the fetch");
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawInput);
     GuestMemory::FlushGpuWrites(address, bytes);
     DrawInputCopy copy;
     copy.buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
@@ -924,6 +929,7 @@ void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCop
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment) {
     auto* recorder = context.recorder;
     if (recorder == nullptr || bytes == 0) return nullptr;
+    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawInput);
     GuestMemory::FlushGpuWrites(address, bytes);
     if (recorder->PendingWriteOverlaps(address, bytes) || recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes)) return nullptr;
     const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
