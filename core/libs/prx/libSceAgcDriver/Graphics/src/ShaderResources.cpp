@@ -4629,7 +4629,7 @@ ShaderResources::DrawBindings::~DrawBindings() {
 
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const {
     std::vector<MovedBuffer> moved;
-    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return moved;
+    if (_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) return moved;
     for (const auto& shader : shaders) {
         if (shader.program == nullptr) return std::nullopt;
         for (const auto& binding : shader.program->bindings) {
@@ -4682,7 +4682,7 @@ std::size_t ShaderResources::MaxDrawSnapshotBytes() {
 }
 
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
-    if ((_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) || usesBda) return {};
+    if (_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) return {};
     const auto reads = guestMemory.InPlaceReads();
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     std::size_t totalSnapshotBytes = 0;

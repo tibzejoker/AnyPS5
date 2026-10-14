@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Recompiler.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <windows.h>
 #include <new>
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -25,7 +26,9 @@ constexpr std::uint32_t Extent = 64u;
 // Guest memory: the vertex buffer, the V# table and a tiled (resident) color target.
 struct GuestData {
     alignas(256) std::array<std::byte, 256> vertices{};
+    alignas(256) std::array<std::byte, 256> otherVertices{};
     alignas(256) std::array<std::uint32_t, 4> descriptor{};
+    alignas(256) std::array<std::uint32_t, 4> otherDescriptor{};
     alignas(4096) std::array<std::byte, 65536> target{};
 };
 // In a 64 KiB aligned allocation of its own (the tiled target's base alignment).
@@ -39,23 +42,37 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* pointer, std::uint32_t
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) & 0xffffu, bytes, 0x31016facu};
 }
 
-// Two identical recorded draws whose vertex shader reads its vertex V# from guest memory (BDA): the
-// second binds the first one's resources (resource cache template hit) instead of rebuilding them.
+// Recorded draws whose vertex shader reads its vertex V# from a guest table (BDA). Repeats bind the
+// first draw's resources (resource cache template hits), and must still follow what changed: user
+// data naming another table (the reused build's shader data is refreshed per draw) and vertex data
+// rewritten in place at the same address (read live through BDA).
 void Run(AgcDriver::VulkanDevice& device) {
     GuestAllocations::Mutation().Add(&guest, sizeof(guest), true, true, true);
     constexpr std::uint32_t stride = 16u;
     constexpr std::uint32_t firstRecord = 2u;
-    for (std::size_t index = 0; index < positions.size(); ++index) std::memcpy(guest.vertices.data() + (firstRecord + index) * stride, positions[index].data(), 16u);
-    const auto vertexAddress = reinterpret_cast<std::uintptr_t>(guest.vertices.data());
-    guest.descriptor = {static_cast<std::uint32_t>(vertexAddress), static_cast<std::uint32_t>(vertexAddress >> 32u) | (stride << 16u), 8u, 0x01000facu | (77u << 12u)};
+    const auto writeVertices = [&](std::array<std::byte, 256>& vertices, float shift) {
+        for (std::size_t index = 0; index < positions.size(); ++index) {
+            auto position = positions[index];
+            position[0] += shift;
+            std::memcpy(vertices.data() + (firstRecord + index) * stride, position.data(), 16u);
+        }
+    };
+    const auto vertexDescriptor = [&](const std::array<std::byte, 256>& vertices) {
+        const auto address = reinterpret_cast<std::uintptr_t>(vertices.data());
+        return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u) | (stride << 16u), 8u, 0x01000facu | (77u << 12u)};
+    };
+    writeVertices(guest.vertices, 0.0f);
+    writeVertices(guest.otherVertices, 8.0f);
+    guest.descriptor = vertexDescriptor(guest.vertices);
+    guest.otherDescriptor = vertexDescriptor(guest.otherVertices);
     const auto tableAddress = reinterpret_cast<std::uintptr_t>(guest.descriptor.data());
     const std::array<std::uint32_t, 4> userData{static_cast<std::uint32_t>(tableAddress), static_cast<std::uint32_t>(tableAddress >> 32u), 0u, 0u};
     ShaderRecompiler::ShaderVertexStageInfo vertexInfo{};
     vertexInfo.fetchEmbedded = true;
     vertexInfo.resourcesNum = 1u;
     vertexInfo.resourcesDst[0] = {0, 4, 0, 0};
-    ShaderRecompiler::RecompileRequest request{{ShaderStage::Vertex, reinterpret_cast<std::uintptr_t>(vertexCode.data()), vertexCode, 0, {}}, {32u, 0u, userData, std::nullopt, std::nullopt, vertexInfo, {}}, device.Target(), {0u, 0u, 0u, 96u}};
-    const auto vertex = ShaderRecompiler::Recompile(request);
+    ShaderRecompiler::RecompileRequest request{{ShaderStage::Vertex, reinterpret_cast<std::uintptr_t>(vertexCode.data()), vertexCode, 0, {}}, {32u, 0u, userData, std::nullopt, std::nullopt, vertexInfo, {}}, device.Target(), {0u, 0u, 0u, 0u}};
+    auto vertex = ShaderRecompiler::Recompile(request);
     const auto pushBytes = static_cast<std::uint32_t>(vertex.pushConstants.size());
     ShaderRecompiler::ShaderPixelStageInfo pixelInfo{};
     pixelInfo.wave32 = true;
@@ -82,17 +99,44 @@ void Run(AgcDriver::VulkanDevice& device) {
     state.blends = {state.blend};
     AgcDriver::Pm4::DrawParameters draw{0u, 3u, 0u, 1u, 0u, false};
     draw.firstVertex = firstRecord;
+    std::array<std::uint32_t, 4> roundUserData{};
+    const auto table = [&](const std::array<std::uint32_t, 4>& descriptor) {
+        const auto address = reinterpret_cast<std::uintptr_t>(descriptor.data());
+        roundUserData = {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 0u, 0u};
+        request.context.userData = roundUserData;
+        vertex = ShaderRecompiler::Recompile(request);
+    };
+    const auto redPixels = [&] {
+        std::vector<std::byte> bytes(state.color.bytes);
+        AgcDriver::GuestMemory::Read(state.color.address, bytes, 4);
+        std::size_t red = 0;
+        for (std::size_t at = 0; at + 4u <= bytes.size(); at += 4u) red += bytes[at] == std::byte{255} && bytes[at + 1u] == std::byte{0} && bytes[at + 2u] == std::byte{0} && bytes[at + 3u] == std::byte{255};
+        return red;
+    };
+    struct Round {
+        const char* what;
+        bool otherTable;
+        float shift;
+        bool drawn;
+    };
+    constexpr std::array<Round, 5> rounds{{{"first draw", false, 0.0f, true}, {"same draw again", false, 0.0f, true}, {"user data naming another table", true, 0.0f, false}, {"vertex data moved off screen in place", false, 8.0f, false}, {"vertex data moved back in place", false, 0.0f, true}}};
     std::uint64_t hits = 0;
-    for (std::uint32_t round = 0; round < 3u; ++round) {
+    for (std::size_t index = 0; index < rounds.size(); ++index) {
+        const auto& round = rounds[index];
+        table(round.otherTable ? guest.otherDescriptor : guest.descriptor);
+        writeVertices(guest.vertices, round.shift);
+        std::memset(guest.target.data(), 0, state.color.bytes);
         const auto before = AgcDriver::Graphics::ResourceTemplateHits();
         device.Draw(state, draw, shaders);
         device.SubmitRecorded(false);
         device.WaitIdle();
         const auto hit = AgcDriver::Graphics::ResourceTemplateHits() - before;
-        std::printf("draw %u: resource cache hits %llu\n", round, static_cast<unsigned long long>(hit));
-        if (round != 0u) hits += hit;
+        const auto red = redPixels();
+        std::printf("%s: resource cache hits %llu, red pixels %zu\n", round.what, static_cast<unsigned long long>(hit), red);
+        if (index != 0u) hits += hit;
+        Require(round.drawn ? red == static_cast<std::size_t>(Extent) * Extent : red == 0u, std::string(round.what) + ": the draw did not follow guest memory (" + std::to_string(red) + " red pixels)");
     }
-    Require(hits == 2u, "identical recorded BDA draws rebuilt their resources instead of reusing the first draw's");
+    Require(hits == rounds.size() - 1u, "identical recorded BDA draws rebuilt their resources instead of reusing the first draw's");
 
 }
 
