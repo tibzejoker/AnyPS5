@@ -1,3 +1,5 @@
+#include <mutex>
+#include <unordered_map>
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -288,6 +290,31 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
 std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation) {
     // The capture's word and page reads (through `read`) are attributed to it ([hooksync], [guestmem]).
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Capture);
+    struct GtavCaptureWaits {
+        std::uint64_t code;
+        double before;
+        GtavCaptureWaits(std::uint64_t address) : code(address), before(Enabled() ? WaitedMs() : 0.0) {}
+        static bool Enabled() { static const bool on = std::getenv("GTAV_CAPTURE_WAITS") != nullptr; return on; }
+        ~GtavCaptureWaits() {
+            if (!Enabled()) return;
+            const double waited = WaitedMs() - before;
+            static std::mutex mutex;
+            static std::unordered_map<std::uint64_t, std::pair<double, std::uint64_t>> totals;
+            static auto last = std::chrono::steady_clock::now();
+            std::lock_guard lock(mutex);
+            auto& entry = totals[code];
+            entry.first += waited;
+            entry.second += 1;
+            const auto now = std::chrono::steady_clock::now();
+            if (now - last < std::chrono::seconds(10)) return;
+            last = now;
+            std::vector<std::pair<std::uint64_t, std::pair<double, std::uint64_t>>> rows(totals.begin(), totals.end());
+            std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+            std::fprintf(stderr, "[gtav-capture-waits] (cumulative) top shaders by capture wait:");
+            for (std::size_t i = 0; i < rows.size() && i < 12; ++i) std::fprintf(stderr, " 0x%llx=%.0fms/%llu", static_cast<unsigned long long>(rows[i].first), rows[i].second.first, static_cast<unsigned long long>(rows[i].second.second));
+            std::fputc(10, stderr);
+        }
+    } gtavCaptureWaits(request.shader.codeAddress);
     const bool profile = CaptureProfiled();
     auto& totals = CaptureTotals();
     // The hook's GPU waits made anywhere inside the capture.
