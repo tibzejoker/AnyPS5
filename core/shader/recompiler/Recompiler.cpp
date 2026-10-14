@@ -576,8 +576,9 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
         const auto op = static_cast<spv::Op>(words[cursor] & 0xffffu);
         if (count == 0u || count > words.size() - cursor) throw std::runtime_error("truncated prepared specialization instruction");
         if (op == spv::OpDecorate && count == 4u && words[cursor + 2u] == spv::DecorationSpecId) {
+            if (supplied.find(words[cursor + 3u]) == supplied.end() && words[cursor + 3u] >= PipelineSpecialization::ImageBase && words[cursor + 3u] < PipelineSpecialization::VertexBase) supplied.emplace(words[cursor + 3u], 0u);
             const auto found = supplied.find(words[cursor + 3u]);
-            if (found == supplied.end() || !values.emplace(words[cursor + 1u], found->second).second) throw std::runtime_error("missing or duplicate prepared specialization value");
+            if (found == supplied.end() || !values.emplace(words[cursor + 1u], found->second).second) { std::string ids; for (const auto& [id, value] : supplied) ids += " " + std::to_string(id); throw std::runtime_error("missing or duplicate prepared specialization value: SpecId " + std::to_string(words[cursor + 3u]) + (found == supplied.end() ? " missing" : " duplicate") + ", supplied:" + ids); }
             specializedIds.insert(found->first);
         }
         cursor += count;
