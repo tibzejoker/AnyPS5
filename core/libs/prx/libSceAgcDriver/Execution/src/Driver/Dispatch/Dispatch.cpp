@@ -357,6 +357,12 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             dispatch(queue, packet, submission, indirectArguments);
             return true;
         }
+        static const bool gtavSkipDevice = std::getenv("GTAV_SKIP_DISPATCH_ERRORS") != nullptr;
+        if (gtavSkipDevice && !resolving) {
+            static std::atomic<int> printedDevice{0};
+            if (printedDevice.fetch_add(1) < 40) std::fprintf(stderr, "[gpu] in-order dispatch skipped at record (GTAV_SKIP_DISPATCH_ERRORS) compute shader 0x%llx: %s\n", static_cast<unsigned long long>(address), error.what());
+            return true;
+        }
         char where[64];
         std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
         throw std::runtime_error(where + std::string(error.what()));
