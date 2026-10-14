@@ -999,7 +999,97 @@ private:
 // GuestMemory flush hook: a CPU access to memory that recorded GPU work will write waits for that
 // work first; then storage image results pending for the range are stored. The recorder is only
 // dereferenced under the GpuMutex (it is destroyed with its device under that lock).
+namespace {
+
+struct DrawCpuState {
+    bool active = false;
+    std::uint32_t reads = 0;
+    std::uint32_t syncs = 0;
+};
+
+thread_local DrawCpuState drawCpu;
+
+struct DrawCpuTotalsState {
+    std::atomic<std::uint64_t> draws{0};
+    std::atomic<std::uint64_t> zeroCpu{0};
+    std::atomic<std::uint64_t> reads{0};
+    std::atomic<std::uint64_t> syncs{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::ReadSite::Count)> readsBySite{};
+    std::array<std::atomic<std::uint64_t>, 5> syncsBySource{};
+    std::atomic<long long> lastReport{0};
+    std::mutex mutex;
+    std::uint64_t reportedDraws = 0;
+    std::uint64_t reportedZero = 0;
+    std::array<std::uint64_t, static_cast<std::size_t>(GuestMemory::ReadSite::Count)> reportedSites{};
+    std::array<std::uint64_t, 5> reportedSources{};
+};
+
+DrawCpuTotalsState& drawCpuTotals() {
+    static auto* state = new DrawCpuTotalsState();
+    return *state;
+}
+
+void reportDrawCpu() {
+    auto& totals = drawCpuTotals();
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    auto previous = totals.lastReport.load();
+    if (now == previous || !totals.lastReport.compare_exchange_strong(previous, now)) return;
+    std::lock_guard lock(totals.mutex);
+    const auto draws = totals.draws.load() - totals.reportedDraws;
+    const auto zero = totals.zeroCpu.load() - totals.reportedZero;
+    totals.reportedDraws += draws;
+    totals.reportedZero += zero;
+    std::string sites;
+    for (std::size_t site = 0; site < totals.readsBySite.size(); ++site) {
+        const auto count = totals.readsBySite[site].load() - totals.reportedSites[site];
+        totals.reportedSites[site] += count;
+        if (count != 0) sites += " " + std::string(GuestMemory::ReadSiteName(static_cast<GuestMemory::ReadSite>(site))) + "=" + std::to_string(count);
+    }
+    static constexpr std::array<const char*, 5> sourceNames{"idle", "pending-write", "recorded-store", "address-based", "other"};
+    std::string sources;
+    for (std::size_t source = 0; source < totals.syncsBySource.size(); ++source) {
+        const auto count = totals.syncsBySource[source].load() - totals.reportedSources[source];
+        totals.reportedSources[source] += count;
+        if (count != 0) sources += " " + std::string(sourceNames[source]) + "=" + std::to_string(count);
+    }
+    std::fprintf(stderr, "[gpu-cpu-reads] last 10 s: %llu draws, %llu with zero CPU guest reads and zero GPU syncs; CPU guest reads by site:%s; GPU syncs by source:%s\n", static_cast<unsigned long long>(draws), static_cast<unsigned long long>(zero), sites.empty() ? " none" : sites.c_str(), sources.empty() ? " none" : sources.c_str());
+}
+
+}
+
+}
+
+DrawCpuScope::DrawCpuScope() {
+    drawCpu = {true, 0u, 0u};
+}
+
+DrawCpuScope::~DrawCpuScope() {
+    auto& totals = drawCpuTotals();
+    totals.draws.fetch_add(1, std::memory_order_relaxed);
+    if (drawCpu.reads == 0u && drawCpu.syncs == 0u) totals.zeroCpu.fetch_add(1, std::memory_order_relaxed);
+    drawCpu.active = false;
+    reportDrawCpu();
+}
+
+bool DrawCpuScopeActive() {
+    return drawCpu.active;
+}
+
+DrawCpuCounts DrawCpuTotals() {
+    auto& totals = drawCpuTotals();
+    return {totals.draws.load(), totals.zeroCpu.load(), totals.reads.load(), totals.syncs.load()};
+}
+
+namespace {
+
 void FlushForAccess(std::uint64_t address, std::size_t bytes) {
+    if (drawCpu.active) {
+        ++drawCpu.reads;
+        auto& totals = drawCpuTotals();
+        totals.reads.fetch_add(1, std::memory_order_relaxed);
+        const auto site = static_cast<std::size_t>(GuestMemory::CurrentReadSite());
+        if (site < totals.readsBySite.size()) totals.readsBySite[site].fetch_add(1, std::memory_order_relaxed);
+    }
     hookCalls.fetch_add(1, std::memory_order_relaxed);
     // A label this worker queued but has not recorded writes the range: in queue order the label
     // precedes this access, so the group is recorded first (it then notes the range as a pending
@@ -1340,6 +1430,12 @@ bool Recorder::SnapshotOverlaps(const WriteRanges* snapshot, std::uint64_t addre
 
 void Recorder::CountSync(int source, const void* site) {
     if (source < 0 || source >= 5) return;
+    if (drawCpu.active) {
+        ++drawCpu.syncs;
+        auto& totals = drawCpuTotals();
+        totals.syncs.fetch_add(1, std::memory_order_relaxed);
+        totals.syncsBySource[static_cast<std::size_t>(source)].fetch_add(1, std::memory_order_relaxed);
+    }
     ++syncCounts[source];
     announcedSource = source;
     announcedSite = site;

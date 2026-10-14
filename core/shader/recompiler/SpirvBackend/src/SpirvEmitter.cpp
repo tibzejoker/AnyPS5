@@ -277,7 +277,8 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     // Stopped invocations would leave the wave LDS barriers incomplete.
     state.bdaStopsInvocations = state.waveLdsScope == 0 && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
     const auto& memories = program.Resources().memoryInfo;
-    state.bdaFaultsElided = std::any_of(memories.begin(), memories.end(), [](const MemoryInfo& memory) { return memory.gpuDescriptor; });
+    static const bool keepFaults = std::getenv("APS5_BDA_FAULTS") != nullptr;
+    state.bdaFaultsElided = !keepFaults && std::any_of(memories.begin(), memories.end(), [](const MemoryInfo& memory) { return memory.gpuDescriptor; });
     if (state.bdaFaultsElided) state.bdaStopsInvocations = false;
     EmitModuleHeader(state, bindings);
     EmitProgram(state);

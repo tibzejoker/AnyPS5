@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Recompiler.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "VulkanTestDevice.hpp"
 #include <array>
 #include <cstdint>
@@ -19,7 +20,13 @@ using ShaderRecompiler::ShaderStage;
 
 constexpr std::uint32_t Extent = 64u;
 alignas(256) std::array<std::byte, Extent * Extent * 4u> pixels{};
-alignas(256) std::array<std::byte, 512> vertices{};
+// The vertex buffer and the V# table are guest memory: the shader reads them itself.
+struct alignas(4096) GuestData {
+    alignas(256) std::array<std::byte, 512> vertices{};
+    alignas(256) std::array<std::uint32_t, 4> descriptor{};
+};
+GuestData guest;
+auto& vertices = guest.vertices;
 constexpr std::array<std::uint32_t, 11> vertexCode{0xf4080100u, 0xfa000000u, 0x4a0a0a02u, 0x4a0a0b08u, 0x4a0a0a03u, 0xe00c2000u, 0x80010005u, 0xbf8c3f70u, 0xf80008cfu, 0x03020100u, 0xbf810000u};
 constexpr std::array<std::uint32_t, 5> pixelCode{0x7e0002f2u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u};
 
@@ -35,7 +42,12 @@ Counts RunCase(AgcDriver::VulkanDevice& device, const char* name, std::uint32_t 
     vertices.fill(std::byte{0});
     constexpr std::uint32_t stride = 16u;
     for (std::size_t index = 0; index < stored; ++index) std::memcpy(vertices.data() + index * stride, positions[index].data(), 16u);
-    std::array<std::uint32_t, 4> descriptor{};
+    static const bool registered = [] {
+        GuestAllocations::Mutation().Add(&guest, sizeof(guest), true, true, true);
+        return true;
+    }();
+    static_cast<void>(registered);
+    auto& descriptor = guest.descriptor;
     const auto tableAddress = reinterpret_cast<std::uintptr_t>(descriptor.data());
     std::array<std::uint32_t, 4> userData{static_cast<std::uint32_t>(tableAddress), static_cast<std::uint32_t>(tableAddress >> 32u), 0u, 0u};
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{tableAddress, std::as_bytes(std::span(descriptor))}}};

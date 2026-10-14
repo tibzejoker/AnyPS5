@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "Recompiler.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "VulkanTestDevice.hpp"
 #include <array>
 #include <cstdint>
@@ -15,8 +16,15 @@ using ShaderRecompiler::ShaderStage;
 
 constexpr std::uint32_t Extent = 64u;
 alignas(256) std::array<std::byte, Extent * Extent * 4u> pixels{};
-alignas(256) std::array<std::byte, 256> vertices{};
-alignas(256) std::array<std::byte, 256> movedVertices{};
+// The vertex buffers and the V# table are guest memory: the shader reads them itself.
+struct alignas(4096) GuestData {
+    alignas(256) std::array<std::byte, 256> vertices{};
+    alignas(256) std::array<std::byte, 256> movedVertices{};
+    alignas(256) std::array<std::uint32_t, 4> descriptor{};
+};
+GuestData guest;
+auto& vertices = guest.vertices;
+auto& movedVertices = guest.movedVertices;
 constexpr std::array<std::array<float, 4>, 3> positions{{{-1.0f, -1.0f, 0.0f, 1.0f}, {3.0f, -1.0f, 0.0f, 1.0f}, {-1.0f, 3.0f, 0.0f, 1.0f}}};
 constexpr std::array<std::uint32_t, 11> vertexCode{0xf4080100u, 0xfa000000u, 0x4a0a0a02u, 0x4a0a0b08u, 0x4a0a0a03u, 0xe00c2000u, 0x80010005u, 0xbf8c3f70u, 0xf80008cfu, 0x03020100u, 0xbf810000u};
 constexpr std::array<std::uint32_t, 5> pixelCode{0x7e0002f2u, 0x7e020280u, 0xf800180fu, 0x00010100u, 0xbf810000u};
@@ -38,7 +46,8 @@ void Run(AgcDriver::VulkanDevice& device) {
     rejectAbi([&] { device.DispatchIndirect(incompatible, 0u); });
     const std::array<AgcDriver::Graphics::CompiledShader, 1> incompatibleShaders{{{ShaderStage::Vertex, &incompatible, 0u}}};
     rejectAbi([&] { device.Draw({}, {}, incompatibleShaders); });
-    std::array<std::uint32_t, 4> descriptor{};
+    GuestAllocations::Mutation().Add(&guest, sizeof(guest), true, true, true);
+    auto& descriptor = guest.descriptor;
     const auto tableAddress = reinterpret_cast<std::uintptr_t>(descriptor.data());
     std::array<std::uint32_t, 4> userData{static_cast<std::uint32_t>(tableAddress), static_cast<std::uint32_t>(tableAddress >> 32u), 1u, 1u};
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{tableAddress, std::as_bytes(std::span(descriptor))}}};

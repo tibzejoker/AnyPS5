@@ -1329,7 +1329,9 @@ private:
         std::uint32_t badDword = 0;
         auto& memory = m_program.Resources().memoryInfo[memoryIndex];
         const auto access = BufferAccessOf(inst.Opcode());
-        if (ValidateSource(descriptor, badDword)) {
+        const auto stage = m_program.Resources().stage;
+        const bool gpuWords = (stage == IrShaderStage::Vertex || stage == IrShaderStage::Pixel) && ReadsMemory(*handle);
+        if (!gpuWords && ValidateSource(descriptor, badDword)) {
             const auto source = InternSource(descriptor);
             const auto resource = AddBuffer(source, memory, inst.Opcode(), inst.Flags<MemoryFlags>().pc);
             if (resource == std::numeric_limits<std::uint32_t>::max()) fail("buffer resource limit exceeded");

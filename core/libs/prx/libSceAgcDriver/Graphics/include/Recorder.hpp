@@ -40,6 +40,25 @@ class Buffer;
 // up to serial S" WITHOUT the mutex (WaitSerial), because the monotonic value cannot be reset or
 // recycled the way the pooled batch fences are, and afterwards run the completions under the mutex
 // (FinishUpTo). Without timeline semaphores callers use the locked Sync as before.
+// Counts the CPU guest reads and GPU syncs made while one draw is prepared and recorded (the
+// [gpu-cpu-reads] line, every 10 s): what is left for draws to stop reading on the CPU.
+class DrawCpuScope {
+public:
+    DrawCpuScope();
+    ~DrawCpuScope();
+    DrawCpuScope(const DrawCpuScope&) = delete;
+    DrawCpuScope& operator=(const DrawCpuScope&) = delete;
+};
+
+struct DrawCpuCounts {
+    std::uint64_t draws = 0;
+    std::uint64_t zeroCpu = 0;
+    std::uint64_t reads = 0;
+    std::uint64_t syncs = 0;
+};
+DrawCpuCounts DrawCpuTotals();
+bool DrawCpuScopeActive();
+
 class Recorder {
 public:
     // `timelineSemaphores`: the device enabled VK_KHR_timeline_semaphore (WaitSerial is usable).

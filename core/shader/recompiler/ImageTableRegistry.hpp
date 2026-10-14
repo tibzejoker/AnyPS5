@@ -217,7 +217,7 @@ inline bool GpuResolvedStage(IrShaderStage stage) {
 // Buffer and address handles read from guest memory are resolved on the GPU (BDA) in compute only:
 // graphics draws have no BDA page table.
 inline bool GpuResolvedBufferStage(IrShaderStage stage) {
-    return stage == IrShaderStage::Compute;
+    return stage == IrShaderStage::Compute || stage == IrShaderStage::Vertex || stage == IrShaderStage::Pixel;
 }
 
 inline std::atomic<std::uint64_t>& RegistryHandles() {
