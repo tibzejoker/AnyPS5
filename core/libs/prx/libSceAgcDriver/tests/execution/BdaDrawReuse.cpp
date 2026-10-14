@@ -137,6 +137,36 @@ void Run(AgcDriver::VulkanDevice& device) {
         Require(round.drawn ? red == static_cast<std::size_t>(Extent) * Extent : red == 0u, std::string(round.what) + ": the draw did not follow guest memory (" + std::to_string(red) + " red pixels)");
     }
     Require(hits == rounds.size() - 1u, "identical recorded BDA draws rebuilt their resources instead of reusing the first draw's");
+    // Back to back in one batch: the second draw reuses the first one's build while the target the
+    // first one rendered is still pending on the GPU. The reuse must not store that target (or any
+    // other pending image under the address space) into guest memory, which would note a pending
+    // write over it and make the next CPU read of it wait for the GPU.
+    table(guest.descriptor);
+    writeVertices(guest.vertices, 0.0f);
+    std::memset(guest.target.data(), 0, state.color.bytes);
+    device.Draw(state, draw, shaders);
+    const auto before = AgcDriver::Graphics::ResourceTemplateHits();
+    device.Draw(state, draw, shaders);
+    const auto hit = AgcDriver::Graphics::ResourceTemplateHits() - before;
+    auto* recorder = AgcDriver::Graphics::Recorder::Active();
+    const bool stored = recorder != nullptr && recorder->PendingWriteOverlaps(state.color.address, state.color.bytes);
+    std::printf("back to back: resource cache hits %llu, target stored by the reuse %d\n", static_cast<unsigned long long>(hit), stored ? 1 : 0);
+    Require(hit == 1u, "the second of two back-to-back BDA draws rebuilt its resources");
+    Require(!stored, "a reused BDA draw stored the pending render target into guest memory");
+    device.SubmitRecorded(false);
+    device.WaitIdle();
+    Require(redPixels() == static_cast<std::size_t>(Extent) * Extent, "back-to-back BDA draws did not draw");
+    // The flush hook names the code that read guest memory (the [gpu-cpu-reads] caller chains).
+    static std::string chain;
+    static const void* caller = nullptr;
+    AgcDriver::GuestMemory::SetFlushHook([](std::uint64_t, std::size_t) {
+        caller = AgcDriver::GuestMemory::CurrentFlushCaller();
+        chain = AgcDriver::GuestMemory::DescribeCallers(0u, 4u);
+    });
+    std::array<std::byte, 4> word{};
+    AgcDriver::GuestMemory::Read(state.color.address, word, 4);
+    std::printf("flush hook caller chain: %s\n", chain.c_str());
+    Require(caller != nullptr && chain.find("agc_driver_bda_draw_reuse") != std::string::npos, "the flush hook does not name the guest memory reader: [" + chain + "]");
 
 }
 

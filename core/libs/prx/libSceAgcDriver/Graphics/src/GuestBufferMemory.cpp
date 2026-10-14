@@ -3940,10 +3940,10 @@ void GuestBufferMemory::WriteBack() {
     heapReferences.clear();
 }
 
-std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferMemory::DirectRegions() const {
+std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferMemory::DirectRegions(bool withSpace) const {
     if (!uploaded || committed) return std::nullopt;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
-    if (space != nullptr) {
+    if (space != nullptr && withSpace) {
         for (const auto& region : space->base) {
             if (region.direct == nullptr && (region.mirror == nullptr || region.mirror->writable || region.mirror->heap)) return std::nullopt;
             result.emplace_back(region.begin, region.end);

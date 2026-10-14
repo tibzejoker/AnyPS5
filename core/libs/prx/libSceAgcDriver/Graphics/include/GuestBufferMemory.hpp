@@ -271,8 +271,10 @@ public:
     }
     // Every uploaded region as [begin, end) when all of them are served by host imports, in place or
     // through a device-local staging copy of the import (nothing was copied through the CPU, so the
-    // upload can serve a later identical build), else nothing.
-    std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> DirectRegions() const;
+    // upload can serve a later identical build), else nothing. Without `withSpace` the cached
+    // address space's regions are left out: a build reusable under that space (BDA) has them
+    // proven by the space's serial, and its shaders read them on the GPU like a fresh build's.
+    std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> DirectRegions(bool withSpace = true) const;
     // Every region the recorded work reads in place through a host import, as [begin, end): the
     // regions bound in place (`direct`), an address-based build's leased heaps included. A region
     // the GPU copies out of an import (gpuCopy) notes its read itself when the copy is recorded.

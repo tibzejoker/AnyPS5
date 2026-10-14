@@ -23,6 +23,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -283,12 +284,17 @@ std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned 
 #endif
 }
 
+// The caller of the GuestMemory entry whose flush hook runs on this thread (CurrentFlushCaller).
+thread_local const void* flushCaller = nullptr;
+
 std::string DescribeCallers(unsigned skip, unsigned count) {
     std::string chain;
 #ifdef _WIN32
-    void* raw[16];
+    void* raw[17];
     const auto wanted = static_cast<DWORD>(std::min<unsigned>(count, 16u));
-    const auto captured = RtlCaptureStackBackTrace(1 + skip, wanted, raw, nullptr);
+    unsigned captured = 0;
+    if (flushCaller != nullptr) raw[captured++] = const_cast<void*>(flushCaller);
+    captured += RtlCaptureStackBackTrace(1 + skip, wanted, raw + captured, nullptr);
     for (unsigned index = 0; index < captured; ++index) {
         HMODULE handle = nullptr;
         char name[MAX_PATH] = "?";
@@ -296,12 +302,14 @@ std::string DescribeCallers(unsigned skip, unsigned count) {
             const auto length = GetModuleFileNameA(handle, name, sizeof(name));
             if (length == 0) std::snprintf(name, sizeof(name), "?");
         }
+        // A frame outside every module is what a walk without unwind tables reads off the stack.
+        if (handle == nullptr) break;
         const char* base = name;
         for (const char* cursor = name; *cursor != '\0'; ++cursor) {
             if (*cursor == '\\' || *cursor == '/') base = cursor + 1;
         }
         char text[MAX_PATH + 32];
-        std::snprintf(text, sizeof(text), "%s%s+0x%llx", index == 0 ? "" : "<", base, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(raw[index]) - reinterpret_cast<std::uintptr_t>(handle)));
+        std::snprintf(text, sizeof(text), "%s%s+0x%llx", chain.empty() ? "" : "<", base, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(raw[index]) - reinterpret_cast<std::uintptr_t>(handle)));
         chain += text;
     }
 #else
@@ -2006,14 +2014,29 @@ void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes)) {
     readGuard.store(guard, std::memory_order_release);
 }
 
+void flushFrom(std::uint64_t address, std::size_t bytes, const void* caller) {
+    const auto hook = flushHook.load(std::memory_order_acquire);
+    if (hook == nullptr) return;
+    const auto previous = std::exchange(flushCaller, caller);
+    struct Restore {
+        const void* previous;
+        ~Restore() { flushCaller = previous; }
+    } restore{previous};
+    hook(address, bytes);
+}
+
+const void* CurrentFlushCaller() {
+    return flushCaller;
+}
+
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
-    if (const auto hook = flushHook.load(std::memory_order_acquire)) hook(address, bytes);
+    flushFrom(address, bytes, __builtin_return_address(0));
 }
 
 void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t alignment) {
     if (destination.empty()) return;
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, destination.size());
-    FlushGpuWrites(address, destination.size());
+    flushFrom(address, destination.size(), __builtin_return_address(0));
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
     const auto* source = reinterpret_cast<const void*>(address);
@@ -2043,7 +2066,7 @@ void copyCommitted(std::uint64_t address, std::span<std::byte> destination) {
 void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
     if (destination.empty()) return;
     if (const auto guard = readGuard.load(std::memory_order_acquire)) guard(address, destination.size());
-    FlushGpuWrites(address, destination.size());
+    flushFrom(address, destination.size(), __builtin_return_address(0));
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
     copyCommitted(address, destination);
@@ -2059,7 +2082,7 @@ void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destinati
 
 bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return true;
-    FlushGpuWrites(address, bytes.size());
+    flushFrom(address, bytes.size(), __builtin_return_address(0));
     return EqualsCommittedUnsynced(address, bytes);
 }
 

@@ -2464,7 +2464,10 @@ void ShaderResources::noteReusable() {
     }
     if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
     if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) return;
-    const auto regions = guestMemory.DirectRegions();
+    // A BDA build's address space is not walked per use: every reused draw would otherwise store
+    // every pending render target into guest memory and wait for the GPU on it (a fresh build
+    // flushes only its written ranges).
+    const auto regions = guestMemory.DirectRegions(!usesBda);
     if (!regions.has_value()) return;
     for (const auto& [begin, end] : *regions) {
         // No reconcile here: the upload just took these imports, and the set is about to be recorded
@@ -4707,7 +4710,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             address = override->address;
             size = override->size;
         } else {
-            if (!item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
+            // A BDA build's in-place buffers are read on the GPU at execution, as a fresh build's are.
+            if (usesBda || !item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
             const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
             if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
         }

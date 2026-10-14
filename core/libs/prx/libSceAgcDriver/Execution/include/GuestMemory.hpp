@@ -245,6 +245,11 @@ std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned 
 // The `count` frames above the caller (after `skip`), each as module name + offset, innermost first,
 // joined by '<'. Resolves the module of every frame: for sampled diagnostics only.
 std::string DescribeCallers(unsigned skip, unsigned count);
+// The driver code address that called the GuestMemory entry (Read, ReadCommitted, EqualsCommitted,
+// FlushGpuWrites...) whose flush hook runs now on this thread, null outside one. The libraries carry
+// no unwind tables (-fno-asynchronous-unwind-tables), so a stack walk from the hook stops at once;
+// this frame is what DescribeCallers puts first.
+const void* CurrentFlushCaller();
 
 }
 
