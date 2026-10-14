@@ -1427,7 +1427,8 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     }
     {
         ShaderResources resources(context, compiled, snapshots);
-        Require(ShaderResources::NeverReusable(std::span<const CompiledShader>(&compiled, 1)) && !resources.Reusable(), "an address-based build is reusable");
+        Require(ShaderResources::NeverReusable(std::span<const CompiledShader>(&compiled, 1)) == compiled.program->bdaWrites, "an address-based build without BDA stores is kept out of the resource cache");
+        Require(!resources.Reusable() || resources.AddressSpaceSerial() != 0, "an address-based build is reusable outside a cached address space");
         Require(resources.UsesAddressTable(), "an address-based build does not use the BDA table");
         ShaderRecompiler::RecompileResult plain;
         plain.bindings = {binding(Role::GuestBuffers, 6)};

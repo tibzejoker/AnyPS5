@@ -40,6 +40,11 @@ std::uint64_t SampledTextureCacheBudget(const Context& context);
 std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words);
 bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second);
 void CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes);
+// Drops the resource cache's reusable builds that pin guest ranges through a cached address space
+// (BDA builds); the guest allocation pin waiter calls it before waiting. True when any was dropped.
+bool DropLeasedResources();
+// TEMPORARY bisection switch (POC): APS5_POC_NO_BDA_REUSE keeps BDA builds never reusable (v9/v10).
+bool PocNoBdaReuse();
 // The device's image registry (set ImageTableRegistry::DescriptorSet): feedback drain, mode-set
 // regions and texture refresh; layouts that hold it at that set are noted and bound per command.
 void SyncImageRegistry(const Context& context);
@@ -181,6 +186,8 @@ public:
     bool HasCopiedWrites() const { return guestMemory.HasCopiedWrites(); }
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
     bool UsesAddressTable() const { return usesBda; }
+    // Nonzero for a reusable BDA build: the address space serial it was built under.
+    std::uint64_t AddressSpaceSerial() const { return addressSpaceSerial; }
     std::size_t CopiedBytes() const { return guestMemory.CopiedBytes(); }
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }
     bool CopiedWritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.CopiedWritesOverlap(address, bytes); }
@@ -480,6 +487,7 @@ private:
     std::size_t maxDrawSnapshotBytes = MaxDrawSnapshotBytes();
     std::unique_ptr<BdaResources> bda;
     bool usesBda = false;
+    std::uint64_t addressSpaceSerial = 0;
     bool usesFaultBuffer = false;
     bool faultChecks = false;
     VkDescriptorSetLayout _layout = VK_NULL_HANDLE;
@@ -604,6 +612,7 @@ public:
     // meanwhile by another worker stays).
     void Remove(const Key& key, const ShaderResources* object = nullptr);
     void RemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted = nullptr);
+    void RemoveLeaseHolders(std::vector<std::shared_ptr<ShaderResources>>& evicted);
     // Moves the entry to the front of the LRU (a recipe hit uses its template without Find, and a
     // hot template must not age out under the recipes that depend on it); false when no entry.
     bool Touch(const Key& key);

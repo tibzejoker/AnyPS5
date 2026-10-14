@@ -2452,7 +2452,16 @@ void ShaderResources::noteReusable() {
     captureValidation();
     reusable = false;
     directRegions.clear();
-    if (guestMemory.HasCopiedWrites() || HoldsLease() || usesBda || (bda != nullptr && LoopGuardEnabled())) return;
+    addressSpaceSerial = 0;
+    if (guestMemory.HasCopiedWrites() || (bda != nullptr && LoopGuardEnabled())) return;
+    if (usesBda) {
+        // A BDA build reads guest memory through the cached address space (in place, BDA table
+        // shared): it serves later identical builds while that space stays the live one (Revalidate).
+        addressSpaceSerial = PocNoBdaReuse() ? 0 : guestMemory.ReusableAddressSpaceSerial();
+        if (addressSpaceSerial == 0) return;
+    } else if (HoldsLease()) {
+        return;
+    }
     if (std::any_of(textures.begin(), textures.end(), [](const std::shared_ptr<Texture>& texture) { return texture != nullptr && texture->RefreshedPerUse(); })) return;
     if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.role != ShaderRecompiler::DescriptorRole::ImageTableMap && allocation.size > MaxRefreshBytes; })) return;
     const auto regions = guestMemory.DirectRegions();
@@ -2470,10 +2479,18 @@ void ShaderResources::noteReusable() {
     reusable = true;
 }
 
+bool PocNoBdaReuse() {
+    static const bool off = std::getenv("APS5_POC_NO_BDA_REUSE") != nullptr;
+    return off;
+}
+
 bool ShaderResources::NeverReusable(std::span<const CompiledShader> shaders) {
     const bool loopGuard = LoopGuardEnabled();
-    return std::any_of(shaders.begin(), shaders.end(), [loopGuard](const CompiledShader& shader) {
-        return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [loopGuard](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || (loopGuard && binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer); });
+    const bool bdaReuse = !PocNoBdaReuse();
+    return std::any_of(shaders.begin(), shaders.end(), [loopGuard, bdaReuse](const CompiledShader& shader) {
+        if (shader.program == nullptr) return false;
+        if (shader.program->bdaWrites && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; })) return true;
+        return std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [loopGuard, bdaReuse](const ShaderRecompiler::DescriptorBinding& binding) { return (!bdaReuse && binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable) || (loopGuard && binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer); });
     });
 }
 
@@ -3068,6 +3085,9 @@ const ShaderRecompiler::DescriptorBinding* ShaderResources::tableImages(std::spa
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
+    // A reused build drains the registry feedback as a new build does (resolveImageTables).
+    SyncImageRegistry(context);
+    if (usesBda && (addressSpaceSerial == 0 || GuestBufferMemory::LiveAddressSpaceSerial(context.device) != addressSpaceSerial)) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (const auto& region : directRegions) CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
@@ -3489,6 +3509,25 @@ void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
         if (found == index.end() || found->second->second.get() != object) return;
     }
     erase(key);
+}
+
+void ResourceCache::RemoveLeaseHolders(std::vector<std::shared_ptr<ShaderResources>>& evicted) {
+    std::lock_guard lock(mutex);
+    for (auto it = entries.begin(); it != entries.end();) {
+        if (!it->second->HoldsLease()) {
+            ++it;
+            continue;
+        }
+        evicted.push_back(std::move(it->second));
+        index.erase(it->first);
+        it = entries.erase(it);
+    }
+}
+
+bool DropLeasedResources() {
+    std::vector<std::shared_ptr<ShaderResources>> evicted;
+    SharedResourceCache().RemoveLeaseHolders(evicted);
+    return !evicted.empty();
 }
 
 void ResourceCache::RemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted) {

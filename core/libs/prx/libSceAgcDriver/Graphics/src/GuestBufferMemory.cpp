@@ -1757,6 +1757,13 @@ bool WaitForLeasesAndImports(std::uintptr_t address, std::size_t bytes) noexcept
     // reference: no GPU wait, no device lock (the mutating thread may be a driver thread holding
     // it). The registry rescans; a range still pinned by a build or a batch holding the space comes
     // back here and finishes lease batches below.
+    if (DropLeasedResources()) {
+        auto& state = Leases();
+        std::lock_guard lock(state.mutex);
+        ++state.stats.contentionWaits;
+        ++state.stats.cacheDrops;
+        return true;
+    }
     if (auto dropped = Spaces().current.exchange(nullptr); dropped != nullptr) {
         Spaces().droppedByWaiter.store(true, std::memory_order_relaxed);
         Spaces().waiterDrops.fetch_add(1, std::memory_order_relaxed);
@@ -3697,6 +3704,22 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
         append(range.end, false);
     }
     return merged;
+}
+
+std::uint64_t GuestBufferMemory::ReusableAddressSpaceSerial() const {
+    if (space == nullptr || !lease.empty()) return 0;
+    if (!space->copied.empty() || !space->sparseMirrors.empty()) return 0;
+    return space->serial;
+}
+
+std::uint64_t GuestBufferMemory::LiveAddressSpaceSerial(VkDevice device) {
+    if (!addressSpaceCacheEnabled()) return 0;
+    const auto current = Spaces().current.load();
+    if (current == nullptr || current->device != device) return 0;
+    if (current->generation != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return 0;
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    return current->importsEpoch == state.epoch ? current->serial : 0;
 }
 
 std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTable() const {

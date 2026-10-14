@@ -37,6 +37,8 @@
 
 namespace AgcDriver::Graphics {
 
+std::atomic<std::uint64_t> drawTemplateHits{0};
+
 std::uint64_t DrawRenderPassKey(const Context& context, const State& state, std::span<const VkImageView> targetViews) {
     std::uint64_t key = 14695981039346656037ull;
     const auto mix = [&](std::uint64_t value) {
@@ -1287,6 +1289,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
                 resolved.resources = std::move(cached);
                 resolved.moved = std::move(*moved);
                 outcome.kind = KindTemplateHit;
+                drawTemplateHits.fetch_add(1, std::memory_order_relaxed);
                 countCache(&DrawProfile::cacheHits);
             } else if (valid) {
                 countCache(&DrawProfile::cacheMisses);
@@ -1851,6 +1854,14 @@ std::optional<std::string> KnownValidationFailure(const Context& context, std::s
     const auto& failures = validationFailures();
     if (const auto found = failures.find(key); found != failures.end()) return found->second;
     return std::nullopt;
+}
+
+std::uint64_t ResourceTemplateHits() {
+    return drawTemplateHits.load(std::memory_order_relaxed);
+}
+
+void NoteResourceTemplateHit() {
+    drawTemplateHits.fetch_add(1, std::memory_order_relaxed);
 }
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut) {

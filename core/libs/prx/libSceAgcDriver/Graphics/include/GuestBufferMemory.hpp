@@ -231,6 +231,14 @@ public:
         const std::vector<ShaderRecompiler::BdaAbi::Range>* ranges;
     };
     std::optional<CachedTable> CachedAddressTable() const;
+    // The cached address space's serial when this build maps guest memory through it with nothing
+    // refreshed per build (no copied ranges, no sparse mirrors), else 0: such a build stays valid,
+    // BDA table included, while that space is the live one (its own regions are proven as any
+    // reusable build's are, by their import serials).
+    std::uint64_t ReusableAddressSpaceSerial() const;
+    // The serial of the cached address space a build would take now on this device (its registry
+    // generation and import epoch still current), 0 when there is none.
+    static std::uint64_t LiveAddressSpaceSerial(VkDevice device);
     // The registered memory an address-based build maps, shared by consecutive builds (see
     // GuestBufferMemory.cpp): its lease and the sorted, immutable regions of the ranges served in
     // place by imports and mirrors. Opaque outside GuestBufferMemory.cpp.
