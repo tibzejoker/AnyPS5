@@ -1248,10 +1248,10 @@ std::vector<PlanFixture> planFixtures() {
 
 IrResourcePlan handBuiltPlan() {
     IrResourcePlan plan;
+    plan.valueStorage.Reserve(64);
     std::uint32_t ids = 0;
     const auto make = [&](IrOpcode opcode, IrType type) -> IrValue& {
-        plan.valueStorage.push_back(std::make_unique<IrValue>(opcode, type, ids++));
-        return *plan.valueStorage.back();
+        return *plan.valueStorage.Create(opcode, type, ids++);
     };
     const auto constant = [&](std::uint32_t value) -> IrValue& {
         auto& immediate = make(IrOpcode::Void, IrType::U32);
@@ -1377,14 +1377,14 @@ std::vector<std::byte> encodedPlan(const IrResourcePlan& plan) {
 }
 
 bool samePlan(const IrResourcePlan& left, const IrResourcePlan& right) {
-    if (left.valueStorage.size() != right.valueStorage.size() || left.blockStorage.size() != right.blockStorage.size()) return false;
+    if (left.valueStorage.Size() != right.valueStorage.Size() || left.blockStorage.size() != right.blockStorage.size()) return false;
     std::map<const IrValue*, std::size_t> leftValues;
     std::map<const IrValue*, std::size_t> rightValues;
     std::map<const IrBlock*, std::size_t> leftBlocks;
     std::map<const IrBlock*, std::size_t> rightBlocks;
-    for (std::size_t index = 0; index < left.valueStorage.size(); ++index) {
-        leftValues.emplace(left.valueStorage[index].get(), index);
-        rightValues.emplace(right.valueStorage[index].get(), index);
+    for (std::size_t index = 0; index < left.valueStorage.Size(); ++index) {
+        leftValues.emplace(&left.valueStorage[index], index);
+        rightValues.emplace(&right.valueStorage[index], index);
     }
     for (std::size_t index = 0; index < left.blockStorage.size(); ++index) {
         leftBlocks.emplace(left.blockStorage[index].get(), index);
@@ -1404,9 +1404,9 @@ bool samePlan(const IrResourcePlan& left, const IrResourcePlan& right) {
     for (std::size_t index = 0; index < left.blockStorage.size(); ++index) {
         if (left.blockStorage[index]->Id() != right.blockStorage[index]->Id()) return false;
     }
-    for (std::size_t index = 0; index < left.valueStorage.size(); ++index) {
-        const auto& a = *left.valueStorage[index];
-        const auto& b = *right.valueStorage[index];
+    for (std::size_t index = 0; index < left.valueStorage.Size(); ++index) {
+        const auto& a = left.valueStorage[index];
+        const auto& b = right.valueStorage[index];
         if (a.Opcode() != b.Opcode() || a.Type() != b.Type() || a.Id() != b.Id() || a.Flags<std::uint64_t>() != b.Flags<std::uint64_t>() || !(a.Register() == b.Register()) || a.HasImmediate() != b.HasImmediate() || (a.HasImmediate() && a.ImmediateU64() != b.ImmediateU64())) return false;
         if (a.ArgumentCount() != b.ArgumentCount() || a.IsPhi() != b.IsPhi() || a.PhiBlockCount() != b.PhiBlockCount()) return false;
         for (std::size_t operand = 0; operand < a.ArgumentCount(); ++operand) {
@@ -1458,7 +1458,7 @@ MaterializedPlan materializePlan(const IrResourcePlan& plan, SrtRuntime runtime)
     } catch (const std::exception& error) {
         outcome.error = error.what();
     }
-    outcome.leaf = static_cast<std::size_t>(std::find_if(plan.valueStorage.begin(), plan.valueStorage.end(), [&](const auto& value) { return value.get() == outcome.trace.leaf; }) - plan.valueStorage.begin());
+    outcome.leaf = static_cast<std::size_t>(std::find_if(plan.valueStorage.begin(), plan.valueStorage.end(), [&](const auto& value) { return &value == outcome.trace.leaf; }) - plan.valueStorage.begin());
     return outcome;
 }
 
@@ -1591,15 +1591,11 @@ void verifyMalformedPlans() {
     std::vector<std::byte> bytes;
     require(!ShaderDiskCache::EncodePlan(foreign, bytes), "a plan reading a value it does not own was encoded");
     auto unblocked = handBuiltPlan();
-    auto& phi = *unblocked.valueStorage.emplace_back(std::make_unique<IrValue>(IrOpcode::Phi, IrType::U32, 100u));
-    phi.AddArgument(unblocked.valueStorage[0].get());
+    auto& phi = *unblocked.valueStorage.Create(IrOpcode::Phi, IrType::U32, 100u);
+    phi.AddArgument(&unblocked.valueStorage[0]);
     unblocked.srtReads[0].value = &phi;
     bytes.clear();
     require(!ShaderDiskCache::EncodePlan(unblocked, bytes), "a phi without predecessor blocks was encoded");
-    auto emptied = handBuiltPlan();
-    emptied.valueStorage.push_back(nullptr);
-    bytes.clear();
-    require(!ShaderDiskCache::EncodePlan(emptied, bytes), "a plan with an empty value slot was encoded");
 }
 
 void verifyPlanRoundTrip() {
@@ -1607,7 +1603,7 @@ void verifyPlanRoundTrip() {
     const auto handBytes = encodedPlan(handBuilt);
     IrResourcePlan handDecoded;
     require(ShaderDiskCache::DecodePlan(handBytes, handDecoded), "the hand-built plan does not decode");
-    require(encodedPlan(handDecoded) == handBytes && handDecoded.valueStorage.size() == handBuilt.valueStorage.size() && handDecoded.blockStorage.size() == handBuilt.blockStorage.size(), "the hand-built plan changed in a round trip");
+    require(encodedPlan(handDecoded) == handBytes && handDecoded.valueStorage.Size() == handBuilt.valueStorage.Size() && handDecoded.blockStorage.size() == handBuilt.blockStorage.size(), "the hand-built plan changed in a round trip");
     const auto& phi = *handDecoded.descriptorSources[0].dwords[2];
     require(phi.IsPhi() && phi.PhiBlockCount() == 2u && phi.PhiBlock(0)->Id() == 3u && phi.PhiBlock(1)->Id() == 7u && phi.Argument(1)->ImmediateU32() == 0u, "the decoded phi lost its blocks or operands");
     require(handDecoded.uniformFill.values[0] == handDecoded.uniformFill.values[1] && handDecoded.uniformFill.values[0] != nullptr && handDecoded.uniformFill.values[2] == nullptr, "the decoded uniform fill lost its shared or null values");
@@ -1633,13 +1629,13 @@ void verifyPlanRoundTrip() {
         require(ShaderDiskCache::DecodePlan(bytes, decoded), fixture.name + ": the plan does not decode");
         require(encodedPlan(decoded) == bytes, fixture.name + ": the plan changed in a round trip");
         require(samePlan(*plan, decoded), fixture.name + ": the decoded plan differs from the plan in a field or a value");
-        require(decoded.valueStorage.size() == plan->valueStorage.size() && decoded.blockStorage.size() == plan->blockStorage.size(), fixture.name + ": the decoded plan holds another graph");
+        require(decoded.valueStorage.Size() == plan->valueStorage.Size() && decoded.blockStorage.size() == plan->blockStorage.size(), fixture.name + ": the decoded plan holds another graph");
         const auto succeeded = verifyRoundTripRuntimes(*plan, decoded, fixture, 0x5eedu + static_cast<std::uint32_t>(index), fixture.name);
         require(succeeded != 0u, fixture.name + ": no runtime materialized");
         std::vector<std::byte> key;
         ShaderDiskCache::BuildPlanKey(request, 32u, key);
         if (index % 4u == 0u) verifyPlanEntryDamage(key, *plan, fixture.name);
-        std::cout << "plan round trip: " << fixture.name << ", " << plan->valueStorage.size() << " values, " << ShaderDiskCache::EncodePlanEntry(key, *plan).size() << " bytes per entry, " << succeeded << " of 1000 runtimes materialized\n";
+        std::cout << "plan round trip: " << fixture.name << ", " << plan->valueStorage.Size() << " values, " << ShaderDiskCache::EncodePlanEntry(key, *plan).size() << " bytes per entry, " << succeeded << " of 1000 runtimes materialized\n";
         ++index;
     }
     const auto covers = [&](const std::function<bool(const IrResourcePlan&)>& predicate) {
@@ -1648,7 +1644,7 @@ void verifyPlanRoundTrip() {
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.descriptorSources.begin(), plan.descriptorSources.end(), [](const DescriptorSource& source) { return source.tableColumn.has_value() && source.tableColumn->keyDomains.empty(); }); }), "no fixture plans a whole image table");
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.descriptorSources.begin(), plan.descriptorSources.end(), [](const DescriptorSource& source) { return source.tableColumn.has_value() && !source.tableColumn->keyDomains.empty(); }); }), "no fixture plans an image table with a key domain");
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.controlFlow.begin(), plan.controlFlow.end(), [](const ResourceBlock& block) { return block.condition != nullptr; }); }), "no fixture plans a control-flow condition");
-    require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.valueStorage.begin(), plan.valueStorage.end(), [](const auto& value) { return value->IsPhi(); }); }), "no fixture plans a phi");
+    require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.valueStorage.begin(), plan.valueStorage.end(), [](const auto& value) { return value.IsPhi(); }); }), "no fixture plans a phi");
     require(covers([](const IrResourcePlan& plan) { return !plan.guardedSrtSlots.empty(); }), "no fixture plans a guarded SRT read");
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; }); }), "no fixture plans a pure flat slot");
 }
