@@ -6,9 +6,31 @@
 #include "IntermediateRepresentation/IrBuilder.hpp"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <stdexcept>
 
 namespace ShaderRecompiler::Detail {
+
+namespace {
+
+void ReportGpuResolution(std::size_t handles, std::size_t flattened) {
+    static std::atomic<std::uint64_t> programs{0};
+    static std::atomic<std::uint64_t> gpuHandles{0};
+    static std::atomic<std::uint64_t> flattenedReads{0};
+    static std::atomic<long long> last{0};
+    ++programs;
+    gpuHandles += handles;
+    flattenedReads += flattened;
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    auto previous = last.load();
+    if (now != previous && last.compare_exchange_strong(previous, now)) {
+        std::fprintf(stderr, "[runtime-vsharp] %llu plans: %llu buffer/address handles resolved on the GPU, %llu raw reads still flattened for image/sampler handles\n", static_cast<unsigned long long>(programs.load()), static_cast<unsigned long long>(gpuHandles.load()), static_cast<unsigned long long>(flattenedReads.load()));
+    }
+}
+
+}
 
 void PlanBuilder::Run() {
     _program.Resources().srtReads.clear();
@@ -26,21 +48,20 @@ void PlanBuilder::Run() {
                     }
                 }
             }
-            if (IsDescriptorHandle(inst->Opcode())) {
+            const auto handle = inst->Opcode();
+            if (handle == IrOpcode::GetBufferResource || handle == IrOpcode::GetAddressResource) {
+                ++_gpuHandles;
+                continue;
+            }
+            if (IsDescriptorHandle(handle)) {
                 for (std::size_t index = 0; index < inst->ArgumentCount(); index++) {
                     Collect(inst->Argument(index), 0);
                 }
             }
         }
     }
-    for (auto& block : _program.Blocks()) {
-        for (IrValue* inst : block->Instructions()) {
-            if (inst->Opcode() == IrOpcode::LoadAddressU32 && IsRawRead(_program.Resources(), *inst) && inst->Argument(1)->Resolve()->HasImmediate() && RuntimeValidator(_program.Resources(), RuntimeValueType::Any).Run(inst)) {
-                Collect(inst, inst->Flags<MemoryFlags>().pc);
-            }
-        }
-    }
     PatchReads();
+    ReportGpuResolution(_gpuHandles, _patches.size());
 }
 
 void PlanBuilder::Collect(IrValue* raw, std::uint32_t usePc) {

@@ -33,6 +33,7 @@ private:
     std::unordered_map<IrValue*, std::size_t> _visitingIndex;
     std::unordered_set<IrValue*> _visited;
     std::vector<Patch> _patches;
+    std::size_t _gpuHandles = 0;
 };
 
 }
