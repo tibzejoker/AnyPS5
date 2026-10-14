@@ -94,6 +94,7 @@ std::atomic<std::uint64_t> collectDirty{0};
 #ifndef _WIN32
 std::atomic<std::uint64_t> collectDirtyRuns{0};
 #endif
+std::atomic<std::uint64_t> importWindows{0}, importWindowPagesHeld{0}, importWindowPagesDiffered{0}, importWindowsUnwatched{0};
 std::atomic<std::uint64_t> trackerWaits{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
 std::uintptr_t PagesBase();
@@ -1022,9 +1023,12 @@ struct WriteTracker {
 #endif
     }
 
+    std::unordered_map<std::uint64_t, std::uint32_t> importWindowBlocks;
+
     void stamp(std::uint64_t block, std::uint32_t stampGeneration, StampKind kind) {
         const bool cpu = kind == StampKind::Cpu || kind == StampKind::ImportWindow;
         const bool stored = kind != StampKind::ImportWindow;
+        if (kind == StampKind::ImportWindow) importWindowBlocks[block] = stampGeneration;
 #ifdef _WIN32
         if (stored) blocks[block] = stampGeneration;
         if (cpu) cpuBlocks[block] = stampGeneration;
@@ -1119,10 +1123,19 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     if (end <= begin) return;
     ++runs.stamped;
     const auto generation = tracker.generation.load(std::memory_order_relaxed);
-    if (kind != StampKind::Driver) tracker.noteCpuStore(begin, end, generation);
     if (runs.window != nullptr) {
-        for (auto page = begin; page < end; page += WritePageBytes) tracker.stamp(tracker.blockOf(page), generation, runs.window->Holds(page) ? StampKind::ImportWindow : kind);
+        for (auto page = begin; page < end; page += WritePageBytes) {
+            if (runs.window->Holds(page)) {
+                importWindowPagesHeld.fetch_add(1, std::memory_order_relaxed);
+                tracker.stamp(tracker.blockOf(page), generation, StampKind::ImportWindow);
+                continue;
+            }
+            importWindowPagesDiffered.fetch_add(1, std::memory_order_relaxed);
+            if (kind != StampKind::Driver) tracker.noteCpuStore(page, page + WritePageBytes, generation);
+            tracker.stamp(tracker.blockOf(page), generation, kind);
+        }
     } else {
+        if (kind != StampKind::Driver) tracker.noteCpuStore(begin, end, generation);
         for (auto block = tracker.blockOf(begin); block <= tracker.blockOf(end - 1); ++block) tracker.stamp(block, generation, kind);
     }
 #ifndef _WIN32
@@ -1331,8 +1344,27 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
         return true;
     }
     const WindowCopy window{first, saved};
-    if (!before || !walkWrites(tracker, first, stop, StampKind::Cpu, true, &window)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
+    importWindows.fetch_add(1, std::memory_order_relaxed);
+    if (!before || !walkWrites(tracker, first, stop, StampKind::Cpu, true, &window)) {
+        importWindowsUnwatched.fetch_add(1, std::memory_order_relaxed);
+        unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
+    }
     return true;
+}
+
+bool ImportWindowSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched || bytes == 0 || tracker.importWindowBlocks.empty() || !tracker.covers(address, bytes)) return false;
+    for (auto block = tracker.blockOf(address); block <= tracker.blockOf(address + bytes - 1); ++block) {
+        if (const auto found = tracker.importWindowBlocks.find(block); found != tracker.importWindowBlocks.end() && found->second > generation) return true;
+    }
+    return false;
+}
+
+ImportWindowCounts ImportWindowStats() {
+    return {importWindows.load(std::memory_order_relaxed), importWindowPagesHeld.load(std::memory_order_relaxed), importWindowPagesDiffered.load(std::memory_order_relaxed), importWindowsUnwatched.load(std::memory_order_relaxed)};
 }
 
 bool WriteWatched() {

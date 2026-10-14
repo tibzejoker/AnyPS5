@@ -62,6 +62,20 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
 bool WriteWatched();
 void Unwatch(std::uint64_t address, std::size_t bytes);
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched = true);
+// Watched imports so far: the pages the import call itself marked that still held their bytes (no
+// CPU store: not stamped as written), the marked pages whose bytes changed across the call (a CPU
+// store during the import: stamped), and the windows that left the range unwatched.
+struct ImportWindowCounts {
+    std::uint64_t imports = 0;
+    std::uint64_t pagesHeld = 0;
+    std::uint64_t pagesDiffered = 0;
+    std::uint64_t unwatched = 0;
+};
+ImportWindowCounts ImportWindowStats();
+// Whether an import call marked a page of the range after `generation` without changing its bytes:
+// such a page carries a CPU stamp (a store of the same bytes during the call cannot be told apart)
+// but no written stamp. For attribution only (the [track-why] line).
+bool ImportWindowSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 void SetUnwatchHook(void (*hook)(std::uint64_t address, std::size_t bytes));
 bool Watched(std::uint64_t address, std::size_t bytes);
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes);

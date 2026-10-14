@@ -108,6 +108,17 @@ struct TrackKindCounters {
 struct TrackState {
     std::atomic<std::uint64_t> refreshes{0}, proved{0}, clean{0}, compares{0}, comparedBytes{0}, originalCompares{0}, originalComparedBytes{0}, snapshotCompares{0}, snapshotComparedBytes{0}, uploads{0}, uploadedBytes{0}, flushes{0}, syncs{0}, captures{0}, capturedBytes{0};
     std::array<TrackKindCounters, static_cast<std::size_t>(TrackBacking::Count)> kinds{};
+    // Upload causes (APS5_TRACK_STATS=1, the [track-why] line): uploads by reason and path, the
+    // changed units behind refresh uploads by what stamped them, uploads that moved more bytes than
+    // their changed units hold, the other images a refresh stored first, and why an alias image of
+    // the same surface could not lend its units instead.
+    std::array<std::array<std::atomic<std::uint64_t>, 2>, 9 * 4> uploadsBy{};
+    std::array<std::atomic<std::uint64_t>, 6> unitsBy{};
+    std::atomic<std::uint64_t> widened{0}, widenedBytes{0}, partial{0}, whole{0};
+    std::atomic<std::uint64_t> flushSameRange{0}, flushSameRangeShape{0}, flushContaining{0}, flushInside{0}, flushPartial{0};
+    std::atomic<std::uint64_t> aliasFound{0}, aliasNoKeysOrImport{0}, aliasUntracked{0}, aliasBothPending{0}, aliasBorrowed{0};
+    std::array<std::uint64_t, 9 * 4 * 2 + 6 + 4 + 5 + 5> reportedWhy{};
+    GuestMemory::ImportWindowCounts reportedWindows{};
     std::atomic<long long> lastReport{-1};
     std::mutex mutex;
     StorageTexture::TrackTotals reported{};
@@ -125,6 +136,18 @@ bool TrackStatsEnabled() {
 }
 
 thread_local TrackBacking trackBacking = TrackBacking::Count;
+thread_local std::uint64_t trackUploadedOnThread = 0;
+
+constexpr std::array<const char*, 9> TrackReasons{"first", "keys", "cpu", "untracked", "flushed", "store", "alias", "shadow", "other"};
+constexpr std::array<const char*, 4> TrackPaths{"clear", "direct", "cpu", "alias"};
+constexpr std::array<const char*, 6> TrackUnitCauses{"keys", "cpu", "driver-after-flush", "driver", "untracked", "stamped-and-import-call"};
+
+std::size_t trackReasonIndex(const char* reason) {
+    for (std::size_t index = 0; reason != nullptr && index + 1 < TrackReasons.size(); ++index) {
+        if (std::strcmp(reason, TrackReasons[index]) == 0) return index;
+    }
+    return TrackReasons.size() - 1;
+}
 
 TrackKindCounters* trackKind() {
     return trackBacking == TrackBacking::Count ? nullptr : &Track().kinds[static_cast<std::size_t>(trackBacking)];
@@ -156,8 +179,12 @@ struct TrackBackingScope {
     TrackBackingScope& operator=(const TrackBackingScope&) = delete;
 };
 
-void countStorageUploadTracked(std::uint64_t bytes) {
+void countStorageUploadTracked(std::size_t path, std::uint64_t bytes, const char* reason) {
     auto& track = Track();
+    trackUploadedOnThread += bytes;
+    auto& by = track.uploadsBy[trackReasonIndex(reason) * TrackPaths.size() + std::min<std::size_t>(path, TrackPaths.size() - 1)];
+    by[0].fetch_add(1, std::memory_order_relaxed);
+    by[1].fetch_add(bytes, std::memory_order_relaxed);
     countTrack(track.uploads, &track.uploadedBytes, bytes);
     if (auto* kind = trackKind()) countTrack(kind->uploads, &kind->uploadedBytes, bytes);
 }
@@ -220,7 +247,7 @@ void reportStorageTraffic(StorageTraffic& traffic) {
 }
 
 void countStorageUpload(std::size_t path, std::uint64_t bytes) {
-    if (path != 0) countStorageUploadTracked(bytes);
+    if (path != 0) countStorageUploadTracked(path, bytes, uploadReason);
     if (!LookupOutcomes::Profiled()) return;
     auto& traffic = Traffic();
     std::lock_guard lock(traffic.mutex);
@@ -304,6 +331,36 @@ void reportTrack(const Context& context) {
     }
     AgcDriver::ProfilePrint_nid_no_patch("[track] last 10 s: refreshes %llu (proved %llu, clean by stamps %llu), untracked compares %llu/%.1f MiB, original compares %llu/%.1f MiB, sampled snapshot compares %llu/%.1f MiB, uploads %llu/%.1f MiB, other images flushed first %llu, GPU syncs inside refreshes %llu, guest snapshots %llu/%.1f MiB%s\n", delta(current.refreshes, last.refreshes), delta(current.proved, last.proved), delta(current.clean, last.clean), delta(current.compares, last.compares), mib(current.comparedBytes - last.comparedBytes), delta(current.originalCompares, last.originalCompares), mib(current.originalComparedBytes - last.originalComparedBytes), delta(current.snapshotCompares, last.snapshotCompares), mib(current.snapshotComparedBytes - last.snapshotComparedBytes), delta(current.uploads, last.uploads), mib(current.uploadedBytes - last.uploadedBytes), delta(current.flushes, last.flushes), delta(current.syncs, last.syncs), delta(current.captures, last.captures), mib(current.capturedBytes - last.capturedBytes), kinds.c_str());
     track.reported = current;
+    if (!TrackStatsEnabled()) return;
+    std::size_t at = 0;
+    const auto take = [&](std::uint64_t value) {
+        const auto difference = value - track.reportedWhy[at];
+        track.reportedWhy[at++] = value;
+        return static_cast<unsigned long long>(difference);
+    };
+    std::string uploads;
+    for (std::size_t reason = 0; reason < TrackReasons.size(); ++reason) {
+        for (std::size_t path = 0; path < TrackPaths.size(); ++path) {
+            const auto& by = track.uploadsBy[reason * TrackPaths.size() + path];
+            const auto count = take(by[0].load(std::memory_order_relaxed));
+            const auto bytes = take(by[1].load(std::memory_order_relaxed));
+            if (count == 0) continue;
+            std::snprintf(text, sizeof(text), " %s/%s %llu/%.1f", TrackReasons[reason], TrackPaths[path], count, bytes / 1048576.0);
+            uploads += text;
+        }
+    }
+    std::string units;
+    for (std::size_t cause = 0; cause < TrackUnitCauses.size(); ++cause) {
+        std::snprintf(text, sizeof(text), " %s %llu", TrackUnitCauses[cause], take(track.unitsBy[cause].load(std::memory_order_relaxed)));
+        units += text;
+    }
+    const auto widened = take(track.widened.load()), widenedBytes = take(track.widenedBytes.load()), partial = take(track.partial.load()), whole = take(track.whole.load());
+    const auto sameRange = take(track.flushSameRange.load()), sameShape = take(track.flushSameRangeShape.load()), containing = take(track.flushContaining.load()), inside = take(track.flushInside.load()), crossing = take(track.flushPartial.load());
+    const auto aliasFound = take(track.aliasFound.load()), aliasKeys = take(track.aliasNoKeysOrImport.load()), aliasUntracked = take(track.aliasUntracked.load()), aliasBoth = take(track.aliasBothPending.load()), aliasBorrowed = take(track.aliasBorrowed.load());
+    const auto windows = GuestMemory::ImportWindowStats();
+    const auto& seen = track.reportedWindows;
+    AgcDriver::ProfilePrint_nid_no_patch("[track-why] last 10 s: uploads by reason/path (count/MiB):%s; refresh uploads: %llu with every unit changed, %llu with some units, %llu moved more than their changed units (+%.1f MiB); changed units by cause:%s; other images stored by refreshes: %llu over the same range (%llu of the same size and texel width), %llu containing it, %llu inside it, %llu crossing it; same-shape alias images: %llu found, refused for %llu keys or no import, %llu an untracked unit, %llu a unit pending in both; %llu lent their units; import windows %llu: %llu pages the import call marked with unchanged bytes (not stamped), %llu changed during the call (stamped as CPU stores), %llu windows left the range unwatched\n", uploads.empty() ? " none" : uploads.c_str(), whole, partial, widened, widenedBytes / 1048576.0, units.c_str(), sameRange, sameShape, containing, inside, crossing, aliasFound, aliasKeys, aliasUntracked, aliasBoth, aliasBorrowed, static_cast<unsigned long long>(windows.imports - seen.imports), static_cast<unsigned long long>(windows.pagesHeld - seen.pagesHeld), static_cast<unsigned long long>(windows.pagesDiffered - seen.pagesDiffered), static_cast<unsigned long long>(windows.unwatched - seen.unwatched));
+    track.reportedWindows = windows;
 }
 
 // Per-layer validity of array surfaces (see StorageTexture::layerBegin): a fill of one layer clears
@@ -1884,15 +1941,44 @@ bool StorageTexture::Refresh() {
     // stamped); an untracked unit is stored whole by that write-back, and a unit pending in both
     // images takes the old order (store, then this image re-uploads it).
     auto alias = pendingAlias();
-    if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) alias = nullptr;
+    if (alias != nullptr) countTrack(Track().aliasFound, nullptr, 0);
+    if (alias != nullptr && !(ProvedClearKeys(descriptor, guestBytes, keyProof) == DccKeys::Uncompressed && HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr)) {
+        countTrack(Track().aliasNoKeysOrImport, nullptr, 0);
+        alias = nullptr;
+    }
     if (alias != nullptr) {
         std::vector<std::uint8_t> aliasStamped(trackedLayers);
-        if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped)) alias = nullptr;
+        if (!GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias->layerGeneration, aliasStamped)) {
+            countTrack(Track().aliasUntracked, nullptr, 0);
+            alias = nullptr;
+        }
         for (std::uint32_t unit = 0; alias != nullptr && unit < trackedLayers; ++unit) {
             if (!alias->layerPending[unit]) continue;
             if (alias->layerGeneration[unit] == 0 || (aliasStamped[unit] == GuestMemory::BlockUnchanged && layerPending[unit])) {
+                countTrack(alias->layerGeneration[unit] == 0 ? Track().aliasUntracked : Track().aliasBothPending, nullptr, 0);
                 alias = nullptr;
                 break;
+            }
+        }
+    }
+    if (TrackStatsEnabled()) {
+        auto& pending = Pending();
+        std::lock_guard lock(pending.mutex);
+        const auto begin = descriptor.baseAddress;
+        const auto end = begin + guestBytes;
+        for (const auto* other : pending.textures) {
+            if (other == this || other == alias.get() || !other->overlaps(begin, static_cast<std::size_t>(guestBytes)) || !other->pendingUnitInside(begin, static_cast<std::size_t>(guestBytes))) continue;
+            const auto otherBegin = other->descriptor.baseAddress;
+            const auto otherEnd = otherBegin + other->guestBytes;
+            if (otherBegin == begin && otherEnd == end) {
+                countTrack(Track().flushSameRange, nullptr, 0);
+                if (other->descriptor.width == descriptor.width && other->descriptor.height == descriptor.height && BytesPerElement(other->descriptor.format) == BytesPerElement(descriptor.format)) countTrack(Track().flushSameRangeShape, nullptr, 0);
+            } else if (otherBegin <= begin && otherEnd >= end) {
+                countTrack(Track().flushContaining, nullptr, 0);
+            } else if (otherBegin >= begin && otherEnd <= end) {
+                countTrack(Track().flushInside, nullptr, 0);
+            } else {
+                countTrack(Track().flushPartial, nullptr, 0);
             }
         }
     }
@@ -2116,6 +2202,7 @@ bool StorageTexture::Refresh() {
         reconcilePending();
     }
     if (anyBorrowed) {
+        countTrack(Track().aliasBorrowed, nullptr, 0);
         uploadReason = "alias";
         borrowUnits(*alias, borrowed);
         for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
@@ -2125,7 +2212,23 @@ bool StorageTexture::Refresh() {
     }
     if (std::any_of(changed.begin(), changed.end(), [](bool selected) { return selected; })) {
         uploadReason = keysChanged ? "keys" : cpuWrote ? "cpu" : generation == 0 ? "untracked" : flushed ? "flushed" : "store";
+        std::uint64_t changedBytes = 0;
+        std::uint32_t changedUnits = 0;
+        for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
+            if (!changed[unit]) continue;
+            ++changedUnits;
+            changedBytes += layerBytes(unit);
+            if (!TrackStatsEnabled()) continue;
+            const bool unitCpu = unit < cpuBlocks.size() && cpuBlocks[unit] != 0 && (compared || (tracked && unit < generations.size() && generations[unit] != 0));
+            std::size_t cause = keysChanged ? 0 : (!tracked && !compared) || layerGeneration[unit] == 0 ? 4 : unitCpu ? 1 : flushed ? 2 : 3;
+            if (cause == 1 && GuestMemory::ImportWindowSince(layerBegin(unit), static_cast<std::size_t>(layerBytes(unit)), layerGeneration[unit])) cause = 5;
+            countTrack(Track().unitsBy[cause], nullptr, 0);
+        }
+        const auto uploadedBefore = trackUploadedOnThread;
         upload(&changed);
+        const auto uploadedNow = trackUploadedOnThread - uploadedBefore;
+        countTrack(changedUnits == trackedLayers ? Track().whole : Track().partial, nullptr, 0);
+        if (uploadedNow > changedBytes) countTrack(Track().widened, &Track().widenedBytes, uploadedNow - changedBytes);
     } else {
         uploadedKeys = keys;
     }

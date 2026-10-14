@@ -550,6 +550,7 @@ void CheckImportWindow() {
     std::memset(memory, 0x11, 3 * Block);
     const auto synced = CollectWritesUncached(base, 3 * Block);
     Require(synced != 0, "the import window block is not collected");
+    const auto windowsBefore = ImportWindowStats();
     Require(ImportWatched(base, 3 * Block, [&] {
         bytes[0x100] = 0x11;
         bytes[Block + 0x2000] = 0x22;
@@ -564,6 +565,11 @@ void CheckImportWindow() {
     Require(changed[1] == BlockWritten && WrittenSince(base + Block, Block, synced) && cpu[1] == 1, "a store of new bytes within an import window was missed");
     Require(changed[2] == BlockUnchanged && cpu[2] == 0, "a block the import window did not touch reads as written");
     Require(cpu[0] == 1, "a page an import window resolved no longer counts as possibly touched by the CPU");
+    const auto windowsAfter = ImportWindowStats();
+    Require(windowsAfter.imports == windowsBefore.imports + 1 && windowsAfter.pagesHeld >= windowsBefore.pagesHeld + 1 && windowsAfter.pagesDiffered >= windowsBefore.pagesDiffered + 1, "the import window counters missed its pages");
+    Require(ImportWindowSince(base, Block, synced) && !ImportWindowSince(base + 2 * Block, Block, synced), "the import window stamps are not attributed to their blocks");
+    MarkWritten(base + 0x8000, 4);
+    Require(!StoredOver(base, 4096, synced), "a page an import window resolved without changing its bytes counts as stored over");
     const auto after = CollectWritesUncached(base, 3 * Block);
     bytes[0x100] = 0x33;
     static_cast<void>(CollectWritesUncached(base, 3 * Block));
