@@ -1201,6 +1201,8 @@ struct RegistryDevice {
     std::vector<std::uint32_t> regionBases;
     std::vector<std::pair<std::chrono::steady_clock::time_point, std::shared_ptr<Texture>>> retired;
     std::chrono::steady_clock::time_point lastRefresh{};
+    // The element the next refresh starts at (refreshRegistry walks the registry round robin).
+    std::uint32_t refreshCursor = 0;
     std::unordered_set<VkPipelineLayout> layouts;
     VkCommandBuffer lastCommands = VK_NULL_HANDLE;
     std::set<std::array<std::uint32_t, 4>> refusedSamplers;
@@ -1450,15 +1452,22 @@ std::vector<std::array<std::uint32_t, Count>> drainRing(std::span<std::uint32_t>
     return out;
 }
 
-// Re-looks every registered texture up at most every 16 ms: a lookup is what refreshes a texture
-// whose guest bytes changed or swaps in a newer view of a storage image. Replaced textures stay alive
-// two seconds for the command buffers still reading them.
+// Re-looks registered textures up, at most every 16 ms and for about 1 ms each time, round robin
+// from where the last refresh stopped: a lookup is what refreshes a texture whose guest bytes
+// changed or swaps in a newer view of a storage image. A whole pass per call made every draw pay
+// for hundreds of lookups (whole-surface compares of render targets under host imports) once draws
+// took longer than 16 ms, which a fresh build sampling a few textures never does. Replaced textures
+// stay alive two seconds for the command buffers still reading them.
 void refreshRegistry(const Context& context, RegistryDevice& registry) {
     const auto now = std::chrono::steady_clock::now();
     if (now - registry.lastRefresh < std::chrono::milliseconds(16)) return;
     registry.lastRefresh = now;
     std::erase_if(registry.retired, [&](const auto& entry) { return now - entry.first > std::chrono::seconds(2); });
-    for (std::uint32_t index = 0; index < registry.elements.size(); ++index) {
+    const auto count = static_cast<std::uint32_t>(registry.elements.size());
+    for (std::uint32_t visited = 0; visited < count; ++visited) {
+        if (visited != 0 && std::chrono::steady_clock::now() - now >= std::chrono::milliseconds(1)) break;
+        const auto index = registry.refreshCursor++ % count;
+        registry.refreshCursor %= count;
         auto& element = registry.elements[index];
         try {
             CompletePendingCpuWrites(context, element.resource.baseAddress, static_cast<std::size_t>(element.guestBytes));
