@@ -4745,6 +4745,52 @@ std::size_t ShaderResources::MaxDrawSnapshotBytes() {
     return static_cast<std::size_t>(mib * 1024ull * 1024ull);
 }
 
+namespace {
+
+// POC: draw snapshots are slices of a shared host-visible ring chunk (8 MiB, a new one when full), each
+// chunk kept by every batch that took a slice of it, instead of a Buffer per snapshot with its pool take,
+// descriptor range, keep entry and reuse record. APS5_POC_NO_SNAPSHOT_RING=1 restores the old path. The
+// draw thread (under the GPU mutex) is the only user.
+struct SnapshotRing {
+    std::shared_ptr<Buffer> chunk;
+    std::size_t used = 0;
+    std::uint64_t keptSerial = ~std::uint64_t{0};
+    VkDevice device = VK_NULL_HANDLE;
+};
+
+bool SnapshotRingEnabled() {
+    static const bool enabled = std::getenv("APS5_POC_NO_SNAPSHOT_RING") == nullptr;
+    return enabled;
+}
+
+std::pair<std::shared_ptr<Buffer>, VkDeviceSize> TakeSnapshotSlice(const Context& context, Recorder& recorder, std::size_t bytes) {
+    // Never destroyed: a chunk must not outlive its device at exit; a chunk of a replaced device is left alive.
+    static auto* state = new SnapshotRing();
+    auto& ring = *state;
+    constexpr std::size_t ChunkBytes = 8u << 20u;
+    if (ring.chunk != nullptr && ring.device != context.device) {
+        new std::shared_ptr<Buffer>(std::move(ring.chunk));
+        ring.chunk = nullptr;
+    }
+    const auto alignment = static_cast<std::size_t>(std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16));
+    auto offset = (ring.used + alignment - 1) / alignment * alignment;
+    if (ring.chunk == nullptr || ring.device != context.device || offset + bytes > ring.chunk->Bytes().size()) {
+        ring.chunk = std::make_shared<Buffer>(context, std::max(ChunkBytes, bytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        ring.device = context.device;
+        ring.keptSerial = ~std::uint64_t{0};
+        offset = 0;
+    }
+    const auto serial = recorder.Submissions();
+    if (ring.keptSerial != serial) {
+        recorder.Keep(ring.chunk);
+        ring.keptSerial = serial;
+    }
+    ring.used = offset + bytes;
+    return {ring.chunk, static_cast<VkDeviceSize>(offset)};
+}
+
+}
+
 std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
     if (_set == VK_NULL_HANDLE && fragment.set == VK_NULL_HANDLE) return {};
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
@@ -4761,7 +4807,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 if (patch.allocation == index && patch.byte < override->size) buffer->Bytes()[patch.byte] = static_cast<std::byte>(patch.adjustment);
             }
             selected.push_back(index);
-            result->snapshots.push_back({0, std::move(buffer)});
+            const auto bufferBytes = buffer->Bytes().size();
+            result->snapshots.push_back({0, std::move(buffer), 0, bufferBytes});
             continue;
         }
         std::uint64_t address = item.address;
@@ -4778,6 +4825,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
         if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) continue;
+        if (SnapshotRingEnabled()) {
+            auto [chunk, offset] = TakeSnapshotSlice(context, recorder, bytes);
+            std::memcpy(chunk->Bytes().data() + offset, reinterpret_cast<const void*>(begin), bytes);
+            selected.push_back(index);
+            result->snapshots.push_back({begin, std::move(chunk), offset, bytes});
+            totalSnapshotBytes += bytes;
+            continue;
+        }
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         const auto generation = GuestMemory::CollectWrites(begin, bytes);
         auto buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation);
@@ -4787,7 +4842,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
         }
         selected.push_back(index);
-        result->snapshots.push_back({begin, std::move(buffer)});
+        result->snapshots.push_back({begin, std::move(buffer), 0, bytes});
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
@@ -4833,14 +4888,16 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 const auto snapshotIndex = snapshotIndices[binding.allocations[element]];
                 if (snapshotIndex == selected.size()) continue;
                 const auto& snapshot = result->snapshots[snapshotIndex];
-                buffers[offset + element] = {snapshot.buffer->Handle(), 0, snapshot.buffer->Bytes().size()};
+                buffers[offset + element] = {snapshot.buffer->Handle(), snapshot.offset, snapshot.size};
             }
         }
     }
     Require(nextWrite == writes.end(), "draw snapshot writes disagree with their descriptor bindings");
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
     recorder.Keep(result);
-    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    if (!SnapshotRingEnabled()) {
+        for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    }
     return result;
 }
 
