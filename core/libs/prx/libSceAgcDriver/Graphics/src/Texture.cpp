@@ -1464,6 +1464,9 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
 
 namespace {
 
+// The pending images in registration order, indexed by base address (Overlapping: the images whose
+// range may meet [address, address + bytes), in registration order, found through the index instead
+// of a walk of every pending image; the index keeps each image's range as registered).
 class PendingList {
 public:
     using iterator = std::vector<StorageTexture*>::iterator;
@@ -1471,40 +1474,73 @@ public:
     iterator end() { return textures.end(); }
     void push_back(StorageTexture* texture) {
         textures.push_back(texture);
-        ++version;
+        const auto base = texture->Descriptor().baseAddress;
+        const auto bytes = texture->GuestBytes();
+        byBase.emplace(base, Entry{nextSequence++, bytes, texture});
+        largest = std::max(largest, bytes);
     }
     iterator erase(iterator it) {
-        ++version;
+        unindex(*it);
         return textures.erase(it);
     }
     void remove(const StorageTexture* texture) {
-        if (std::erase(textures, texture) != 0) ++version;
+        const auto found = std::find(textures.begin(), textures.end(), texture);
+        if (found == textures.end()) return;
+        unindex(*found);
+        textures.erase(found);
     }
     bool MayOverlap(std::uint64_t address, std::size_t bytes) {
-        if (textures.empty() || bytes == 0) return false;
-        if (indexed != version) rebuild();
-        const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
-        const auto it = std::upper_bound(ranges.begin(), ranges.end(), address, [](std::uint64_t value, const std::pair<std::uint64_t, std::uint64_t>& range) { return value < range.second; });
-        return it != ranges.end() && it->first < end;
+        bool any = false;
+        visit(address, bytes, [&](StorageTexture*) { any = true; return false; });
+        return any;
+    }
+    std::vector<StorageTexture*> Overlapping(std::uint64_t address, std::size_t bytes) {
+        std::vector<std::pair<std::uint64_t, StorageTexture*>> found;
+        visit(address, bytes, [&](StorageTexture* texture) {
+            found.emplace_back(sequenceOf(texture), texture);
+            return true;
+        });
+        std::sort(found.begin(), found.end());
+        std::vector<StorageTexture*> result;
+        result.reserve(found.size());
+        for (const auto& [sequence, texture] : found) result.push_back(texture);
+        return result;
     }
 
 private:
-    void rebuild() {
-        ranges.clear();
-        for (const auto* texture : textures) ranges.emplace_back(texture->Descriptor().baseAddress, texture->Descriptor().baseAddress + texture->GuestBytes());
-        std::sort(ranges.begin(), ranges.end());
-        std::size_t merged = 0;
-        for (const auto& range : ranges) {
-            if (merged != 0 && range.first <= ranges[merged - 1].second) ranges[merged - 1].second = std::max(ranges[merged - 1].second, range.second);
-            else ranges[merged++] = range;
+    struct Entry {
+        std::uint64_t sequence;
+        std::uint64_t bytes;
+        StorageTexture* texture;
+    };
+    template <typename F>
+    void visit(std::uint64_t address, std::size_t bytes, F&& f) {
+        if (byBase.empty() || bytes == 0) return;
+        const auto end = bytes > std::numeric_limits<std::uint64_t>::max() - address ? std::numeric_limits<std::uint64_t>::max() : address + bytes;
+        const auto from = address > largest ? address - largest : 0;
+        for (auto it = byBase.lower_bound(from); it != byBase.end() && it->first < end; ++it) {
+            if (it->first + it->second.bytes <= address) continue;
+            if (!f(it->second.texture)) return;
         }
-        ranges.resize(merged);
-        indexed = version;
+    }
+    std::uint64_t sequenceOf(const StorageTexture* texture) const {
+        for (auto [it, last] = byBase.equal_range(texture->Descriptor().baseAddress); it != last; ++it) {
+            if (it->second.texture == texture) return it->second.sequence;
+        }
+        return ~std::uint64_t{0};
+    }
+    void unindex(const StorageTexture* texture) {
+        for (auto [it, last] = byBase.equal_range(texture->Descriptor().baseAddress); it != last; ++it) {
+            if (it->second.texture != texture) continue;
+            byBase.erase(it);
+            break;
+        }
+        if (byBase.empty()) largest = 0;
     }
     std::vector<StorageTexture*> textures;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
-    std::uint64_t version = 0;
-    std::uint64_t indexed = ~std::uint64_t{0};
+    std::multimap<std::uint64_t, Entry> byBase;
+    std::uint64_t nextSequence = 0;
+    std::uint64_t largest = 0;
 };
 
 // Storage images whose results have not reached guest memory yet.
@@ -2400,7 +2436,8 @@ bool StorageTexture::otherPendingOverlaps() const {
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
     const auto other = [&](const StorageTexture* texture) { return texture != this && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)); };
-    return std::any_of(pending.textures.begin(), pending.textures.end(), other) || std::any_of(pending.flushing.begin(), pending.flushing.end(), other);
+    const auto candidates = pending.textures.Overlapping(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    return std::any_of(candidates.begin(), candidates.end(), other) || std::any_of(pending.flushing.begin(), pending.flushing.end(), other);
 }
 
 bool StorageTexture::refreshProved() {
@@ -3586,12 +3623,10 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
         const auto* exempt = refreshing;
-        for (auto it = pending.textures.MayOverlap(address, bytes) ? pending.textures.begin() : pending.textures.end(); it != pending.textures.end();) {
-            auto* texture = *it;
+        for (auto* texture : pending.textures.Overlapping(address, bytes)) {
             if (texture != except && texture != exempt && !lendingImage(texture) && texture->overlaps(address, bytes)) {
                 if (!texture->pendingUnitInside(address, bytes)) {
                     pretestSkipped.fetch_add(1, std::memory_order_relaxed);
-                    ++it;
                     continue;
                 }
                 texture->dirty = false;
@@ -3600,9 +3635,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                     if (PublishReasonFor(reason) == PublishReason::Hook && texture->hookSkipSite.load(std::memory_order_relaxed) == static_cast<std::uint8_t>(GuestMemory::CurrentReadSite())) flushedAfterSkipSameSite.fetch_add(1, std::memory_order_relaxed);
                 }
                 if (auto alive = texture->weak_from_this().lock()) flush.push_back(std::move(alive));
-                it = pending.textures.erase(it);
-            } else {
-                ++it;
+                pending.textures.remove(texture);
             }
         }
         // Still pending for the adjacency rule of writeBack until each one is stored.
@@ -4026,7 +4059,7 @@ bool StorageTexture::ScanPending(std::span<PendingQuery> queries) {
         query.found = nullptr;
         if (query.end <= query.begin) continue;
         const auto bytes = static_cast<std::size_t>(query.end - query.begin);
-        for (const auto* texture : pending.textures) {
+        for (const auto* texture : pending.textures.Overlapping(query.begin, bytes)) {
             if (query.found == nullptr && texture->descriptor.baseAddress == query.begin && texture->guestBytes >= bytes) query.found = texture;
             if (texture != query.except && texture->overlaps(query.begin, bytes)) query.overlaps = true;
         }
@@ -4912,7 +4945,7 @@ std::vector<StorageTexture::Lender> StorageTexture::pendingLenders(const Storage
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
-        for (auto* texture : pending.textures) {
+        for (auto* texture : pending.textures.Overlapping(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
             if (texture == this || texture == alias || !texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) || !texture->pendingUnitInside(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) continue;
             if (auto alive = texture->weak_from_this().lock()) candidates.push_back(std::move(alive));
         }

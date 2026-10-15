@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
@@ -29,6 +30,9 @@ DeferredLabels& deferredLabels();
 // for the draws still in flight there.
 bool DrawThreadEnabled();
 void DrainDrawPipeline();
+// POC: direct dispatches of queue 0 recorded on the draw thread too (APS5_POC_DISPATCH_THREAD=1).
+bool DispatchThreadEnabled();
+void PushDrawPipeline(std::function<void()> job);
 
 bool DeferLabels();
 

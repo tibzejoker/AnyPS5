@@ -1961,8 +1961,9 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         // Debug aid: APS5_NO_RESIDENT_TARGETS=1 copies every target in and out again.
         static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
         // POC: linear targets get a resident image too (they took a synchronous draw each, 134 per 10 s
-        // in GTA Story, 8.4 -> 8.9 FPS); APS5_POC_NO_RESIDENT_LINEAR=1 restores the old path.
-        static const bool residentLinear = std::getenv("APS5_POC_NO_RESIDENT_LINEAR") == nullptr;
+        // in GTA Story, 8.4 -> 8.9 FPS) with APS5_POC_RESIDENT_LINEAR=1; off by default: their results never reach
+        // guest memory for a CPU reader (41 agc_driver tests fail with it).
+        static const bool residentLinear = std::getenv("APS5_POC_RESIDENT_LINEAR") != nullptr;
         if ((binding.gpuTiling || ((color.tileMode != ColorTileMode::Linear || residentLinear) && context.detiler != nullptr)) && residentTargets) {
             // The lookup refreshes the image on every draw (StorageTexture::Refresh: FlushPending,
             // CollectWrites over the target's pages, the DCC key scan of TextureClearKeys, then

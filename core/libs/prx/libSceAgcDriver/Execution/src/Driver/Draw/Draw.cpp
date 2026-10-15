@@ -86,6 +86,15 @@ bool DrawThreadEnabled() {
     return enabled;
 }
 
+bool DispatchThreadEnabled() {
+    static const bool enabled = DrawThreadEnabled() && std::getenv("APS5_POC_DISPATCH_THREAD") != nullptr;
+    return enabled;
+}
+
+void PushDrawPipeline(std::function<void()> job) {
+    drawPipeline().Push(std::move(job));
+}
+
 void DrainDrawPipeline() {
     if (DrawThreadEnabled()) drawPipeline().Drain();
 }

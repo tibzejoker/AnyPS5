@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -21,6 +22,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     if (!registeredShader) registeredShader = ReadRawShader(address);
     const auto& snapshot = *registeredShader;
     require(snapshot.type == 0, "compute program refers to a non-compute shader");
+    // POC draw thread: queued labels are recorded by this worker, behind the draws in flight.
+    if (DispatchThreadEnabled() && !deferredLabels().labels.empty()) DrainDrawPipeline();
     const auto userCount = (readRegister(queue.shader, 0x213) >> 1u) & 0x1fu;
     std::vector<std::uint32_t> userData;
     for (std::uint32_t i = 0; i < userCount; ++i) {
@@ -79,6 +82,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (indirectArguments == 0 && (packet[4] & 0x20u) == 0) {
             if (const auto fill = Graphics::MatchMemoryValueFill(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads, {packet[1], packet[2], packet[3]})) Graphics::NoteMemoryValueFill(*fill);
         }
+        // POC draw thread: the fill and copy HLE write guest memory on the CPU, after the draws in flight.
+        if (DispatchThreadEnabled() && (matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute))) DrainDrawPipeline();
         if (!partialLastGroup && fillBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice)) {
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
@@ -351,6 +356,90 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         std::fprintf(stderr, "[dispatch-io] shader 0x%llx%s\n", static_cast<unsigned long long>(address), words.c_str());
     }
 
+    if (DispatchThreadEnabled() && submission.queue == 0 && indirectArguments == 0 && !fromAhead && deferredLabels().labels.empty()) {
+        if (writeEvidenceEnabled() || traceCapSync()) noteWrittenBuffers(address, submission.queue, compiled);
+        struct Job {
+            std::shared_ptr<VulkanDevice> device;
+            decltype(compiledResult) compiled;
+            decltype(keepVariant) keep;
+            decltype(attachVariant) attach;
+            std::vector<std::vector<std::byte>> bytes;
+            std::vector<Graphics::GuestMemorySnapshot> snapshots;
+            std::array<std::uint32_t, 3> groups{};
+            std::uint64_t threads = 0;
+            std::uint64_t address = 0;
+            std::uint64_t epoch = 0;
+            std::uint32_t queue = 0;
+            bool dataHit = false;
+            bool cached = false;
+        };
+        auto job = std::make_shared<Job>();
+        job->device = localDevice;
+        job->compiled = compiledResult;
+        job->keep = keepVariant;
+        job->attach = attachVariant;
+        job->bytes.reserve(snapshots.size());
+        for (const auto& item : snapshots) {
+            job->bytes.emplace_back(item.bytes.begin(), item.bytes.end());
+            job->snapshots.push_back({item.address, std::span<const std::byte>(job->bytes.back())});
+        }
+        job->groups = groups;
+        job->threads = dispatchThreads;
+        job->address = address;
+        job->epoch = GuestMemory::ThreadCollectEpoch();
+        job->queue = submission.queue;
+        job->dataHit = dataHit;
+        job->cached = cached;
+        PushDrawPipeline([this, job] {
+            std::shared_lock deviceUse(deviceReplacement);
+            GuestMemory::AdoptCollectEpoch(job->epoch);
+            auto localDevice = job->device;
+            if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
+            const auto& compiled = *job->compiled;
+            try {
+                std::shared_ptr<RecipeHit> recipeHit;
+                if (job->cached && job->keep != nullptr && !stampValidate()) recipeHit = localDevice->PrepareRecipe(job->keep->recipe.load(std::memory_order_acquire), false);
+                auto* const attachTo = stampValidate() ? nullptr : job->keep != nullptr ? job->keep.get() : job->attach.get();
+                std::shared_ptr<const Recipe> builtRecipe;
+                for (;;) {
+                    std::shared_ptr<PreparedDispatch> prepared;
+                    if (recipeHit == nullptr || VulkanDevice::VerifyRecipes()) prepared = localDevice->PrepareDispatch(compiled, job->snapshots, job->threads);
+                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
+                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    recordLabelsForPacket(localDevice.get(), job->queue);
+                    if (recipeHit != nullptr) {
+                        VulkanDevice::IndirectOutcome outcome{0, 0};
+                        if (localDevice->DispatchRecipe(compiled, job->groups[0], job->groups[1], job->groups[2], 0, job->address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, job->dataHit) == RecipeOutcome::Rebuild) {
+                            recipeHit = nullptr;
+                            VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, false);
+                            continue;
+                        }
+                    } else {
+                        localDevice->Dispatch(compiled, job->groups[0], job->groups[1], job->groups[2], job->snapshots, job->address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr);
+                    }
+                    if (builtRecipe != nullptr) {
+                        if (job->dataHit) {
+                            auto own = std::make_shared<Recipe>(*builtRecipe);
+                            own->dataWordsHash = Graphics::ShaderResources::DataWordsHash({ShaderRecompiler::ShaderStage::Compute, job->keep->compiled.get(), 0});
+                            builtRecipe = std::move(own);
+                        }
+                        attachTo->recipe.store(std::move(builtRecipe), std::memory_order_release);
+                        VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, false);
+                    }
+                    break;
+                }
+            } catch (const std::exception& error) {
+                static std::atomic<std::uint64_t> failures{0};
+                if (failures.fetch_add(1) < 50) std::fprintf(stderr, "[draw-thread] compute shader 0x%llx failed: %s\n", static_cast<unsigned long long>(job->address), error.what());
+            }
+        });
+        if (profile) {
+            auto& pending = pendingDispatchPhases();
+            pending.outcome = DispatchOutcome::Real;
+            pending.phases = false;
+        }
+        return;
+    }
     const auto rethrow = [&](const std::exception& error) {
         if (fromAhead) {
             ++groupStats.deviceRejects;
