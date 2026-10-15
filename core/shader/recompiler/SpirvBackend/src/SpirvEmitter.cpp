@@ -277,7 +277,10 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     // Stopped invocations would leave the wave LDS barriers incomplete.
     state.bdaStopsInvocations = state.waveLdsScope == 0 && BdaInvocationsMayStop(program) && program.Resources().stage != IrShaderStage::Mesh;
     const auto& memories = program.Resources().memoryInfo;
-    static const bool keepFaults = std::getenv("APS5_BDA_FAULTS") != nullptr;
+    // POC: the fault checks stay on (eliding them left GTA Story with a GPU read fault, DEVICE_LOST, in
+    // about one 5-minute run in three; with them, 0 in 4 runs at the same FPS). APS5_POC_ELIDE_BDA_FAULTS=1
+    // elides them where descriptors are GPU-resolved.
+    static const bool keepFaults = std::getenv("APS5_POC_ELIDE_BDA_FAULTS") == nullptr;
     state.bdaFaultsElided = !keepFaults && std::any_of(memories.begin(), memories.end(), [](const MemoryInfo& memory) { return memory.gpuDescriptor; });
     if (state.bdaFaultsElided) state.bdaStopsInvocations = false;
     EmitModuleHeader(state, bindings);
