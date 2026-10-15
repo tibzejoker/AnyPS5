@@ -33,6 +33,15 @@ void DrainDrawPipeline();
 // POC: direct dispatches of queue 0 recorded on the draw thread too (APS5_POC_DISPATCH_THREAD=1).
 bool DispatchThreadEnabled();
 void PushDrawPipeline(std::function<void()> job);
+// POC parallel draw preparation (APS5_POC_PARALLEL_PREP=<threads>, default 3, 0 disables): queue 0's draw packets are prepared on a pool
+// of threads, each on a copy of the queue state; a ticket per draw orders what reaches the draw thread (the
+// preparation waits for its turn before handing its recording over or drawing synchronously, ServeDrawTurn).
+std::size_t ParallelPrepThreads();
+std::uint64_t TakeDrawTicket();
+void SubmitDrawPrep(std::uint64_t ticket, std::function<void()> job);
+void ServeDrawTurn();
+// Waits for every submitted preparation, then for the draws still on the draw thread.
+void DrainDrawWork();
 
 bool DeferLabels();
 

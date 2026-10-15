@@ -81,6 +81,116 @@ DrawPipeline& drawPipeline() {
 
 }
 
+namespace {
+
+class PrepPool {
+public:
+    void Start(std::size_t count) {
+        std::lock_guard lock(mutex);
+        if (!threads.empty()) return;
+        for (std::size_t index = 0; index < count; ++index) threads.emplace_back([this] { run(); });
+    }
+    void Submit(std::function<void()> job) {
+        std::lock_guard lock(mutex);
+        jobs.push_back(std::move(job));
+        ready.notify_one();
+    }
+
+private:
+    void run() {
+        PinWorkerThread("draw prep");
+        std::unique_lock lock(mutex);
+        for (;;) {
+            ready.wait(lock, [&] { return !jobs.empty(); });
+            auto job = std::move(jobs.front());
+            jobs.pop_front();
+            lock.unlock();
+            job();
+            lock.lock();
+        }
+    }
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::deque<std::function<void()>> jobs;
+    std::vector<std::thread> threads;
+};
+
+PrepPool& prepPool() {
+    static auto* pool = new PrepPool();
+    return *pool;
+}
+
+struct DrawTurns {
+    std::mutex mutex;
+    std::condition_variable changed;
+    std::uint64_t issued = 0;
+    std::uint64_t finished = 0;
+};
+
+DrawTurns& drawTurns() {
+    static auto* turns = new DrawTurns();
+    return *turns;
+}
+
+// The ticket of the preparation running on this thread, and whether it holds the turn.
+thread_local std::uint64_t currentTicket = 0;
+thread_local bool ticketActive = false;
+thread_local bool ticketServed = false;
+
+}
+
+std::size_t ParallelPrepThreads() {
+    static const std::size_t threads = [] { const char* text = std::getenv("APS5_POC_PARALLEL_PREP"); return text != nullptr ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : std::size_t{3}; }();
+    return DrawThreadEnabled() ? threads : 0;
+}
+
+std::uint64_t TakeDrawTicket() {
+    auto& turns = drawTurns();
+    std::lock_guard lock(turns.mutex);
+    return turns.issued++;
+}
+
+void ServeDrawTurn() {
+    if (!ticketActive || ticketServed) return;
+    auto& turns = drawTurns();
+    std::unique_lock lock(turns.mutex);
+    turns.changed.wait(lock, [&] { return turns.finished == currentTicket; });
+    ticketServed = true;
+}
+
+void SubmitDrawPrep(std::uint64_t ticket, std::function<void()> job) {
+    auto& pool = prepPool();
+    pool.Start(ParallelPrepThreads());
+    pool.Submit([ticket, job = std::move(job)] {
+        currentTicket = ticket;
+        ticketActive = true;
+        ticketServed = false;
+        try {
+            job();
+        } catch (const std::exception& error) {
+            static std::atomic<std::uint64_t> failures{0};
+            if (failures.fetch_add(1) < 50) std::fprintf(stderr, "[draw-prep] draw failed: %s\n", error.what());
+        }
+        ServeDrawTurn();
+        ticketActive = false;
+        auto& turns = drawTurns();
+        {
+            std::lock_guard lock(turns.mutex);
+            ++turns.finished;
+        }
+        turns.changed.notify_all();
+    });
+}
+
+void DrainDrawWork() {
+    if (ParallelPrepThreads() != 0) {
+        auto& turns = drawTurns();
+        std::unique_lock lock(turns.mutex);
+        turns.changed.wait(lock, [&] { return turns.finished == turns.issued; });
+    }
+    DrainDrawPipeline();
+}
+
 bool DrawThreadEnabled() {
     static const bool enabled = std::getenv("APS5_POC_NO_DRAW_THREAD") == nullptr;
     return enabled;
@@ -365,6 +475,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("post_compile_prepare");
     const auto lockForDraw = [&] {
         if (gpuLock.owns_lock()) return;
+        ServeDrawTurn();
         DrainDrawPipeline();
         phaseTiming.Phase(DrawRowVectors);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
@@ -509,6 +620,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         job->drawKey = drawKey;
         job->epoch = GuestMemory::ThreadCollectEpoch();
         job->queue = submission.queue;
+        ServeDrawTurn();
         drawPipeline().Push([this, job] {
             std::shared_lock deviceUse(deviceReplacement);
             GuestMemory::AdoptCollectEpoch(job->epoch);

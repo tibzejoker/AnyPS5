@@ -125,7 +125,7 @@ void Driver::execute(const Submission& submission) {
         auto nextCursor = cursor + count;
         if (submission.queue == 0 && DrawThreadEnabled()) {
             const bool keepsDraws = (opcode == 0x15 && DispatchThreadEnabled()) || Pm4::DrawOpcode(opcode) || Pm4::IndirectRegisterOpcode(opcode) || opcode == 0x69 || opcode == 0x76 || opcode == 0x79 || opcode == 0x68 || opcode == 0x10 || opcode == 0x2a || opcode == 0x2f || opcode == 0x26 || opcode == 0x13 || opcode == 0x3c;
-            if (!keepsDraws || header == FlipPacketHeader || header == RenderingWaitPacketHeader) DrainDrawPipeline();
+            if (!keepsDraws || header == FlipPacketHeader || header == RenderingWaitPacketHeader) DrainDrawWork();
         }
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
@@ -280,6 +280,22 @@ void Driver::execute(const Submission& submission) {
                     if (profileDraws) Graphics::CountDrawSkip(kind, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count());
                 };
 
+                if (submission.queue == 0 && ParallelPrepThreads() != 0 && deferredLabels().labels.empty()) {
+                    auto state = std::make_shared<QueueState>(queue);
+                    const auto epoch = GuestMemory::ThreadCollectEpoch();
+                    SubmitDrawPrep(TakeDrawTicket(), [this, state, packet, &submission, epoch] {
+                        std::shared_lock prepDeviceUse(deviceReplacement);
+                        GuestMemory::AdoptCollectEpoch(epoch);
+                        std::string rejected;
+                        const Graphics::DrawCpuScope cpuScope;
+                        if (draw(*state, packet, submission, rejected) == DrawVerdict::Rejected) {
+                            static std::atomic<std::uint64_t> rejects{0};
+                            if (rejects.fetch_add(1) < 50) std::fprintf(stderr, "[draw-prep] draw rejected: %.256s\n", rejected.c_str());
+                        }
+                    });
+                    drawn = true;
+                    return;
+                }
                 try {
                     std::string rejected;
                     const Graphics::DrawCpuScope cpuScope;
@@ -335,7 +351,7 @@ void Driver::execute(const Submission& submission) {
     // in flight on the draw thread carry over into it (APS5_POC_DRAW_THREAD_KEEP_END=1).
     static const bool keepEnd = std::getenv("APS5_POC_DRAW_THREAD_KEEP_END") != nullptr;
     const bool nextQueued = submission.queue == 0 && !submitAtEnd && submission.rewindTail == nullptr && workerQueued() != nullptr && workerQueued()->load(std::memory_order_acquire) != 0;
-    if (submission.queue == 0 && !(keepEnd && nextQueued)) DrainDrawPipeline();
+    if (submission.queue == 0 && !(keepEnd && nextQueued)) DrainDrawWork();
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
     if (!deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value() || Graphics::Recorder::RecordedWorkSinceSubmit() != 0) {
