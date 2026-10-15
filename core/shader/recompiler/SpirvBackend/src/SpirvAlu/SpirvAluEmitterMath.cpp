@@ -1424,6 +1424,8 @@ static std::uint32_t EmitNativeF32ToF16BitsRte(SpirvEmitterState& state, std::ui
     const auto pair = state.module.AllocateId();
     state.module.AddFunction(spv::OpCompositeConstruct, state.module.Type(spv::OpTypeVector, f16, 2u), pair, half, state.module.Constant(spv::OpConstant, f16, 0u));
     const auto bits = Unary(state, spv::OpBitcast, u32, pair);
+    static const bool fast = std::getenv("APS5_POC_FAST_F16") != nullptr;
+    if (fast) return bits;
     const auto source = Unary(state, spv::OpBitcast, u32, value);
     const auto magnitude = Binary(state, spv::OpBitwiseAnd, u32, source, ConstantU32(state, 0x7fffffffu));
     const auto sign = Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpShiftRightLogical, u32, source, ConstantU32(state, 16u)), ConstantU32(state, 0x8000u));

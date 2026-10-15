@@ -215,6 +215,8 @@ struct State {
 // again (the registry probes run per pixel otherwise).
 inline bool GpuResolvedStage(IrShaderStage stage) {
     static const bool noGraphics = std::getenv("APS5_POC_NO_GRAPHICS_REGISTRY") != nullptr;
+    static const bool noCompute = std::getenv("APS5_POC_NO_COMPUTE_REGISTRY") != nullptr;
+    if (noCompute && stage == IrShaderStage::Compute) return false;
     if (noGraphics) return stage == IrShaderStage::Compute;
     return stage == IrShaderStage::Compute || stage == IrShaderStage::Vertex || stage == IrShaderStage::Pixel;
 }
@@ -235,7 +237,8 @@ inline bool PocNoVertexPull() {
 }
 
 inline bool GpuResolvedBufferStage(IrShaderStage stage) {
-    if (stage == IrShaderStage::Compute) return true;
+    static const bool noComputeBda = std::getenv("APS5_POC_NO_COMPUTE_BDA") != nullptr;
+    if (stage == IrShaderStage::Compute) return !noComputeBda;
     if (PocNoGraphicsBda()) return false;
     if (stage == IrShaderStage::Vertex) return !PocNoVertexPull();
     return stage == IrShaderStage::Pixel;

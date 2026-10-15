@@ -1481,8 +1481,46 @@ std::uint64_t Recorder::ReapsWithWork() {
     return holdCounters.reapsWithWork;
 }
 
+namespace {
+// POC: why open render passes end (APS5_PASS_STATS=1, [pass] line every 10 s).
+struct PassStats {
+    std::mutex mutex;
+    std::map<std::string, std::uint64_t> reasons;
+    std::map<void*, std::uint64_t> callers;
+    long long reported = 0;
+};
+bool PassStatsEnabled() {
+    static const bool enabled = std::getenv("APS5_PASS_STATS") != nullptr;
+    return enabled;
+}
+void NotePassEnd(const char* reason, void* caller) {
+    static auto* stats = new PassStats();
+    std::lock_guard lock(stats->mutex);
+    ++stats->reasons[reason];
+    if (caller != nullptr) ++stats->callers[caller];
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (now == stats->reported) return;
+    stats->reported = now;
+    std::string line = "[pass] ends (10 s):";
+    for (const auto& [name, count] : stats->reasons) line += " " + name + "=" + std::to_string(count);
+    std::vector<std::pair<std::uint64_t, void*>> top;
+    for (const auto& [address, count] : stats->callers) top.emplace_back(count, address);
+    std::sort(top.rbegin(), top.rend());
+    line += "; Commands() callers:";
+    for (std::size_t i = 0; i < top.size() && i < 12; ++i) {
+        char item[64];
+        std::snprintf(item, sizeof(item), " %p=%llu", top[i].second, static_cast<unsigned long long>(top[i].first));
+        line += item;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+    stats->reasons.clear();
+    stats->callers.clear();
+}
+}
+
 VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess) {
     ensureOpen();
+    if (PassStatsEnabled() && open->renderPass.open) NotePassEnd("commands", __builtin_return_address(0));
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or
     // for a caller whose ranges overlap a queued store: FlushStores).
@@ -1501,6 +1539,7 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     ensureOpen();
     auto& pass = open->renderPass;
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
+        if (PassStatsEnabled() && pass.open) NotePassEnd(forced ? "forced" : "segment", nullptr);
         const auto commands = Commands();
         open->passHazards.Clear();
         open->passHazards.BeginPass();
@@ -1510,6 +1549,7 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     if (hazard == PassHazard::None && pass.key == key) return {open->commands, true, false};
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
+    if (PassStatsEnabled()) NotePassEnd(hazard != PassHazard::None ? (pass.key == key ? "hazard-same-key" : "hazard-new-key") : "new-key", nullptr);
     endOpenRenderPass(!merge);
     const auto commands = Commands();
     if (!elide) open->passHazards.Clear();
