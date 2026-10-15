@@ -429,6 +429,9 @@ public:
     // return address of the Sync/SyncThrough call itself is taken, so an unannounced sync still
     // names its real caller.
     static void CountSync(int source, const void* site = nullptr);
+    // How many syncs the calling thread announced with CountSync so far (any profile setting): a
+    // caller reads the difference across a span of its own work (the [track] line's refresh syncs).
+    static std::uint64_t AnnouncedSyncs();
     // Names only the site for the sync or drain this thread makes next (its source stays as
     // announced, or as the drain counts it): for a wrapper (VulkanDevice::ReapRecorded) whose
     // FinishUpTo counts the drain itself, so a CountSync there would count it twice.

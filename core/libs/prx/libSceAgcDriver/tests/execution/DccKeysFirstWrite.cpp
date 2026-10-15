@@ -345,14 +345,14 @@ void Run(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     }
     readPending(DccKeys::Uncompressed, false, "a pending fill of the keys with 0x5a, which is no clear code");
     Require(fill(0, KeyBytes, 0x10), "the comp-to-single fill of the keys was not recorded");
-    readPending(DccKeys::ClearSingle, true, "a pending comp-to-single fill of the keys");
+    readPending(DccKeys::ClearSingle, false, "a pending comp-to-single fill of the keys");
     Require(fill(0, KeyBytes / 2, 0x00) && fill(KeyBytes / 2, KeyBytes / 2, 0x00), "the 0000 fills of the key halves were not recorded");
-    readPending(DccKeys::Clear0000, true, "pending 0000 fills over both halves of the keys");
+    readPending(DccKeys::Clear0000, false, "pending 0000 fills over both halves of the keys");
     Require(fill(0, KeyBytes / 2, 0x40), "the 0001 fill of the first key half was not recorded");
     Dispatch(device, ClearKeysCode, clearTailData, false);
     readPending(DccKeys::Uncompressed, true, "a pending 0001 fill over half the keys and a kernel's 0000 store over the other half");
     Require(fill(0, KeyBytes, 0x10) && fill(0, KeyBytes, 0x00), "the 0x10 and 0000 fills of the keys were not recorded");
-    readPending(DccKeys::Clear0000, true, "a pending 0x10 fill of the keys overwritten by a pending 0000 fill");
+    readPending(DccKeys::Clear0000, false, "a pending 0x10 fill of the keys overwritten by a pending 0000 fill");
     Require(fill(KeyBytes / 2, KeyBytes / 2, 0x10), "the 0x10 fill of the second key half was not recorded");
     device.WaitIdle();
     Require(fill(0, KeyBytes / 2, 0x00), "the 0000 fill of the first key half was not recorded");
@@ -616,7 +616,6 @@ void RunUntrackedReuse(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     Require(image->Refresh(), "the GPU-edited image was uploaded twice");
 }
 
-#ifndef _WIN32
 // An import window stamps the pages whose write protection it saw resolved as a possible CPU
 // store. A driver that pins imported pages for writing (NVIDIA on Linux) resolves it without
 // storing anything, which a store of the byte already there reproduces on any device.
@@ -656,7 +655,163 @@ void RunImportWindow(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "test");
     device.WaitIdle();
 }
-#endif
+
+// A host import that stays write-watched (the driver leaves the page marks to CPU stores): a
+// refresh without a CPU store neither compares nor uploads, a CPU store is found by its mark alone
+// and only its 64 KiB unit is uploaded again, and a GPU write through the import is no CPU store.
+void RunTrackedImport(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+    using namespace AgcDriver::GuestMemory;
+    const auto address = AddressOf(block);
+    std::memset(block, 0x55, BlockBytes);
+    auto descriptor = TextureDescriptor(block, nullptr);
+    descriptor[2] = ((Side - 1u) >> 2u) | ((2 * Side - 1u) << 14u);
+    descriptor[6] = 0;
+    descriptor[7] = 0;
+    std::vector<std::uint32_t> userData(16, 0u);
+    std::copy(descriptor.begin(), descriptor.end(), userData.begin() + 4);
+    std::lock_guard gpu(GpuMutex());
+    BumpCollectEpoch();
+    Dispatch(device, WriteCode, userData);
+    const auto image = StorageTexture::FindPending(address, BlockBytes);
+    Require(image != nullptr && image->GuestBytes() == BlockBytes, "tracked import: the two-block image has no pending results");
+    if (!Watched(address, BlockBytes)) {
+        std::puts("host imports are compared, not watched: the tracked import is not tested");
+        StorageTexture::FlushPending(address, BlockBytes, nullptr, "test tracked import");
+        device.WaitIdle();
+        return;
+    }
+    StorageTexture::FlushPending(address, BlockBytes, nullptr, "test tracked import");
+    device.WaitIdle();
+    for (int settle = 0; settle < 2; ++settle) {
+        BumpCollectEpoch();
+        image->Refresh();
+    }
+    const auto comparisons = [] {
+        const auto totals = StorageTexture::TrackCounters();
+        return totals.compares + totals.originalCompares;
+    };
+    const auto version = image->Version();
+    const auto compares = comparisons();
+    const auto uploaded = StorageTexture::TrackCounters().uploadedBytes;
+    for (int epoch = 0; epoch < 50; ++epoch) {
+        BumpCollectEpoch();
+        Require(image->Refresh() && image->Version() == version, "tracked import: an unchanged image was uploaded again");
+    }
+    Require(comparisons() == compares, "tracked import: a refresh without a store compared guest bytes");
+    Require(StorageTexture::TrackCounters().uploadedBytes == uploaded, "tracked import: a refresh without a store uploaded");
+    block[SurfaceBytes + 0x100] = 0x33;
+    BumpCollectEpoch();
+    Require(!image->Refresh() && image->Version() != version, "tracked import: a CPU store into the imported image was missed");
+    Require(comparisons() == compares, "tracked import: the CPU store was found through a compare");
+    char message[192];
+    const auto unitUpload = StorageTexture::TrackCounters().uploadedBytes - uploaded;
+    std::snprintf(message, sizeof(message), "tracked import: a store into one 64 KiB unit uploaded %llu bytes", static_cast<unsigned long long>(unitUpload));
+    Require(unitUpload != 0 && unitUpload <= SurfaceBytes, message);
+    BumpCollectEpoch();
+    Require(image->Refresh(), "tracked import: the stored image did not settle");
+    const auto beforeFill = CollectWritesUncached(address, BlockBytes);
+    const std::array<std::uint32_t, 4> pattern{0x66666666u, 0x66666666u, 0x66666666u, 0x66666666u};
+    Require(device.FillBuffer(address, SurfaceBytes, pattern), "tracked import: the GPU fill was not recorded");
+    device.WaitIdle();
+    Require(Count(block, SurfaceBytes, 0x66) == SurfaceBytes, "tracked import: the GPU fill did not reach guest memory");
+    Require(UnchangedSinceCollected(address, BlockBytes, beforeFill), "tracked import: a GPU write through the import was taken for a CPU store");
+    Require(!UnchangedSince(address, SurfaceBytes, beforeFill), "tracked import: the recorded GPU write left no stamp");
+    BumpCollectEpoch();
+    Require(!image->Refresh() && comparisons() == compares, "tracked import: the GPU-written unit was not uploaded from its stamp");
+    BumpCollectEpoch();
+    Require(image->Refresh() && Count(block, SurfaceBytes, 0x66) == SurfaceBytes, "tracked import: the GPU-written image did not settle");
+}
+
+// A smaller image over the first rows of a larger one (same width, tiling and texel size) lends
+// its pending results to the larger one's refresh by a device copy: nothing is stored to guest
+// memory and re-read, and the larger image takes over storing them.
+void RunLentRows(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+    using namespace AgcDriver::GuestMemory;
+    const auto address = AddressOf(block);
+    std::memset(block, 0x55, BlockBytes);
+    auto tall = TextureDescriptor(block, nullptr);
+    tall[2] = ((Side - 1u) >> 2u) | ((2 * Side - 1u) << 14u);
+    tall[6] = 0;
+    tall[7] = 0;
+    auto small = TextureDescriptor(block, nullptr);
+    small[6] = 0;
+    small[7] = 0;
+    std::vector<std::uint32_t> tallData(16, 0u);
+    std::copy(tall.begin(), tall.end(), tallData.begin() + 4);
+    std::vector<std::uint32_t> smallData(16, 0u);
+    std::copy(small.begin(), small.end(), smallData.begin() + 4);
+    std::lock_guard gpu(GpuMutex());
+    BumpCollectEpoch();
+    Dispatch(device, WriteCode, tallData);
+    const auto image = StorageTexture::FindPending(address, BlockBytes);
+    Require(image != nullptr && image->GuestBytes() == BlockBytes, "lent rows: the tall image has no pending results");
+    StorageTexture::FlushPending(address, BlockBytes, nullptr, "test lent rows");
+    device.WaitIdle();
+    for (int settle = 0; settle < 2; ++settle) {
+        BumpCollectEpoch();
+        image->Refresh();
+    }
+    BumpCollectEpoch();
+    Dispatch(device, WriteRowCode, smallData);
+    const auto lender = StorageTexture::FindPending(address, SurfaceBytes);
+    Require(lender != nullptr && lender != image && lender->GuestBytes() == SurfaceBytes, "lent rows: the small image has no pending results");
+    const auto before = StorageTexture::TrackCounters();
+    BumpCollectEpoch();
+    Require(!image->Refresh(), "lent rows: the small image's results did not reach the tall image");
+    const auto after = StorageTexture::TrackCounters();
+    Require(after.flushes == before.flushes, "lent rows: the refresh stored the small image instead of copying it");
+    Require(StorageTexture::FindPending(address, SurfaceBytes) == image, "lent rows: the tall image did not take over the small image's pending unit");
+    Require(Count(block, SurfaceBytes, 0xff) == Threads * 4u, "lent rows: the lent results reached guest memory before a write-back");
+    BumpCollectEpoch();
+    Require(image->Refresh(), "lent rows: a second refresh copied again");
+    StorageTexture::FlushPending(address, BlockBytes, nullptr, "test lent rows");
+    device.WaitIdle();
+    Require(Count(block, SurfaceBytes, 0xff) == 2u * Threads * 4u, "lent rows: the tall image's write-back lost the lent row or its own");
+    BumpCollectEpoch();
+    Require(lender->Refresh() == false || Count(block, SurfaceBytes, 0xff) == 2u * Threads * 4u, "lent rows: the small image lost the rows");
+}
+
+// The same surface bound under another storage format of the same texel size is the first
+// image's memory: it opens views on that image instead of having one of its own, its writes are
+// the first image's pending results, and nothing is copied, lent or stored between the two.
+void RunSharedAlias(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+    using namespace AgcDriver::GuestMemory;
+    constexpr std::uint32_t Format32Float = 22;
+    const auto address = AddressOf(block);
+    std::memset(block, 0x55, BlockBytes);
+    auto unorm = TextureDescriptor(block, nullptr);
+    unorm[6] = 0;
+    unorm[7] = 0;
+    auto single = unorm;
+    single[1] = (single[1] & ~(0x1ffu << 20u)) | (Format32Float << 20u);
+    std::vector<std::uint32_t> unormData(16, 0u);
+    std::copy(unorm.begin(), unorm.end(), unormData.begin() + 4);
+    std::vector<std::uint32_t> singleData(16, 0u);
+    std::copy(single.begin(), single.end(), singleData.begin() + 4);
+    std::lock_guard gpu(GpuMutex());
+    BumpCollectEpoch();
+    Dispatch(device, WriteCode, unormData);
+    const auto image = StorageTexture::FindPending(address, SurfaceBytes);
+    Require(image != nullptr && !image->SharesImage(), "shared alias: the RGBA8 surface has no pending image of its own");
+    StorageTexture::FlushPending(address, SurfaceBytes, nullptr, "test shared alias");
+    device.WaitIdle();
+    BumpCollectEpoch();
+    image->Refresh();
+    const auto shared = StorageTexture::SharedStorageCounts();
+    const auto before = StorageTexture::TrackCounters();
+    BumpCollectEpoch();
+    Dispatch(device, WriteRowCode, singleData);
+    Require(StorageTexture::SharedStorageCounts().created == shared.created + 1, "shared alias: the R32 binding of the surface did not share the RGBA8 image");
+    Require(StorageTexture::FindPending(address, SurfaceBytes) == image, "shared alias: the R32 writes are not the RGBA8 image's pending results");
+    BumpCollectEpoch();
+    Require(image->Refresh(), "shared alias: the shared image was uploaded after a write through its other format");
+    const auto after = StorageTexture::TrackCounters();
+    Require(after.flushes == before.flushes && after.uploadedBytes == before.uploadedBytes, "shared alias: the two formats copied or stored to each other");
+    StorageTexture::FlushPending(address, SurfaceBytes, nullptr, "test shared alias");
+    device.WaitIdle();
+    Require(Count(block, SurfaceBytes, 0xff) == Threads * 4u, "shared alias: the RGBA8 row was lost");
+    Require(Count(block, SurfaceBytes, 0x3f) == Threads, "shared alias: the R32 row did not reach guest memory");
+}
 
 #ifdef _WIN32
 void RunHintedImport(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
@@ -811,10 +966,18 @@ int main() {
             pendingSingle.emplace(true);
 #endif
             RunSingleKeysOverPendingImage(*device, pendingSingle->Data(), sampledOutput->Data());
-#ifndef _WIN32
             window.emplace(true);
             RunImportWindow(*device, window->Data());
-#else
+            std::optional<GuestBlock> tracked;
+            tracked.emplace(true);
+            RunTrackedImport(*device, tracked->Data());
+            std::optional<GuestBlock> lentRows;
+            lentRows.emplace(true);
+            RunLentRows(*device, lentRows->Data());
+            std::optional<GuestBlock> sharedAlias;
+            sharedAlias.emplace(true);
+            RunSharedAlias(*device, sharedAlias->Data());
+#ifdef _WIN32
             hinted.emplace(true);
             RunHintedImport(*device, hinted->Data());
 #endif

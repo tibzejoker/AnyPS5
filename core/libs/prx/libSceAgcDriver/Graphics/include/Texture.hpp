@@ -159,6 +159,27 @@ VkFormat SrgbTwinFormat(const Context& context, VkFormat format);
 class StorageTexture : public std::enable_shared_from_this<StorageTexture> {
 public:
     static std::shared_ptr<StorageTexture> Create(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel);
+    // Shared images (APS5_NO_SHARED_STORAGE=1 makes every surface its own image): a surface whose
+    // every (mip, layer) slice is a slice of a live cached image at one constant (mip, layer) offset
+    // (same guest bytes, extent, tiling, pitch, block rows and texel size, no tail mip, DCC keys
+    // either absent on both or the same at the same base) is that image's memory, as on the console.
+    // It gets no image of its own: its views open the root's image at the offset, and its state (the
+    // units the CPU or GPU wrote, refreshes, write-backs, keys) is the root's, so the two never copy,
+    // lend or store to each other. The root, or null when none qualifies.
+    static std::shared_ptr<StorageTexture> SharedRootFor(const Context& context, const GuestTextureResource& descriptor, std::uint32_t& level, std::uint32_t& layer);
+    static std::shared_ptr<StorageTexture> CreateShared(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel, std::shared_ptr<StorageTexture> root, std::uint32_t level, std::uint32_t layer);
+    // The image level and layer this surface's level 0, layer 0 is at (0 unless it shares a root's
+    // image): every subresource index into Image() is offset by them.
+    std::uint32_t ImageBaseLevel() const { return rootLevel; }
+    std::uint32_t ImageBaseLayer() const { return rootLayer; }
+    bool SharesImage() const { return root != nullptr; }
+    struct SharedCounts {
+        std::uint64_t created;
+        std::uint64_t refusedShape;
+        std::uint64_t refusedSlices;
+        std::uint64_t refusedKeys;
+    };
+    static SharedCounts SharedStorageCounts();
     ~StorageTexture();
     StorageTexture(const StorageTexture&) = delete;
     StorageTexture& operator=(const StorageTexture&) = delete;
@@ -325,16 +346,16 @@ public:
     // Content version: advances when the image is re-uploaded or a shader wrote it. Together with
     // Generation (the write generation guest memory was last known to match the content at) it
     // validates textures copied from this image.
-    std::uint64_t Version() const { return version; }
-    std::uint64_t Generation() const { return generation; }
+    std::uint64_t Version() const { return root != nullptr ? root->Version() : version; }
+    std::uint64_t Generation() const { return root != nullptr ? root->Generation() : generation; }
     // The DCC keys the content was uploaded under and the last scan of the surface's keys
     // (ProvedClearKeys): Refresh's own key rule for the fast revalidation. Under
     // GuestMemory::GpuMutex only, as Refresh is; never from a build's stage A.
-    DccKeys UploadedKeys() const { return uploadedKeys; }
-    DccKeys FilledKeys() const { return filledKeys; }
-    bool GuestSnapshotValid() const { return originalHolds(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)); }
-    DccKeyProof& KeyProof() const { return keyProof; }
-    DccRangeProof& TargetKeyProof() const { return targetKeyProof; }
+    DccKeys UploadedKeys() const { return root != nullptr ? root->UploadedKeys() : uploadedKeys; }
+    DccKeys FilledKeys() const { return root != nullptr ? root->FilledKeys() : filledKeys; }
+    bool GuestSnapshotValid() const { return root != nullptr ? root->GuestSnapshotValid() : originalHolds(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)); }
+    DccKeyProof& KeyProof() const { return root != nullptr ? root->KeyProof() : keyProof; }
+    DccRangeProof& TargetKeyProof() const { return root != nullptr ? root->TargetKeyProof() : targetKeyProof; }
     DccKeys ProvedKeys() const;
     bool ServesKeysAt(std::uint64_t dccAddress) const;
     // Brings the image up to date with guest memory before another use; returns whether its content
@@ -344,12 +365,39 @@ public:
     static std::uint64_t SinglePassMoves();
     static std::uint64_t RefreshesProved();
     static std::uint64_t UntrackedCompares();
+    // Write tracking totals since start (the [track] line prints them per 10 s): refreshes and how
+    // they settled, guest byte comparisons (untracked surfaces and `original` checks), uploads,
+    // flushes of other images' results the refresh had to make, and guest snapshots taken.
+    struct TrackTotals {
+        std::uint64_t refreshes = 0;
+        std::uint64_t proved = 0;
+        std::uint64_t clean = 0;
+        std::uint64_t compares = 0;
+        std::uint64_t comparedBytes = 0;
+        std::uint64_t originalCompares = 0;
+        std::uint64_t originalComparedBytes = 0;
+        std::uint64_t snapshotCompares = 0;
+        std::uint64_t snapshotComparedBytes = 0;
+        std::uint64_t uploads = 0;
+        std::uint64_t uploadedBytes = 0;
+        std::uint64_t flushes = 0;
+        std::uint64_t syncs = 0;
+        std::uint64_t captures = 0;
+        std::uint64_t capturedBytes = 0;
+    };
+    static TrackTotals TrackCounters();
+    // A sampled texture's snapshot compared with guest memory (ShaderResources), for the [track] line.
+    static void CountSnapshotCompare(std::size_t bytes);
     std::uint64_t GuestBytes() const;
     std::size_t OriginalSnapshotBytes() const { return original.capacity(); }
     VkDeviceSize AllocationBytes() const { return memoryBytes; }
 
 private:
-    StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel);
+    StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel, std::shared_ptr<StorageTexture> sharedRoot = nullptr, std::uint32_t level = 0, std::uint32_t layer = 0);
+    // The (level, layer) offset at which every slice of `geometry`'s surface at `descriptor` is a slice
+    // of this image, if any (SharedRootFor).
+    std::optional<std::pair<std::uint32_t, std::uint32_t>> holdsSlices(const GuestTextureResource& other, const SurfaceGeometry& otherGeometry, VkFormat otherFormat) const;
+    void markRangePending(std::uint64_t address, std::uint64_t bytes);
     // The regions of every array layer, or of the tracked layers `layers` selects.
     std::vector<VkBufferImageCopy> CopyRegions(const std::vector<bool>* layers = nullptr) const;
     // Uploads the surface, or only the tracked layers `layers` selects (the direct path; the others
@@ -478,6 +526,36 @@ private:
     // still the pending ones and a write-back for the range would store them.
     bool skippedResultsInside(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t borrowUnits(StorageTexture& source, const std::vector<bool>& units);
+    // Records a device copy of `regions` from `source` into this image (barriers both ways), kept
+    // by the open batch, counted as `bytes` of the alias upload path.
+    void copyFromImage(StorageTexture& source, std::span<const VkImageCopy> regions, std::uint64_t bytes);
+    // Subresource lending (APS5_NO_SUBRESOURCE_LEND=1 stores and re-reads as before): another
+    // pending image over part of this surface whose (mip, layer) slices in the overlap are slices
+    // of this image too (same guest range, extent, tiling, pitch and texel size) holds the newest
+    // bytes there when no block of its own over the overlap was stamped since its generation and
+    // none of this image's is pending. Refresh then leaves it out of its flush and, once its own
+    // units are current, copies those slices image to image; the lender's pending units inside
+    // the overlap become this image's (it stores them from now on, the lender no longer has to).
+    struct Lender {
+        std::shared_ptr<StorageTexture> image;
+        std::vector<VkImageCopy> regions;
+        std::uint64_t bytes = 0;
+        // (lender unit, this image's unit) of the lender's pending units inside the overlap.
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> transfers;
+        // Every slice pair is a whole subresource of both images (mip or layer containment, no row
+        // shift): the lender could be a view of this image.
+        bool wholeSubresources = false;
+    };
+    enum class LendRefusal : std::uint8_t { Shape, Slices, Stamped, Pending, Straddle, Count };
+    std::optional<Lender> lendable(StorageTexture& other, LendRefusal& refusal) const;
+    std::vector<Lender> pendingLenders(const StorageTexture* alias);
+    bool applyLenders(std::vector<Lender>& lenders);
+    struct LentCopy {
+        std::weak_ptr<StorageTexture> source;
+        std::uint64_t sourceVersion;
+        std::uint64_t version;
+    };
+    std::vector<LentCopy> lentCopies;
     void forgetBorrowed(std::uint32_t first, std::uint32_t count);
     bool clearByKeysFill(DccKeys keys, std::uint8_t key);
     bool overlaps(std::uint64_t address, std::size_t bytes) const;
@@ -557,6 +635,10 @@ private:
     std::map<std::uint32_t, VkImageView> elementLayerViews;
     std::int8_t singlePassState = -1;
     bool attachable = false;
+    // The image this surface shares (SharedRootFor) and its offset in it; null for an image of its own.
+    std::shared_ptr<StorageTexture> root;
+    std::uint32_t rootLevel = 0;
+    std::uint32_t rootLayer = 0;
     std::map<std::tuple<VkFormat, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t>, VkImageView> attachmentViews;
     VkImage proxyImage = VK_NULL_HANDLE;
     VkDeviceMemory proxyMemory = VK_NULL_HANDLE;

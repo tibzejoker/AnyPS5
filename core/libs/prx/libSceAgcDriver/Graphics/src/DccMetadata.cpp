@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -692,14 +693,43 @@ DccKeys EncodedKeys(const GuestTextureResource& resource, DccKeys keys) {
     return keys;
 }
 
-bool PendingFillsLeaveUncompressed(const Recorder& recorder, const GuestTextureResource& resource, std::size_t count) {
+// Key waits avoided and taken by WaitForKeyWriters (APS5_TRACK_STATS=1, the [dcc-wait] line): answered
+// by the recorded fills alone (uncompressed, or a clear code), and waits for a range under a unit
+// shadow and for a writer whose bytes are not known (a shader store, a copy).
+std::atomic<std::uint64_t> keysByFillsUncompressed{0}, keysByFillsClear{0}, keyWaitsShadowed{0}, keyWaitsUnknownWriter{0};
+std::atomic<long long> keyWaitReport{-1};
+
+void reportKeyWaits() {
+    static const bool enabled = std::getenv("APS5_TRACK_STATS") != nullptr;
+    if (!enabled) return;
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    auto previous = keyWaitReport.load(std::memory_order_relaxed);
+    if (previous == now || !keyWaitReport.compare_exchange_strong(previous, now)) return;
+    static std::array<std::uint64_t, 4> seen{};
+    const std::array<std::uint64_t, 4> current{keysByFillsUncompressed.load(), keysByFillsClear.load(), keyWaitsShadowed.load(), keyWaitsUnknownWriter.load()};
+    std::array<unsigned long long, 4> delta{};
+    for (std::size_t index = 0; index < current.size(); ++index) delta[index] = static_cast<unsigned long long>(current[index] - seen[index]);
+    seen = current;
+    if (previous < 0) return;
+    std::fprintf(stderr, "[dcc-wait] last 10 s: keys known from recorded fills without a wait: %llu uncompressed, %llu clear; GPU waits to read keys: %llu under a unit shadow, %llu behind a writer of unknown bytes\n", delta[0], delta[1], delta[2], delta[3]);
+}
+
+enum class FillKeys : std::uint8_t { Known, Shadowed, Unknown };
+
+// The keys the recorded fills leave over the surface's key range, newest first, with the bytes no
+// pending write covers read as they are: one uniform key byte the format encodes (uncompressed, or a
+// clear code) is known without waiting for the GPU. A pending writer whose bytes are not recorded
+// (value < 0) only allows the uncompressed answer, as before.
+std::optional<DccKeys> PendingFillKeys(const Recorder& recorder, const GuestTextureResource& resource, std::size_t count, FillKeys& why) {
     const auto begin = resource.dccAddress;
-    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), count) || AnyShadowedOverlaps(begin, count)) return false;
+    why = FillKeys::Shadowed;
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), count) || AnyShadowedOverlaps(begin, count)) return std::nullopt;
     auto writes = recorder.PendingWritesOver(begin, count);
     std::sort(writes.begin(), writes.end(), [](const Recorder::PendingWrite& a, const Recorder::PendingWrite& b) { return a.note > b.note; });
     std::vector<std::pair<std::uint64_t, std::uint64_t>> unwritten{{begin, begin + count}};
     int value = -1;
     bool mixed = false;
+    bool unknown = false;
     const auto see = [&](int key) {
         if (value < 0) value = key;
         else if (value != key) mixed = true;
@@ -718,7 +748,9 @@ bool PendingFillsLeaveUncompressed(const Recorder& recorder, const GuestTextureR
             if (write.end < to) rest.emplace_back(write.end, to);
         }
         unwritten = std::move(rest);
-        if (covered && write.value >= 0) see(write.value);
+        if (!covered) continue;
+        if (write.value >= 0) see(write.value);
+        else unknown = true;
     }
     for (const auto& [from, to] : unwritten) {
         if (mixed) break;
@@ -726,7 +758,18 @@ bool PendingFillsLeaveUncompressed(const Recorder& recorder, const GuestTextureR
         if (AllKeysEqual(keys + 1, static_cast<std::size_t>(to - from) - 1, keys[0])) see(keys[0]);
         else mixed = true;
     }
-    return mixed || (value >= 0 && EncodedKeys(resource, ByteKeys(static_cast<std::uint8_t>(value))) == DccKeys::Uncompressed);
+    why = FillKeys::Known;
+    if (mixed) return DccKeys::Uncompressed;
+    why = FillKeys::Unknown;
+    if (value < 0) return std::nullopt;
+    const auto keys = EncodedKeys(resource, ByteKeys(static_cast<std::uint8_t>(value)));
+    why = FillKeys::Known;
+    if (keys == DccKeys::Uncompressed) return DccKeys::Uncompressed;
+    if (unknown) {
+        why = FillKeys::Unknown;
+        return std::nullopt;
+    }
+    return keys;
 }
 
 }
@@ -737,7 +780,14 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
     if (metaAddress == 0 || count == 0 || !GuestMemory::GpuMutex().HeldByThisThread()) return std::nullopt;
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || !recorder->PendingWriteOverlaps(metaAddress, count) || PendingStoreKeys(*recorder, metaAddress, count).has_value()) return std::nullopt;
-    if (PendingFillsLeaveUncompressed(*recorder, resource, count)) return DccKeys::Uncompressed;
+    FillKeys why{};
+    if (const auto keys = PendingFillKeys(*recorder, resource, count, why)) {
+        (*keys == DccKeys::Uncompressed ? keysByFillsUncompressed : keysByFillsClear).fetch_add(1, std::memory_order_relaxed);
+        reportKeyWaits();
+        return keys;
+    }
+    (why == FillKeys::Shadowed ? keyWaitsShadowed : keyWaitsUnknownWriter).fetch_add(1, std::memory_order_relaxed);
+    reportKeyWaits();
     Recorder::CountSync(2);
     recorder->SyncThrough(metaAddress, count);
     return std::nullopt;

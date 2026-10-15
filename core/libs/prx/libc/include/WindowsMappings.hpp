@@ -51,6 +51,7 @@ public:
                 reset(cursor, size);
                 const DWORD flags = MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | (watched ? MEM_WRITE_WATCH : 0);
                 if (!allocate(GetCurrentProcess(), reinterpret_cast<void*>(cursor), size, flags, protection, nullptr, 0)) fail("replace guest placeholder with private memory");
+                privateAllocations[cursor] = cursor + size;
                 if (!created.empty() && created.back().first + created.back().second == cursor) created.back().second += size;
                 else created.emplace_back(cursor, size);
                 cursor += size;
@@ -436,9 +437,8 @@ public:
                     cursor = next == views.end() ? end : std::min(end, next->first);
                     continue;
                 }
-                const auto memory = query(cursor);
-                if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
-                const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+                const auto stop = std::min(end, privateEnd(cursor));
+                if (stop == 0) return false;
                 if (capacity == *count) return true;
                 const auto touched = (((stop + 4095) & ~static_cast<std::uintptr_t>(4095)) - (cursor & ~static_cast<std::uintptr_t>(4095))) / 4096;
                 ULONG_PTR available = std::min<ULONG_PTR>(capacity - *count, touched);
@@ -458,14 +458,35 @@ private:
             const auto base = cursor & ~(pageBytes - 1);
             if (const auto found = views.find(base); found != views.end()) {
                 if (found->second.protection == PAGE_NOACCESS || (found->second.resident && !watchResident)) return false;
+                if (found->second.resident) {
+                    const auto run = residentRuns.upper_bound(cursor);
+                    if (run != residentRuns.begin() && std::prev(run)->second.end > cursor) {
+                        const auto stop = std::min(end, std::prev(run)->second.end);
+                        for (auto it = std::next(found); it != views.end() && it->first < stop; ++it) {
+                            if (it->second.protection == PAGE_NOACCESS) return false;
+                        }
+                        cursor = stop;
+                        continue;
+                    }
+                }
                 cursor = std::min(end, base + pageBytes);
                 continue;
             }
-            const auto memory = query(cursor);
-            if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
-            cursor = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+            const auto stop = privateEnd(cursor);
+            if (stop == 0) return false;
+            cursor = std::min(end, stop);
         }
         return true;
+    }
+
+    // The end of the committed private memory holding `address` (0: none): a private allocation this
+    // class made from a placeholder (whole, committed until reset releases it) without asking the
+    // page tables, any other memory through VirtualQuery.
+    std::uintptr_t privateEnd(std::uintptr_t address) const {
+        if (const auto next = privateAllocations.upper_bound(address); next != privateAllocations.begin() && std::prev(next)->second > address) return std::prev(next)->second;
+        const auto memory = query(address);
+        if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return 0;
+        return reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
     }
 
     static constexpr std::size_t pageBytes = 0x4000;
@@ -532,6 +553,17 @@ private:
 
     void collectResident(std::uintptr_t start, Run& run, std::uintptr_t from, std::uintptr_t stop, void** pages, std::size_t* count, bool clear, Collection collection) {
         const auto first = from & ~std::uintptr_t{4095};
+        if (run.fresh == 0) {
+            // Every page of the run was collected once: the written pages are the answer, read
+            // straight into the caller's array (no per-page pass, no copy). Fresh selects none.
+            if (collection == Collection::Fresh) return;
+            ULONG_PTR reported = (stop - first + 4095) / 4096;
+            DWORD granularity = 0;
+            if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(first), stop - first, pages + *count, &reported, &granularity) != 0) fail("collect resident guest writes");
+            if (reported != 0 && reinterpret_cast<std::uintptr_t>(pages[*count]) < from) pages[*count] = reinterpret_cast<void*>(from);
+            *count += reported;
+            return;
+        }
         std::vector<std::uintptr_t> written;
         if (collection != Collection::Fresh) {
             std::vector<void*> found((stop - first + 4095) / 4096);
@@ -805,6 +837,7 @@ private:
             } else if (memory.Type == MEM_PRIVATE) {
                 if (const auto run = residentRuns.find(cursor); run != residentRuns.end()) evict(run);
                 if (!VirtualFree(reinterpret_cast<void*>(cursor), allocationEnd - cursor, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) fail("release private guest memory");
+                privateAllocations.erase(privateAllocations.lower_bound(cursor), privateAllocations.lower_bound(allocationEnd));
             } else {
                 throw std::runtime_error("unsupported guest mapping type");
             }
@@ -860,6 +893,7 @@ private:
     std::map<std::pair<std::uintptr_t, std::uint64_t>, Physical> physical;
     std::map<std::uintptr_t, Run> residentRuns;
     std::map<std::uintptr_t, std::size_t> splitAliases;
+    std::map<std::uintptr_t, std::uintptr_t> privateAllocations;
     std::size_t granularity = 0x10000;
     bool watchResident = false;
     std::mutex mutex;
