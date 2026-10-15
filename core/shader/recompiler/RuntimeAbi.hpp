@@ -9,7 +9,7 @@
 
 namespace ShaderRecompiler::RuntimeAbi {
 
-inline constexpr std::uint32_t Version = 9027u;
+inline constexpr std::uint32_t Version = 9028u;
 inline constexpr std::uint32_t DescriptorSet = 0u;
 inline constexpr std::uint32_t FragmentDescriptorSet = 1u;
 inline constexpr std::uint32_t StageCount = 4u;

@@ -1431,8 +1431,16 @@ bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint6
     return true;
 }
 
+std::atomic<void (*)(std::uint64_t, std::uint64_t)> markWrittenHook{nullptr};
+
+void SetMarkWrittenHook(void (*hook)(std::uint64_t address, std::uint64_t end)) {
+    markWrittenHook.store(hook, std::memory_order_release);
+}
+
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
     if (bytes == 0) return 0;
+    // The driver's own stores reach the device mirrors' hook like MarkWritten's reports.
+    if (const auto hook = markWrittenHook.load(std::memory_order_acquire); hook != nullptr) hook(address, address + bytes);
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
         ++tracker.generation;
@@ -1476,6 +1484,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 }
 
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
+    if (const auto hook = markWrittenHook.load(std::memory_order_acquire); hook != nullptr && bytes != 0) hook(address, address + bytes);
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
     tracker.initialize();

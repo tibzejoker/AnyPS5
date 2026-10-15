@@ -52,6 +52,8 @@ private:
     // same device addresses share one buffer while one of them is alive (see the table cache in
     // BdaResources.cpp, which refers to it weakly).
     void markWrittenPages() const;
+    // The table entries this use's lookups resolved on their slow path, to the device mirrors' hot set.
+    void reportTouched() const;
     std::shared_ptr<Buffer> table;
     std::unique_ptr<Buffer> fault;
     std::size_t tableBytes = 0;

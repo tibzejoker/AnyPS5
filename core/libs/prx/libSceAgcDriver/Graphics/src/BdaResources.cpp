@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DeviceMirrors.hpp"
 #include "ImageTableAbi.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
@@ -126,7 +127,7 @@ BdaResources::BdaResources(const Context& context) {
     static_assert(std::endian::native == std::endian::little);
     Require(ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA fault buffer exceeds storage buffer range limit");
     fault = std::make_unique<Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t));
+    std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::FaultBufferBytes);
 }
 
 BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory) : BdaResources(context) {
@@ -300,8 +301,30 @@ void BdaResources::SetImageTables(std::vector<ImageTableFaults> tables, std::vec
     imageTableRanges = std::move(ranges);
 }
 
+void BdaResources::reportTouched() const {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    if (table == nullptr) return;
+    auto* words = reinterpret_cast<std::uint32_t*>(fault->Bytes().data());
+    Abi::Header header{};
+    std::memcpy(&header, table->Bytes().data(), sizeof(header));
+    for (std::uint32_t word = 0; word < Abi::TouchedWords; ++word) {
+        auto bits = words[Abi::TouchedWord + word];
+        if (bits == 0u) continue;
+        words[Abi::TouchedWord + word] = 0u;
+        while (bits != 0u) {
+            const auto index = word * 32u + static_cast<std::uint32_t>(std::countr_zero(bits));
+            bits &= bits - 1u;
+            if (index >= header.count) continue;
+            Abi::Range range{};
+            std::memcpy(&range, table->Bytes().data() + sizeof(header) + static_cast<std::size_t>(index) * sizeof(range), sizeof(range));
+            NoteDeviceMirrorTouched(range.begin, range.end);
+        }
+    }
+}
+
 void BdaResources::markWrittenPages() const {
     namespace Abi = ShaderRecompiler::BdaAbi;
+    reportTouched();
     auto* words = reinterpret_cast<std::uint32_t*>(fault->Bytes().data());
     Require(words[Abi::WrittenOverflowWord] == 0, "more than " + std::to_string(Abi::WrittenPageSlots) + " chunks of " + std::to_string(Abi::WrittenChunkPages) + " pages stored to through the BDA table in one use are not implemented");
     const auto count = words[Abi::WrittenCountWord];

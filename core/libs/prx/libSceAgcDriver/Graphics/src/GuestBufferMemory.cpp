@@ -91,6 +91,8 @@ struct ImageMirror {
 struct GuestBufferMemory::AddressSpace {
     std::uint64_t generation = 0;
     std::uint64_t importsEpoch = 0;
+    // DeviceMirrorEpoch when the space was built: a new hot chunk or an eviction rebuilds it.
+    std::uint64_t mirrorEpoch = 0;
     VkDevice device = VK_NULL_HANDLE;
     // Identity for the life of this space (see CachedAddressTable).
     std::uint64_t serial = 0;
@@ -2393,6 +2395,7 @@ void GuestBufferMemory::AcquireRegistered() {
             else if (current->device != context.device) spaces.rebuiltDevice.fetch_add(1, std::memory_order_relaxed);
             else if (current->generation != generation) spaces.rebuiltGeneration.fetch_add(1, std::memory_order_relaxed);
             else if (current->importsEpoch != state.epoch) spaces.rebuiltEpoch.fetch_add(1, std::memory_order_relaxed);
+            else if (current->mirrorEpoch != DeviceMirrorEpoch()) spaces.rebuiltEpoch.fetch_add(1, std::memory_order_relaxed);
             else hit = true;
             importFloor = state.useCounter + 1;
             if (hit) {
@@ -2553,8 +2556,8 @@ void GuestBufferMemory::AcquireRegistered() {
                 built->device = context.device;
                 built->serial = spaces.serials.fetch_add(1, std::memory_order_relaxed) + 1;
                 built->lease = std::move(lease);
-                built->deviceMirrors = AssignDeviceMirrors(context, ranges, mirrorSources);
-                built->ranges = std::move(ranges);
+                built->mirrorEpoch = DeviceMirrorEpoch();
+                built->ranges = ChunkDeviceMirrors(context, std::move(ranges), mirrorSources, built->deviceMirrors);
                 std::vector<Region> extras;
                 for (auto& region : regions) {
                     if (region.direct != nullptr || region.mirror != nullptr) {
@@ -3773,7 +3776,7 @@ std::uint64_t GuestBufferMemory::LiveAddressSpaceSerial(VkDevice device) {
     if (current->generation != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return 0;
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
-    return current->importsEpoch == state.epoch ? current->serial : 0;
+    return current->importsEpoch == state.epoch && current->mirrorEpoch == DeviceMirrorEpoch() ? current->serial : 0;
 }
 
 std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTable() const {

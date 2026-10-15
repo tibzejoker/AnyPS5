@@ -61,7 +61,11 @@ inline constexpr std::uint32_t WrittenOverflowWord = sizeof(Fault) / sizeof(std:
 inline constexpr std::uint32_t WrittenCountWord = WrittenOverflowWord + 1;
 inline constexpr std::uint32_t WrittenSlotsWord = WrittenCountWord + 1;
 inline constexpr std::uint32_t WrittenListWord = WrittenSlotsWord + 2 * WrittenPageSlots;
-inline constexpr std::size_t FaultBufferBytes = (WrittenListWord + WrittenPageSlots) * sizeof(std::uint32_t);
+// One bit per BDA table entry a lookup's slow path resolved through (the first 65536 entries): the
+// driver's hot-set report for device mirrors (DeviceMirrors.hpp), cleared after each read.
+inline constexpr std::uint32_t TouchedWord = WrittenListWord + WrittenPageSlots;
+inline constexpr std::uint32_t TouchedWords = 2048;
+inline constexpr std::size_t FaultBufferBytes = (TouchedWord + TouchedWords) * sizeof(std::uint32_t);
 static_assert((WrittenPageSlots & (WrittenPageSlots - 1)) == 0);
 static_assert(WrittenChunkPages == 32);
 
