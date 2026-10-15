@@ -330,10 +330,14 @@ void Driver::execute(const Submission& submission) {
         cursor = nextCursor;
     }
 
-    if (submission.queue == 0) DrainDrawPipeline();
+    static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;
+    // POC: when the next submission is queued already (the end submit below is skipped), draws still
+    // in flight on the draw thread carry over into it (APS5_POC_DRAW_THREAD_KEEP_END=1).
+    static const bool keepEnd = std::getenv("APS5_POC_DRAW_THREAD_KEEP_END") != nullptr;
+    const bool nextQueued = submission.queue == 0 && !submitAtEnd && submission.rewindTail == nullptr && workerQueued() != nullptr && workerQueued()->load(std::memory_order_acquire) != 0;
+    if (submission.queue == 0 && !(keepEnd && nextQueued)) DrainDrawPipeline();
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
-    static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;
     if (!deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value() || Graphics::Recorder::RecordedWorkSinceSubmit() != 0) {
         auto& costs = submissionCosts(submission.queue);
         if (!submitAtEnd && submission.rewindTail == nullptr && submission.queue == 0 && workerQueued() != nullptr && workerQueued()->load(std::memory_order_acquire) != 0) {
