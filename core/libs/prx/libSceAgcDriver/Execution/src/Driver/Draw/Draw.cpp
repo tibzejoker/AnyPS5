@@ -20,15 +20,20 @@ namespace {
 
 // POC (APS5_POC_DRAW_THREAD=1): queue 0's draws are recorded on a thread of their own while the queue
 // worker prepares the next packet (decode, capture, shader lookup run unlocked; the recording takes
-// the GPU mutex). At most two draws are in flight; every packet other than a draw, a register write
+// the GPU mutex). At most APS5_POC_DRAW_THREAD_DEPTH (default 6) draws are in flight; every packet other than a draw, a register write
 // or a WAIT_REG_MEM, the end of a submission and any draw the worker records itself wait for them
 // (DrainDrawPipeline).
+std::size_t DrawThreadDepth() {
+    static const std::size_t depth = [] { const char* text = std::getenv("APS5_POC_DRAW_THREAD_DEPTH"); return text != nullptr ? std::max<std::size_t>(1, std::strtoull(text, nullptr, 10)) : std::size_t{6}; }();
+    return depth;
+}
+
 class DrawPipeline {
 public:
     void Push(std::function<void()> job) {
         std::unique_lock lock(mutex);
         if (!thread.joinable()) thread = std::thread([this] { run(); });
-        space.wait(lock, [&] { return jobs.size() + running < 2; });
+        space.wait(lock, [&] { return jobs.size() + running < DrawThreadDepth(); });
         jobs.push_back(std::move(job));
         ++inFlight;
         ready.notify_one();
