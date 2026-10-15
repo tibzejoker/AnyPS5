@@ -788,6 +788,10 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
     }
     (why == FillKeys::Shadowed ? keyWaitsShadowed : keyWaitsUnknownWriter).fetch_add(1, std::memory_order_relaxed);
     reportKeyWaits();
+    // POC: a writer of unknown key bytes is taken as leaving the surface uncompressed (the driver
+    // renders and stores uncompressed) instead of waiting for it. APS5_POC_GUESS_KEYS=1.
+    static const bool guess = std::getenv("APS5_POC_GUESS_KEYS") != nullptr;
+    if (guess && why == FillKeys::Unknown) return DccKeys::Uncompressed;
     Recorder::CountSync(2);
     recorder->SyncThrough(metaAddress, count);
     return std::nullopt;
