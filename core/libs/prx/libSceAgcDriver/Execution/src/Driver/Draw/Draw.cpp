@@ -20,7 +20,7 @@ namespace AgcDriver::DriverDetail {
 
 namespace {
 
-// POC (APS5_POC_DRAW_THREAD=1): queue 0's draws are recorded on a thread of their own while the queue
+// POC (on by default, APS5_POC_NO_DRAW_THREAD=1 disables): queue 0's draws are recorded on a thread of their own while the queue
 // worker prepares the next packet (decode, capture, shader lookup run unlocked; the recording takes
 // the GPU mutex). At most APS5_POC_DRAW_THREAD_DEPTH (default 6) draws are in flight; every packet other than a draw, a register write
 // or a WAIT_REG_MEM, the end of a submission and any draw the worker records itself wait for them
@@ -82,7 +82,7 @@ DrawPipeline& drawPipeline() {
 }
 
 bool DrawThreadEnabled() {
-    static const bool enabled = std::getenv("APS5_POC_DRAW_THREAD") != nullptr;
+    static const bool enabled = std::getenv("APS5_POC_NO_DRAW_THREAD") == nullptr;
     return enabled;
 }
 
