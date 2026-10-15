@@ -17,6 +17,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace AgcDriver {
@@ -64,9 +65,10 @@ void MakeUncached(std::vector<std::uint32_t>& spirv) {
     spirv.insert(spirv.begin() + static_cast<std::ptrdiff_t>(at), instruction.begin(), instruction.end());
 }
 
-// Pipeline creation time (fast-linked graphics libraries, then the optimized link the driver builds
-// in the background) of a replayed pixel shader request (APS5_DUMP_SHADERS) with a minimal vertex
-// shader, on uncached SPIR-V.
+// Pipeline creation time of a replayed pixel shader request (APS5_DUMP_SHADERS) with a minimal vertex
+// shader, on uncached SPIR-V: cold on the draw thread, after a registration-style background prebuild
+// of its fragment program, and while that prebuild still compiles (the draw must wait for it, not
+// compile the program again).
 void Time(AgcDriver::VulkanDevice& device, const char* path) {
     auto saved = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
     auto& request = saved.request;
@@ -114,14 +116,47 @@ void Time(AgcDriver::VulkanDevice& device, const char* path) {
     state.blend.colorWriteMask = 15;
     state.blends.assign(state.colors.size(), state.blend);
     const auto layouts = DescribeSetLayouts(context, shaders);
-    const auto start = std::chrono::steady_clock::now();
-    {
+    const auto milliseconds = [](auto from, auto to) { return std::chrono::duration<double, std::milli>(to - from).count(); };
+    const auto fresh = [&] {
+        auto words = pixel.spirv.Words();
+        MakeUncached(words);
+        pixel.spirv = std::move(words);
+        (pixel.specializationId != 0 ? pixel.specializationId : pixel.variantId) += 0x9e3779b97f4a7c15ull;
+    };
+    const auto build = [&] {
+        const auto start = std::chrono::steady_clock::now();
         Pipeline pipeline(context, state, VertexInputLayout{}, layouts.View(), shaders);
-        const auto linked = std::chrono::steady_clock::now();
-        WaitForOptimizedPipelines(context.device);
-        const auto optimized = std::chrono::steady_clock::now();
-        std::printf("%s: %zu SPIR-V words, recompile %.1f ms, pipeline %.1f ms, optimized link %.1f ms\n", path, pixel.spirv.size(), recompileMs, std::chrono::duration<double, std::milli>(linked - start).count(), std::chrono::duration<double, std::milli>(optimized - linked).count());
-    }
+        return milliseconds(start, std::chrono::steady_clock::now());
+    };
+    const auto fragmentParts = [&] { return PipelineLibraryCountersOf(context.device).built[2]; };
+    const auto prebuild = [&] {
+        const std::array<CompiledShader, 1> fragment{{{ShaderStage::Fragment, &pixel, pixelPush}}};
+        static_cast<void>(device.PrebuildGraphicsLibraries(state.stages, fragment));
+    };
+    // (1) Cold, on the draw thread, as a draw without a prebuild compiles it.
+    const auto cold = build();
+    WaitForOptimizedPipelines(context.device);
+    // (2) After a background prebuild of the fragment program: the draw only links.
+    fresh();
+    const auto prebuildStart = std::chrono::steady_clock::now();
+    std::thread(prebuild).join();
+    const auto prebuildMs = milliseconds(prebuildStart, std::chrono::steady_clock::now());
+    const auto before = fragmentParts();
+    const auto prebuilt = build();
+    const bool reused = fragmentParts() == before;
+    WaitForOptimizedPipelines(context.device);
+    // (3) A draw arriving while the prebuild still compiles waits for that compile, not a second one.
+    fresh();
+    const auto overlapBefore = fragmentParts();
+    std::thread background(prebuild);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto overlapped = build();
+    background.join();
+    const auto compiles = fragmentParts() - overlapBefore;
+    WaitForOptimizedPipelines(context.device);
+    std::printf("%s: %zu SPIR-V words, recompile %.1f ms; pipeline cold %.1f ms; background prebuild %.1f ms then draw pipeline %.1f ms (fragment part reused %d); draw during the prebuild %.1f ms, fragment compiles %llu\n", path, pixel.spirv.size(), recompileMs, cold, prebuildMs, prebuilt, reused ? 1 : 0, overlapped, static_cast<unsigned long long>(compiles));
+    Require(reused, "the draw compiled the fragment program its prebuild had compiled");
+    Require(compiles == 1u, "a draw during a prebuild of its fragment program compiled it a second time");
 }
 
 }

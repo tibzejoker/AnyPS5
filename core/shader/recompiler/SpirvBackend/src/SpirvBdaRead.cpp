@@ -239,23 +239,20 @@ std::uint32_t DefineBdaSpanReadFunction(SpirvEmitterState& state, bool coherent,
 
 
 
-std::uint32_t BdaSpanMissResultType(SpirvEmitterState& state) {
-    const auto u64 = TypeScalarU64(state);
-    return state.module.Type(spv::OpTypeStruct, BdaSpanReadResultType(state), u64, u64, u64);
-}
-
-// A read site's miss: the full span read, then the range probe_bda_pointer cached for it, which the
-// site keeps in main's variables for its later reads.
+// A read site's miss: the full span read, then the range probe_bda_pointer cached for it, stored
+// through the pointers to main's site variables as begin, end and device delta (device address
+// minus guest address; the end is 0, no range, when the delta is not 4-aligned).
 std::uint32_t DefineBdaSpanMissFunction(SpirvEmitterState& state, bool coherent, std::uint32_t full) {
     const auto u32 = TypeU32(state);
     const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
     const auto result = BdaSpanReadResultType(state);
-    const auto missType = BdaSpanMissResultType(state);
+    const auto pointer = TypePointer(state, spv::StorageClassFunction, u64);
     const auto function = state.module.AllocateId();
     state.module.AddName(function, std::string("read_bda_span_miss") + (state.bdaStopsInvocations ? "_stop" : "") + (coherent ? "_coherent" : ""));
-    state.module.AddFunction(spv::OpFunction, missType, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, missType, u64, u32, u32, u32));
-    std::array<std::uint32_t, 4> parameters{};
-    const std::array<std::uint32_t, 4> types{u64, u32, u32, u32};
+    state.module.AddFunction(spv::OpFunction, result, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, result, u64, u32, u32, u32, pointer, pointer, pointer));
+    std::array<std::uint32_t, 7> parameters{};
+    const std::array<std::uint32_t, 7> types{u64, u32, u32, u32, pointer, pointer, pointer};
     for (std::size_t index = 0; index < parameters.size(); ++index) {
         parameters[index] = state.module.AllocateId();
         state.module.AddFunction(spv::OpFunctionParameter, types[index], parameters[index]);
@@ -268,9 +265,12 @@ std::uint32_t DefineBdaSpanMissFunction(SpirvEmitterState& state, bool coherent,
         range[index] = state.module.AllocateId();
         state.module.AddFunction(spv::OpLoad, u64, range[index], state.bdaProbeCache[index]);
     }
-    const auto value = state.module.AllocateId();
-    state.module.AddFunction(spv::OpCompositeConstruct, missType, value, read, range[0], range[1], range[2]);
-    state.module.AddFunction(spv::OpReturnValue, value);
+    const auto delta = Binary(state, spv::OpISub, u64, range[2], range[0]);
+    const auto aligned = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u64, delta, BdaConstant(state, 3u)), BdaConstant(state, 0u));
+    state.module.AddFunction(spv::OpStore, parameters[4], range[0]);
+    state.module.AddFunction(spv::OpStore, parameters[5], Select(state, u64, aligned, range[1], BdaConstant(state, 0u)));
+    state.module.AddFunction(spv::OpStore, parameters[6], delta);
+    state.module.AddFunction(spv::OpReturnValue, read);
     state.module.AddFunction(spv::OpFunctionEnd);
     return function;
 }
@@ -638,7 +638,6 @@ std::uint32_t EmitBdaSpanSite(SpirvValueEmitContext& ctx, const IrValue& inst, s
     const auto delta = static_cast<std::int64_t>(static_cast<std::int32_t>(offset)) + static_cast<std::int64_t>(first) * 4;
     const auto magnitude = BdaConstant(state, static_cast<std::uint64_t>(delta < 0 ? -delta : delta));
     const auto firstAddress = Binary(state, delta < 0 ? spv::OpISub : spv::OpIAdd, u64, address, magnitude);
-    const auto wrapped = delta < 0 ? Binary(state, spv::OpUGreaterThan, boolean, magnitude, address) : Binary(state, spv::OpULessThan, boolean, firstAddress, address);
     const auto spanBytes = (last + 1u - first) * 4u;
     const auto end = Binary(state, spv::OpIAdd, u64, firstAddress, BdaConstant(state, spanBytes));
     const auto load = [&](std::uint32_t variable) {
@@ -646,13 +645,13 @@ std::uint32_t EmitBdaSpanSite(SpirvValueEmitContext& ctx, const IrValue& inst, s
         state.module.AddFunction(spv::OpLoad, u64, value, variable);
         return value;
     };
-    const auto begin = load(state.bdaSiteCache[0]);
-    auto hit = Binary(state, spv::OpLogicalAnd, boolean, Unary(state, spv::OpLogicalNot, boolean, wrapped), Binary(state, spv::OpUGreaterThan, boolean, end, firstAddress));
-    hit = Binary(state, spv::OpLogicalAnd, boolean, hit, Binary(state, spv::OpUGreaterThanEqual, boolean, firstAddress, begin));
+    // Guest addresses are 48-bit (V# bases, user data pointers), so the span cannot wrap; a cached
+    // range has a 4-aligned delta, so a 4-aligned guest address is a 4-aligned device address.
+    auto hit = Binary(state, spv::OpUGreaterThanEqual, boolean, firstAddress, load(state.bdaSiteCache[0]));
     hit = Binary(state, spv::OpLogicalAnd, boolean, hit, Binary(state, spv::OpULessThanEqual, boolean, end, load(state.bdaSiteCache[1])));
-    const auto physical = Binary(state, spv::OpIAdd, u64, load(state.bdaSiteCache[2]), Binary(state, spv::OpISub, u64, firstAddress, begin));
-    hit = Binary(state, spv::OpLogicalAnd, boolean, hit, Unary(state, spv::OpLogicalNot, boolean, BdaAddressUnaligned(state, physical)));
+    hit = Binary(state, spv::OpLogicalAnd, boolean, hit, Unary(state, spv::OpLogicalNot, boolean, BdaAddressUnaligned(state, firstAddress)));
     return EmitValueIfElse(state, hit, result, [&] {
+        const auto physical = Binary(state, spv::OpIAdd, u64, firstAddress, load(state.bdaSiteCache[2]));
         std::array<std::uint32_t, 4> parts{};
         for (std::uint32_t dword = 0; dword < 4u; ++dword) {
             if ((used & (1u << dword)) == 0u) {
@@ -660,7 +659,7 @@ std::uint32_t EmitBdaSpanSite(SpirvValueEmitContext& ctx, const IrValue& inst, s
                 continue;
             }
             const auto pointer = state.module.AllocateId();
-            state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, Binary(state, spv::OpIAdd, u64, physical, BdaConstant(state, (dword - first) * 4u)));
+            state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, dword == first ? physical : Binary(state, spv::OpIAdd, u64, physical, BdaConstant(state, (dword - first) * 4u)));
             parts[dword] = state.module.AllocateId();
             if (coherent) state.module.AddFunction(spv::OpAtomicLoad, u32, parts[dword], pointer, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0u));
             else state.module.AddFunction(spv::OpLoad, u32, parts[dword], pointer, BdaAccessMask(coherent), 4u);
@@ -672,16 +671,9 @@ std::uint32_t EmitBdaSpanSite(SpirvValueEmitContext& ctx, const IrValue& inst, s
         state.module.AddFunction(spv::OpCompositeConstruct, result, value, values, ConstantU32(state, 0u));
         return value;
     }, [&] {
-        const auto miss = state.module.AllocateId();
-        state.module.AddFunction(spv::OpFunctionCall, BdaSpanMissResultType(state), miss, state.bdaSpanMissFunctions[state.bdaStopsInvocations][coherent], address, ConstantU32(state, offset), ConstantU32(state, used), instruction);
-        for (std::uint32_t index = 0; index < 3u; ++index) {
-            const auto value = state.module.AllocateId();
-            state.module.AddFunction(spv::OpCompositeExtract, u64, value, miss, index + 1u);
-            state.module.AddFunction(spv::OpStore, state.bdaSiteCache[index], value);
-        }
-        const auto value = state.module.AllocateId();
-        state.module.AddFunction(spv::OpCompositeExtract, result, value, miss, 0u);
-        return value;
+        const auto read = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionCall, result, read, state.bdaSpanMissFunctions[state.bdaStopsInvocations][coherent], address, ConstantU32(state, offset), ConstantU32(state, used), instruction, state.bdaSiteCache[0], state.bdaSiteCache[1], state.bdaSiteCache[2]);
+        return read;
     });
 }
 

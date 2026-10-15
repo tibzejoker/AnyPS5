@@ -527,7 +527,10 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             prebuilt = true;
             return;
         }
-        if (libraries) pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
+        if (libraries) {
+            NoteDrawDepthFormat(state.depth.has_value() ? state.depth->format : VK_FORMAT_UNDEFINED);
+            pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
+        }
         else {
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
             Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateGraphicsPipelines");
@@ -550,6 +553,33 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         release();
         throw;
     }
+}
+
+namespace {
+
+struct SeenDepthFormats {
+    std::mutex mutex;
+    std::vector<VkFormat> formats;
+};
+
+SeenDepthFormats& drawDepthFormats() {
+    static auto* formats = new SeenDepthFormats();
+    return *formats;
+}
+
+}
+
+void NoteDrawDepthFormat(VkFormat format) {
+    auto& seen = drawDepthFormats();
+    std::lock_guard lock(seen.mutex);
+    if (std::find(seen.formats.begin(), seen.formats.end(), format) != seen.formats.end() || seen.formats.size() >= 4u) return;
+    seen.formats.push_back(format);
+}
+
+std::vector<VkFormat> DrawDepthFormats() {
+    auto& seen = drawDepthFormats();
+    std::lock_guard lock(seen.mutex);
+    return seen.formats;
 }
 
 bool Pipeline::Prebuild(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders) {
@@ -935,7 +965,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
     if (disabled) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     auto& store = Pipelines();
-    std::lock_guard lock(store.mutex);
+    std::unique_lock lock(store.mutex);
     reportPipelines(store);
     auto& key = store.scratchKey;
     pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
@@ -967,8 +997,17 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     for (auto it = store.entries.begin(); it != store.entries.end();) {
         it = alive(*it, context) ? std::next(it) : abandon(store, it);
     }
+    // Built without the store's lock: a compile here (seconds for a large program) must not hold up
+    // the lookups of other threads, nor the library prebuilds they wait on.
+    auto ownKey = key;
+    lock.unlock();
     auto pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
-    store.entries.push_back({context.device, context.bufferPool, hash, key, pipeline});
+    lock.lock();
+    if (const auto raced = store.index.find(hash); raced != store.index.end()) {
+        if (raced->second->key == ownKey && alive(*raced->second, context)) return raced->second->pipeline;
+        return pipeline;
+    }
+    store.entries.push_back({context.device, context.bufferPool, hash, std::move(ownKey), pipeline});
     store.index[hash] = std::prev(store.entries.end());
     constexpr std::size_t bound = 1024;
     while (store.entries.size() > bound) {

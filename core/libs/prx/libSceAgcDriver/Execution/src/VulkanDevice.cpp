@@ -3281,7 +3281,17 @@ bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stage
         else group.push_back({ShaderRecompiler::ShaderStage::Fragment, fragmentStub.get(), Graphics::PipelinePushSlotBytes});
     }
     const auto layouts = Graphics::DescribeSetLayouts(context, group);
-    return Graphics::Pipeline::Prebuild(context, state, Graphics::VertexInputLayout{}, layouts.View(), group);
+    // One fragment part per depth format draws used so far (its attachment formats are part of the
+    // fragment library's key), none when no draw has been seen yet.
+    auto formats = Graphics::DrawDepthFormats();
+    if (formats.empty()) formats.push_back(VK_FORMAT_UNDEFINED);
+    bool built = false;
+    for (const auto format : formats) {
+        state.depth.reset();
+        if (format != VK_FORMAT_UNDEFINED) state.depth = Graphics::DepthTarget{0, 0, {1, 1}, format, 1.0f, 0};
+        built |= Graphics::Pipeline::Prebuild(context, state, Graphics::VertexInputLayout{}, layouts.View(), group);
+    }
+    return built;
 }
 
 void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipe) {

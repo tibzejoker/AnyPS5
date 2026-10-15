@@ -1,6 +1,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdio>
+#include <set>
 #include <condition_variable>
 #include <cstdlib>
 #include <deque>
@@ -42,12 +46,35 @@ struct DeviceLibraries {
     std::vector<VkShaderModule> modules;
     std::map<Key, VkPipelineLayout> layouts;
     std::array<std::map<Key, VkPipeline>, 4> parts;
+    // Parts some thread is compiling now (another thread needing one waits for it, see below), and
+    // parts a background prebuild made that no draw has used yet (the [pipelines] prebuilt hits).
+    std::array<std::set<Key>, 4> compiling;
+    std::array<std::set<Key>, 4> prebuilt;
     PipelineLibraryCounters counters;
+};
+
+// [pipelines], every 10 s: library parts compiled on draw threads (the draw waits for them) and in
+// the background (registration prebuilds), with their compile time; draws that found a prebuilt part,
+// and draws that waited for a part another thread was compiling.
+struct PipelineTotals {
+    std::array<std::uint64_t, 4> drawParts{};
+    std::array<std::uint64_t, 4> backgroundParts{};
+    double drawMs = 0;
+    double backgroundMs = 0;
+    double maxDrawMs = 0;
+    std::uint64_t prebuiltHits = 0;
+    std::uint64_t waits = 0;
+    double waitMs = 0;
+    std::uint64_t links = 0;
+    double linkMs = 0;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
 };
 
 struct LibraryStore {
     std::mutex mutex;
     std::map<VkDevice, DeviceLibraries> devices;
+    PipelineTotals totals;
+    std::condition_variable compiled;
     std::condition_variable idle;
     std::condition_variable work;
     std::deque<std::pair<VkDevice, std::function<void()>>> jobs;
@@ -81,6 +108,21 @@ void enqueue(LibraryStore& store, VkDevice device, std::function<void()> job) {
     ++store.pending[device];
     store.jobs.emplace_back(device, std::move(job));
     store.work.notify_one();
+}
+
+void reportPipelines(PipelineTotals& totals) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - totals.last < std::chrono::seconds(10)) return;
+    totals.last = now;
+    const auto sum = [](const std::array<std::uint64_t, 4>& parts) { return parts[0] + parts[1] + parts[2] + parts[3]; };
+    if (sum(totals.drawParts) + sum(totals.backgroundParts) + totals.prebuiltHits + totals.waits + totals.links == 0) return;
+    std::fprintf(stderr, "[pipelines] last 10 s: library parts compiled on draw threads %llu (vertex input %llu, pre-rasterization %llu, fragment %llu, output %llu) in %.0f ms (longest %.0f ms), in the background %llu (vertex input %llu, pre-rasterization %llu, fragment %llu, output %llu) in %.0f ms; draws using a prebuilt part %llu; waits for a part compiling elsewhere %llu (%.0f ms); links %llu (%.0f ms)\n",
+        static_cast<unsigned long long>(sum(totals.drawParts)), static_cast<unsigned long long>(totals.drawParts[0]), static_cast<unsigned long long>(totals.drawParts[1]), static_cast<unsigned long long>(totals.drawParts[2]), static_cast<unsigned long long>(totals.drawParts[3]), totals.drawMs, totals.maxDrawMs,
+        static_cast<unsigned long long>(sum(totals.backgroundParts)), static_cast<unsigned long long>(totals.backgroundParts[0]), static_cast<unsigned long long>(totals.backgroundParts[1]), static_cast<unsigned long long>(totals.backgroundParts[2]), static_cast<unsigned long long>(totals.backgroundParts[3]), totals.backgroundMs,
+        static_cast<unsigned long long>(totals.prebuiltHits), static_cast<unsigned long long>(totals.waits), totals.waitMs, static_cast<unsigned long long>(totals.links), totals.linkMs);
+    const auto last = totals.last;
+    totals = {};
+    totals.last = last;
 }
 
 Key Combined(const Key& part, const Key& context) {
@@ -168,7 +210,18 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         if (part == 0 && mesh) continue;
         const auto key = Combined(*partKeys[part], *contextKeys[part]);
         auto& cache = device.parts[part];
+        // A part another thread is compiling (a prebuild, or a draw of another queue) is waited for,
+        // not compiled again: the wait overlaps every other compile in flight.
+        if (device.compiling[part].contains(key)) {
+            const auto waitStart = std::chrono::steady_clock::now();
+            store.compiled.wait(lock, [&] { return !device.compiling[part].contains(key); });
+            if (!partsOnly) {
+                ++store.totals.waits;
+                store.totals.waitMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+            }
+        }
         if (const auto found = cache.find(key); found != cache.end()) {
+            if (!partsOnly && device.prebuilt[part].erase(key) != 0u) ++store.totals.prebuiltHits;
             libraries.push_back(found->second);
             continue;
         }
@@ -205,13 +258,27 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             break;
         }
         VkPipeline handle = VK_NULL_HANDLE;
-        if (partsOnly) lock.unlock();
+        // Compiled without the store's lock (other parts compile meanwhile), marked as in flight.
+        device.compiling[part].insert(key);
+        lock.unlock();
+        const auto compileStart = std::chrono::steady_clock::now();
         VkResult created;
         {
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
             created = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &handle);
         }
-        if (partsOnly) lock.lock();
+        const auto compileMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - compileStart).count();
+        lock.lock();
+        device.compiling[part].erase(key);
+        store.compiled.notify_all();
+        if (partsOnly) {
+            ++store.totals.backgroundParts[part];
+            store.totals.backgroundMs += compileMs;
+        } else {
+            ++store.totals.drawParts[part];
+            store.totals.drawMs += compileMs;
+            store.totals.maxDrawMs = std::max(store.totals.maxDrawMs, compileMs);
+        }
         Check(created, "vkCreateGraphicsPipelines library");
         if (const auto raced = cache.find(key); raced != cache.end()) {
             device.destroyPipeline(context.device, handle, nullptr);
@@ -219,6 +286,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
             continue;
         }
         cache.emplace(key, handle);
+        if (partsOnly) device.prebuilt[part].insert(key);
         if (optimize) {
             for (std::uint32_t stage = 0; stage < create.stageCount; ++stage) {
                 for (auto& module : modules) {
@@ -232,18 +300,26 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         libraries.push_back(handle);
     }
     if (partsOnly) return VK_NULL_HANDLE;
+    reportPipelines(store.totals);
     PerformanceTimer timing("Vulkan.GraphicsPipelineLink");
+    const auto linkStart = std::chrono::steady_clock::now();
     VkPipelineLibraryCreateInfoKHR linked{VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR};
     linked.libraryCount = static_cast<std::uint32_t>(libraries.size());
     linked.pLibraries = libraries.data();
     VkGraphicsPipelineCreateInfo create{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &linked};
     create.layout = info.layout;
     VkPipeline pipeline = VK_NULL_HANDLE;
+    lock.unlock();
+    VkResult linkedResult;
     {
         auto pipelineCacheLock = context.LockPipelineCacheForUse();
-        Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &pipeline), "vkCreateGraphicsPipelines link");
+        linkedResult = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &pipeline);
     }
+    lock.lock();
+    Check(linkedResult, "vkCreateGraphicsPipelines link");
     ++device.counters.linked;
+    ++store.totals.links;
+    store.totals.linkMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - linkStart).count();
     if (optimize && optimized != nullptr) {
         auto slot = std::make_shared<OptimizedPipeline>();
         slot->device = context.device;
@@ -293,6 +369,10 @@ void ClearPipelineLibraries(VkDevice device) {
     auto& store = Libraries();
     std::unique_lock lock(store.mutex);
     store.idle.wait(lock, [&] { return store.pending[device] == 0; });
+    store.compiled.wait(lock, [&] {
+        const auto devices = store.devices.find(device);
+        return devices == store.devices.end() || std::all_of(devices->second.compiling.begin(), devices->second.compiling.end(), [](const auto& parts) { return parts.empty(); });
+    });
     const auto found = store.devices.find(device);
     if (found == store.devices.end()) return;
     auto& libraries = found->second;

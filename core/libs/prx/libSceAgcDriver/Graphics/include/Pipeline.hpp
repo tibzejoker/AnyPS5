@@ -100,6 +100,10 @@ private:
 // A configuration whose stage has no variant id gets a private pipeline. Entries are LRU-bounded and
 // only evicted once no recorded draw holds them. Debug aid: APS5_NO_PIPELINE_CACHE=1 builds one per
 // draw as before.
+// The depth formats (VK_FORMAT_UNDEFINED: none) of the pipelines draws built from libraries, the
+// first four seen: a registration prebuild compiles a fragment program for each, as draws will need it.
+void NoteDrawDepthFormat(VkFormat format);
+std::vector<VkFormat> DrawDepthFormats();
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 struct DescribedSetLayouts {
