@@ -1,6 +1,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -46,6 +48,8 @@ public:
 
 private:
     void run() {
+        PinWorkerThread("draw thread");
+        if (std::getenv("APS5_SAMPLE_DRAW_THREAD") != nullptr) StartWorkerSampler();
         std::unique_lock lock(mutex);
         for (;;) {
             ready.wait(lock, [&] { return !jobs.empty(); });

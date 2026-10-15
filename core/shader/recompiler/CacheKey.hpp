@@ -93,6 +93,7 @@ private:
         append(key, RayTracingMiss());
         append(key, ImageTableRegistry::PocNoGraphicsBda());
         append(key, ImageTableRegistry::GpuResolvedStage(IrShaderStage::Pixel));
+        append(key, std::getenv("APS5_BDA_FAULTS") != nullptr);
     }
 
     static void appendMesh(std::vector<std::uint64_t>& key, const RecompileRequest& request) {
