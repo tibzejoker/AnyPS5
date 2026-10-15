@@ -125,6 +125,19 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     fail(binary(spv::OpUGreaterThan, boolean, end, finish), BdaAbi::FaultReason::Unmapped);
     fail(binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, permissions, constant(permission)), constant(permission)), BdaAbi::FaultReason::Permission);
     fail(binary(spv::OpIEqual, boolean, base, BdaConstant(state, 0)), BdaAbi::FaultReason::InvalidTable);
+    if (state.faultBufferVariable != 0) {
+        // The entry joins the hot set the driver mirrors (BdaAbi::TouchedWord): a plain load first,
+        // so the lanes after the first leave the bitmap untouched.
+        const auto entryIndex = binary(spv::OpISub, u32, index, constant(1));
+        EmitIfCondition(state, binary(spv::OpULessThan, boolean, entryIndex, constant(BdaAbi::TouchedWords * 32u)), [&] {
+            const auto word = BdaWord(state, state.faultBufferVariable, binary(spv::OpIAdd, u32, constant(BdaAbi::TouchedWord), binary(spv::OpShiftRightLogical, u32, entryIndex, constant(5))));
+            const auto bit = binary(spv::OpShiftLeftLogical, u32, constant(1), binary(spv::OpBitwiseAnd, u32, entryIndex, constant(31)));
+            const auto current = load(word);
+            EmitIfCondition(state, binary(spv::OpIEqual, boolean, binary(spv::OpBitwiseAnd, u32, current, bit), constant(0)), [&] {
+                state.module.AddFunction(spv::OpAtomicOr, u32, state.module.AllocateId(), word, constant(spv::ScopeDevice), constant(spv::MemorySemanticsMaskNone), bit);
+            });
+        });
+    }
     const auto offset = binary(spv::OpISub, u64, address, begin);
     const auto result = binary(spv::OpIAdd, u64, base, offset);
     fail(binary(spv::OpULessThan, boolean, result, base), BdaAbi::FaultReason::Overflow);

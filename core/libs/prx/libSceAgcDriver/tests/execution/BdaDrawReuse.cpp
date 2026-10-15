@@ -12,6 +12,8 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "VulkanTestDevice.hpp"
 #include <array>
+#include <thread>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <iostream>
@@ -120,6 +122,17 @@ void Run(AgcDriver::VulkanDevice& device) {
         bool drawn;
     };
     constexpr std::array<Round, 5> rounds{{{"first draw", false, 0.0f, true}, {"same draw again", false, 0.0f, true}, {"user data naming another table", true, 0.0f, false}, {"vertex data moved off screen in place", false, 8.0f, false}, {"vertex data moved back in place", false, 0.0f, true}}};
+    // The chunks the first use reads join the device mirrors' hot set (DeviceMirrors.hpp): the next
+    // address space, at most 50 ms later, mirrors them or leaves them on their import for good. The
+    // rounds start once that set settled.
+    for (int warmup = 0; warmup < 2; ++warmup) {
+        table(guest.descriptor);
+        writeVertices(guest.vertices, 0.0f);
+        device.Draw(state, draw, shaders);
+        device.SubmitRecorded(false);
+        device.WaitIdle();
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    }
     std::uint64_t hits = 0;
     for (std::size_t index = 0; index < rounds.size(); ++index) {
         const auto& round = rounds[index];
