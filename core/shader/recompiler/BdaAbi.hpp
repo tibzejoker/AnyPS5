@@ -8,7 +8,7 @@
 
 namespace ShaderRecompiler::BdaAbi {
 
-inline constexpr std::uint32_t Version = 1;
+inline constexpr std::uint32_t Version = 2;
 inline constexpr std::uint32_t Read = 1;
 inline constexpr std::uint32_t Write = 2;
 
@@ -19,13 +19,18 @@ struct Header {
     std::uint32_t reserved;
 };
 
+// deviceAddress serves reads; stores and atomics go to hostAddress when it is nonzero (a range
+// served by a device-local mirror of host-imported guest memory: the stores write through to the
+// guest bytes the CPU and the other GPU paths read, and to the mirror, see SpirvBdaRead).
 struct Range {
     std::uint64_t begin;
     std::uint64_t end;
     std::uint64_t deviceAddress;
     std::uint32_t permissions;
     std::uint32_t reserved;
+    std::uint64_t hostAddress = 0;
 };
+inline constexpr std::uint32_t RangeWords = 10;
 
 enum class FaultState : std::uint32_t { Empty, Writing, Ready };
 enum class FaultReason : std::uint32_t { Unmapped = 1, Permission, Overflow, InvalidTable, InvalidRectangle, LoopLimit, Unaligned, InvalidDescriptor, ImageTable };
@@ -41,8 +46,8 @@ struct Fault {
 };
 
 static_assert(std::is_standard_layout_v<Header> && std::is_trivially_copyable_v<Header> && sizeof(Header) == 16);
-static_assert(std::is_standard_layout_v<Range> && std::is_trivially_copyable_v<Range> && sizeof(Range) == 32);
-static_assert(offsetof(Range, deviceAddress) == 16 && offsetof(Range, permissions) == 24);
+static_assert(std::is_standard_layout_v<Range> && std::is_trivially_copyable_v<Range> && sizeof(Range) == RangeWords * 4u);
+static_assert(offsetof(Range, deviceAddress) == 16 && offsetof(Range, permissions) == 24 && offsetof(Range, hostAddress) == 32);
 static_assert(std::is_standard_layout_v<Fault> && std::is_trivially_copyable_v<Fault> && sizeof(Fault) == 32);
 static_assert(offsetof(Fault, address) == 8 && offsetof(Fault, instruction) == 24);
 

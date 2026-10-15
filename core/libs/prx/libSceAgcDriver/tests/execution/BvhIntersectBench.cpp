@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
@@ -145,29 +146,19 @@ std::uint32_t Half(float value) {
 
 class GuestBlock {
 public:
+    // Arena memory (write tracked), as the title's: device mirrors (DeviceMirrors.hpp) serve it.
     GuestBlock() {
-        constexpr std::uintptr_t hint = std::uintptr_t{1} << 40u;
-#ifdef _WIN32
-        for (std::uintptr_t attempt = 0; block == nullptr && attempt < 16u; ++attempt) {
-            block = static_cast<std::uint8_t*>(VirtualAlloc(reinterpret_cast<void*>(hint + (attempt << 32u)), BlockBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-        }
-        if (block == nullptr) block = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, BlockBytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-#else
-        void* mapped = mmap(reinterpret_cast<void*>(hint), BlockBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-        block = mapped == MAP_FAILED ? nullptr : static_cast<std::uint8_t*>(mapped);
-#endif
-        Require(block != nullptr, "bvh64 intersect ray: cannot allocate the guest block");
+        block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(BlockBytes, BlockBytes));
+        Require(block != nullptr, "bvh bench: cannot allocate the guest block");
+        GuestArena::GuestArenaCommit_nid_postfix(block, BlockBytes, PAGE_READWRITE, BlockBytes);
         std::memset(block, 0, BlockBytes);
         GuestAllocations::Mutation().Add(block, BlockBytes, true, false, true);
     }
 
     ~GuestBlock() {
         GuestAllocations::Mutation().Remove(block);
-#ifdef _WIN32
-        VirtualFree(block, 0, MEM_RELEASE);
-#else
-        munmap(block, BlockBytes);
-#endif
+        GuestArena::GuestArenaReset_nid_postfix(block, BlockBytes);
+        GuestArena::GuestArenaRelease_nid_postfix(block, BlockBytes);
     }
 
     GuestBlock(const GuestBlock&) = delete;
@@ -302,7 +293,6 @@ int main() {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         GuestBlock guest;
-        Require((guest.Address() >> 35u) != 0u, "bvh64 intersect ray: the guest block is not above 32 GiB, the node pointer would fit 32 bits");
         FillNodes(guest);
         for (const bool addressInPointer : {true, false}) {
             Run(*device, guest, addressInPointer);

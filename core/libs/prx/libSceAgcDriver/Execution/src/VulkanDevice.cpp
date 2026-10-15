@@ -32,6 +32,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeviceDiagnostics.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DeviceMirrors.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -693,6 +694,7 @@ struct VulkanDevice::State {
             Graphics::ReleaseImageRegistry(device, reinterpret_cast<PFN_vkDestroyDescriptorPool>(deviceProc(device, "vkDestroyDescriptorPool")), reinterpret_cast<PFN_vkDestroyDescriptorSetLayout>(deviceProc(device, "vkDestroyDescriptorSetLayout")));
             Graphics::ClearCachedTextures(device);
             Graphics::ClearImageMirrors(device);
+            Graphics::ClearDeviceMirrors(device);
             Graphics::ClearHostImports(device);
             patternBuffers.clear();
             workgroupMemory.reset();
@@ -4039,6 +4041,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     };
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
+    resources.RefreshDeviceMirrors(recorder);
     VkAccessFlags covered = 0;
     const auto commands = recorder.Commands(&covered);
     recordStep(PhaseRecordCommands);

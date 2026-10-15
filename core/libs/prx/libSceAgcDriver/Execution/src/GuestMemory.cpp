@@ -1554,6 +1554,23 @@ bool walkHints(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
 }
 #endif
 
+bool Hinted(std::uint64_t address, std::size_t bytes) {
+#ifdef _WIN32
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    constexpr std::uint64_t page = 4096;
+    const auto first = address & ~(page - 1);
+    const auto stop = (address + bytes + page - 1) & ~(page - 1);
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    return tracker.watched && tracker.hinted(first, stop);
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    return false;
+#endif
+}
+
 std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes) {
 #ifdef _WIN32
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;

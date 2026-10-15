@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DeviceMirrors.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -110,6 +111,8 @@ struct GuestBufferMemory::AddressSpace {
     std::vector<CopiedRange> copied;
     // The BDA table entries of `base`, in its order.
     std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
+    // The device-local mirrors serving some of `ranges` (DeviceMirrors.hpp), refreshed before each use.
+    std::vector<std::shared_ptr<DeviceMirror>> deviceMirrors;
     mutable std::mutex tableMutex;
     mutable std::map<std::vector<std::pair<std::uint64_t, std::uint64_t>>, std::pair<std::uint64_t, std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>>>> writeTables;
 };
@@ -2471,6 +2474,7 @@ void GuestBufferMemory::AcquireRegistered() {
             // moved the epoch, in which case this build keeps the per-build form and Upload
             // re-resolves every pointer as before.
             std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
+            std::vector<DeviceMirrorSource> mirrorSources;
             bool publish = true;
             {
                 auto& state = Imports();
@@ -2494,7 +2498,9 @@ void GuestBufferMemory::AcquireRegistered() {
                     }
                     regions.erase(regions.begin() + static_cast<std::ptrdiff_t>(kept), regions.end());
                     for (const auto& region : regions) {
-                        if (region.direct != nullptr || region.mirror != nullptr) ranges.push_back(addressRange(region));
+                        if (region.direct == nullptr && region.mirror == nullptr) continue;
+                        ranges.push_back(addressRange(region));
+                        mirrorSources.push_back(region.direct != nullptr && region.mirror == nullptr ? DeviceMirrorSource{region.direct->buffer, region.begin - region.direct->base} : DeviceMirrorSource{});
                     }
                 }
             }
@@ -2505,6 +2511,7 @@ void GuestBufferMemory::AcquireRegistered() {
                 built->device = context.device;
                 built->serial = spaces.serials.fetch_add(1, std::memory_order_relaxed) + 1;
                 built->lease = std::move(lease);
+                built->deviceMirrors = AssignDeviceMirrors(context, ranges, mirrorSources);
                 built->ranges = std::move(ranges);
                 std::vector<Region> extras;
                 for (auto& region : regions) {
@@ -3689,6 +3696,7 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
             part.begin = cursor;
             part.end = end;
             part.deviceAddress += cursor - range.begin;
+            if (part.hostAddress != 0) part.hostAddress += cursor - range.begin;
             if (written) {
                 const auto* region = owner(cursor);
                 Require(region != nullptr && region->writable && (region->mirror == nullptr || region->mirror->writable), "runtime buffer write has no writable GPU owner");
@@ -3704,6 +3712,10 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
         append(range.end, false);
     }
     return merged;
+}
+
+void GuestBufferMemory::RefreshDeviceMirrors(Recorder& recorder) const {
+    if (space != nullptr && !space->deviceMirrors.empty()) Graphics::RefreshDeviceMirrors(context, recorder, space->deviceMirrors);
 }
 
 std::uint64_t GuestBufferMemory::ReusableAddressSpaceSerial() const {

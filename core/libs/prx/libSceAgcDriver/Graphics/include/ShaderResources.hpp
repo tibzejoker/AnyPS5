@@ -186,6 +186,8 @@ public:
     bool HasCopiedWrites() const { return guestMemory.HasCopiedWrites(); }
     bool HoldsLease() const { return guestMemory.HoldsLease(); }
     bool UsesAddressTable() const { return usesBda; }
+    // Before recording work that reads guest memory through the address space (DeviceMirrors.hpp).
+    void RefreshDeviceMirrors(Recorder& recorder) const { if (usesBda) guestMemory.RefreshDeviceMirrors(recorder); }
     // Nonzero for a reusable BDA build: the address space serial it was built under.
     std::uint64_t AddressSpaceSerial() const { return addressSpaceSerial; }
     std::size_t CopiedBytes() const { return guestMemory.CopiedBytes(); }

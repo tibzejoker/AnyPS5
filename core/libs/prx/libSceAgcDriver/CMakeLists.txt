@@ -200,6 +200,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Pipeline.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineLibrary.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DeviceDiagnostics.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DeviceMirrors.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PlaceholderImages.cpp

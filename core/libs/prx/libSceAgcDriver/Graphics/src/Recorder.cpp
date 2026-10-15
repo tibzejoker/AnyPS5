@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DeviceMirrors.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
@@ -2789,6 +2790,7 @@ void Recorder::OnComplete(std::function<void()> action) {
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
+    NoteDeviceMirrorGpuWrite(address, address + bytes);
     ensureOpen();
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
@@ -2808,6 +2810,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
 
 void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t bytes, bool ownLabel) {
     if (bytes == 0) return;
+    NoteDeviceMirrorGpuWrite(address, address + bytes);
     if (&batch == open.get()) {
         if (!noteWrite(address, bytes, ownLabel)) return;
         publishPendingWrites();

@@ -161,12 +161,37 @@ std::uint32_t EmitBdaWritePhysical(SpirvEmitterState& state, std::uint32_t addre
     });
 }
 
+// The device address reads of [address, address + bytes) go to (a device-local mirror for a
+// mirrored range, else the host import a store reaches too), 0 when unmapped.
+std::uint32_t EmitBdaReadPhysical(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction) {
+    if (BdaSitePhysicalAvailable(state)) return EmitBdaSitePhysical(state, address, bytes, instruction);
+    const auto lookup = state.bdaProbeFunction != 0 ? state.bdaProbeFunction : state.bdaPointerFunction;
+    const auto physical = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionCall, TypeScalarU64(state), physical, lookup, address, ConstantU32(state, bytes), instruction);
+    return physical;
+}
+
+// Runs `store(device address)` for the mirror of a store's bytes when its range has one (the read
+// address differs from the host address the store went to): stores write through to the guest
+// bytes and to the mirror later reads of the same queue go to.
+template<typename TStore>
+void EmitBdaMirrorStore(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction, std::uint32_t hostPhysical, TStore&& store) {
+    const auto boolean = TypeBool(state);
+    const auto mirror = EmitBdaReadPhysical(state, address, bytes, instruction);
+    const auto mirrored = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpINotEqual, boolean, mirror, BdaConstant(state, 0u)), Binary(state, spv::OpINotEqual, boolean, mirror, hostPhysical));
+    EmitIfCondition(state, mirrored, [&] { store(mirror); });
+}
+
 void EmitBdaStoreAt(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t pointerType, std::uint32_t value, std::uint32_t instruction, std::uint32_t accessMask) {
     const auto physical = EmitBdaWritePhysical(state, address, bytes, instruction);
     EmitIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), physical, BdaConstant(state, 0u)), [&] {
-        const auto pointer = state.module.AllocateId();
-        state.module.AddFunction(spv::OpConvertUToPtr, pointerType, pointer, physical);
-        state.module.AddFunction(spv::OpStore, pointer, value, accessMask, bytes);
+        const auto storeAt = [&](std::uint32_t target) {
+            const auto pointer = state.module.AllocateId();
+            state.module.AddFunction(spv::OpConvertUToPtr, pointerType, pointer, target);
+            state.module.AddFunction(spv::OpStore, pointer, value, accessMask, bytes);
+        };
+        storeAt(physical);
+        EmitBdaMirrorStore(state, address, bytes, instruction, physical, storeAt);
         EmitBdaNoteWrite(state, address);
     });
 }
@@ -688,6 +713,13 @@ void EmitBdaDwordWrites(SpirvValueEmitContext& ctx, const IrValue& inst, std::ui
         });
         EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, vectorAligned), separate);
     }
+    EmitBdaMirrorStore(state, addresses[0], dwords * 4u, instruction, physical, [&](std::uint32_t mirror) {
+        for (std::uint32_t dword = 0; dword < dwords; ++dword) {
+            const auto pointer = state.module.AllocateId();
+            state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, dword == 0u ? mirror : Binary(state, spv::OpIAdd, u64, mirror, BdaConstant(state, dword * 4u)));
+            state.module.AddFunction(spv::OpStore, pointer, values[dword], accessMask, 4u);
+        }
+    });
     const auto last = addresses[dwords - 1u];
     EmitBdaNoteWrite(state, addresses[0]);
     const auto pageShift = BdaConstant(state, BdaAbi::WrittenPageShift);
@@ -715,9 +747,21 @@ std::uint32_t EmitBdaAtomic(SpirvValueEmitContext& ctx, const IrValue& inst, std
         const auto physical = state.module.AllocateId();
         state.module.AddFunction(spv::OpFunctionCall, TypeScalarU64(state), physical, state.bdaWritePointerFunction, address, ConstantU32(state, bytes), instruction);
         return EmitValueOrDefaultIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), physical, BdaConstant(state, 0u)), type, zero, [&] {
-            const auto pointer = state.module.AllocateId();
-            state.module.AddFunction(spv::OpConvertUToPtr, TypePointer(state, spv::StorageClassPhysicalStorageBuffer, type), pointer, physical);
-            const auto old = operation(pointer);
+            const auto pointerTo = [&](std::uint32_t target) {
+                const auto pointer = state.module.AllocateId();
+                state.module.AddFunction(spv::OpConvertUToPtr, TypePointer(state, spv::StorageClassPhysicalStorageBuffer, type), pointer, target);
+                return pointer;
+            };
+            // A mirrored range: the atomic runs on the mirror (the value later reads see, and the
+            // one returned) and again on the guest bytes, so both end with the same value for the
+            // commutative operations (a compare-exchange on the guest bytes may resolve otherwise).
+            const auto mirror = EmitBdaReadPhysical(state, address, bytes, instruction);
+            const auto mirrored = Binary(state, spv::OpLogicalAnd, TypeBool(state), Binary(state, spv::OpINotEqual, TypeBool(state), mirror, BdaConstant(state, 0u)), Binary(state, spv::OpINotEqual, TypeBool(state), mirror, physical));
+            const auto old = EmitValueIfElse(state, mirrored, type, [&] {
+                const auto value = operation(pointerTo(mirror));
+                static_cast<void>(operation(pointerTo(physical)));
+                return value;
+            }, [&] { return operation(pointerTo(physical)); });
             EmitBdaNoteWrite(state, address);
             return old;
         });

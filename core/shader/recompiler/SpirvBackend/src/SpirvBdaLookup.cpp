@@ -77,8 +77,8 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     fail(binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(3)), constant(0)), BdaAbi::FaultReason::InvalidTable);
     const auto count = BdaLoadWord(state, constant(1));
     const auto available = binary(spv::OpISub, u32, length, constant(4));
-    fail(binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, available, constant(7)), constant(0)), BdaAbi::FaultReason::InvalidTable);
-    fail(binary(spv::OpINotEqual, boolean, count, binary(spv::OpShiftRightLogical, u32, available, constant(3))), BdaAbi::FaultReason::InvalidTable);
+    fail(binary(spv::OpINotEqual, boolean, binary(spv::OpUMod, u32, available, constant(BdaAbi::RangeWords)), constant(0)), BdaAbi::FaultReason::InvalidTable);
+    fail(binary(spv::OpINotEqual, boolean, count, binary(spv::OpUDiv, u32, available, constant(BdaAbi::RangeWords))), BdaAbi::FaultReason::InvalidTable);
     state.module.AddFunction(spv::OpStore, low, constant(0));
     state.module.AddFunction(spv::OpStore, high, count);
     const auto header = state.module.AllocateId();
@@ -94,7 +94,7 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     state.module.AddFunction(spv::OpBranchConditional, search, body, merge);
     EmitLabel(state, body);
     const auto midpoint = binary(spv::OpIAdd, u32, lower, binary(spv::OpShiftRightLogical, u32, binary(spv::OpISub, u32, upper, lower), constant(1)));
-    const auto entry = binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, midpoint, constant(8)));
+    const auto entry = binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, midpoint, constant(BdaAbi::RangeWords)));
     const auto before = binary(spv::OpULessThan, boolean, address, BdaLoadAddress(state, entry));
     const auto newLow = state.module.AllocateId();
     const auto newHigh = state.module.AllocateId();
@@ -108,11 +108,17 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     EmitLabel(state, merge);
     const auto index = load(low);
     fail(binary(spv::OpIEqual, boolean, index, constant(0)), BdaAbi::FaultReason::Unmapped);
-    const auto selected = binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, binary(spv::OpISub, u32, index, constant(1)), constant(8)));
+    const auto selected = binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, binary(spv::OpISub, u32, index, constant(1)), constant(BdaAbi::RangeWords)));
     const auto at = [&](std::uint32_t offset) { return binary(spv::OpIAdd, u32, selected, constant(offset)); };
     const auto begin = BdaLoadAddress(state, selected);
     const auto finish = BdaLoadAddress(state, at(2));
-    const auto base = BdaLoadAddress(state, at(4));
+    // Stores and atomics reach the host bytes of a mirrored range (its hostAddress), reads the mirror.
+    const auto deviceBase = BdaLoadAddress(state, at(4));
+    std::uint32_t base = deviceBase;
+    if ((permission & BdaAbi::Write) != 0u) {
+        const auto host = BdaLoadAddress(state, at(8));
+        base = Select(state, u64, binary(spv::OpINotEqual, boolean, host, BdaConstant(state, 0u)), host, deviceBase);
+    }
     const auto permissions = BdaLoadWord(state, at(6));
     fail(binary(spv::OpINotEqual, boolean, BdaLoadWord(state, at(7)), constant(0)), BdaAbi::FaultReason::InvalidTable);
     fail(binary(spv::OpUGreaterThanEqual, boolean, begin, finish), BdaAbi::FaultReason::InvalidTable);

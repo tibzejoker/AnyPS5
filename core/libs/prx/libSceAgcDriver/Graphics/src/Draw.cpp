@@ -1716,6 +1716,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
+    // Mirror uploads go outside a pass, before the decision to continue one.
+    resources.RefreshDeviceMirrors(*recorder);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
@@ -2244,6 +2246,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     if (recorded && recorder->HasQueuedKeyStores() && (resources->HoldsLease() || recorder->AnyQueuedKeyStore(touches))) recorder->FlushKeyStores();
     // A queued label store over such memory likewise (Recorder::RecordStore).
     if (recorded && recorder->HasQueuedStores() && (resources->HoldsLease() || recorder->AnyQueuedStore(touches))) recorder->FlushStores();
+    if (recorded) resources->RefreshDeviceMirrors(*recorder);
     const auto commands = recorded ? recorder->Commands() : batch->Handle();
     if (recorded) recorder->PrepareSampleSlot();
     APS5_LOG_CHARS_OUT_DEBUG("CommandBatch created");

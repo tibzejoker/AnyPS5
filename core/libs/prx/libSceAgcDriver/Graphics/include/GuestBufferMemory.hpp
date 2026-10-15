@@ -236,6 +236,9 @@ public:
     // BDA table included, while that space is the live one (its own regions are proven as any
     // reusable build's are, by their import serials).
     std::uint64_t ReusableAddressSpaceSerial() const;
+    // Records the uploads that bring the space's device mirrors up to date (DeviceMirrors.hpp),
+    // ahead of work that reads guest memory through it.
+    void RefreshDeviceMirrors(Recorder& recorder) const;
     // The serial of the cached address space a build would take now on this device (its registry
     // generation and import epoch still current), 0 when there is none.
     static std::uint64_t LiveAddressSpaceSerial(VkDevice device);
