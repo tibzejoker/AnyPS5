@@ -1716,6 +1716,10 @@ thread_local const StorageTexture* refreshing = nullptr;
 // its flushes like `refreshing`, their slices reach the image by device copies at its end.
 thread_local std::vector<const StorageTexture*> lendingImages;
 
+bool lendingImage(const std::vector<const StorageTexture*>& lenders, const StorageTexture* texture) {
+    return !lenders.empty() && std::find(lenders.begin(), lenders.end(), texture) != lenders.end();
+}
+
 bool lendingImage(const StorageTexture* texture) {
     return !lendingImages.empty() && std::find(lendingImages.begin(), lendingImages.end(), texture) != lendingImages.end();
 }
@@ -3622,9 +3626,11 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
+        // The thread_local reads hoisted: mingw's emulated TLS costs a call per access.
         const auto* exempt = refreshing;
+        const auto& lenders = lendingImages;
         for (auto* texture : pending.textures.Overlapping(address, bytes)) {
-            if (texture != except && texture != exempt && !lendingImage(texture) && texture->overlaps(address, bytes)) {
+            if (texture != except && texture != exempt && !lendingImage(lenders, texture) && texture->overlaps(address, bytes)) {
                 if (!texture->pendingUnitInside(address, bytes)) {
                     pretestSkipped.fetch_add(1, std::memory_order_relaxed);
                     continue;
@@ -3897,10 +3903,10 @@ std::vector<std::shared_ptr<StorageTexture>> StorageTexture::overlappingPending(
     std::vector<std::shared_ptr<StorageTexture>> overlapping;
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
-    if (!pending.textures.MayOverlap(address, bytes)) return overlapping;
     const auto* exempt = refreshing;
-    for (auto* texture : pending.textures) {
-        if (texture == exempt || lendingImage(texture) || !texture->overlaps(address, bytes) || !texture->pendingUnitInside(address, bytes)) continue;
+    const auto& lenders = lendingImages;
+    for (auto* texture : pending.textures.Overlapping(address, bytes)) {
+        if (texture == exempt || lendingImage(lenders, texture) || !texture->overlaps(address, bytes) || !texture->pendingUnitInside(address, bytes)) continue;
         if (auto alive = texture->weak_from_this().lock()) overlapping.push_back(std::move(alive));
     }
     return overlapping;
