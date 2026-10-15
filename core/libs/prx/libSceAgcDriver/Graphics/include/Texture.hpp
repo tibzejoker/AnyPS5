@@ -501,6 +501,33 @@ private:
     // still the pending ones and a write-back for the range would store them.
     bool skippedResultsInside(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t borrowUnits(StorageTexture& source, const std::vector<bool>& units);
+    // Records a device copy of `regions` from `source` into this image (barriers both ways), kept
+    // by the open batch, counted as `bytes` of the alias upload path.
+    void copyFromImage(StorageTexture& source, std::span<const VkImageCopy> regions, std::uint64_t bytes);
+    // Subresource lending (APS5_NO_SUBRESOURCE_LEND=1 stores and re-reads as before): another
+    // pending image over part of this surface whose (mip, layer) slices in the overlap are slices
+    // of this image too (same guest range, extent, tiling, pitch and texel size) holds the newest
+    // bytes there when no block of its own over the overlap was stamped since its generation and
+    // none of this image's is pending. Refresh then leaves it out of its flush and, once its own
+    // units are current, copies those slices image to image; the lender's pending units inside
+    // the overlap become this image's (it stores them from now on, the lender no longer has to).
+    struct Lender {
+        std::shared_ptr<StorageTexture> image;
+        std::vector<VkImageCopy> regions;
+        std::uint64_t bytes = 0;
+        // (lender unit, this image's unit) of the lender's pending units inside the overlap.
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> transfers;
+    };
+    enum class LendRefusal : std::uint8_t { Shape, Slices, Stamped, Pending, Straddle, Count };
+    std::optional<Lender> lendable(StorageTexture& other, LendRefusal& refusal) const;
+    std::vector<Lender> pendingLenders(const StorageTexture* alias);
+    bool applyLenders(std::vector<Lender>& lenders);
+    struct LentCopy {
+        std::weak_ptr<StorageTexture> source;
+        std::uint64_t sourceVersion;
+        std::uint64_t version;
+    };
+    std::vector<LentCopy> lentCopies;
     void forgetBorrowed(std::uint32_t first, std::uint32_t count);
     bool clearByKeysFill(DccKeys keys, std::uint8_t key);
     bool overlaps(std::uint64_t address, std::size_t bytes) const;

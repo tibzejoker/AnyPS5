@@ -722,6 +722,55 @@ void RunTrackedImport(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     Require(image->Refresh() && Count(block, SurfaceBytes, 0x66) == SurfaceBytes, "tracked import: the GPU-written image did not settle");
 }
 
+// A smaller image over the first rows of a larger one (same width, tiling and texel size) lends
+// its pending results to the larger one's refresh by a device copy: nothing is stored to guest
+// memory and re-read, and the larger image takes over storing them.
+void RunLentRows(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+    using namespace AgcDriver::GuestMemory;
+    const auto address = AddressOf(block);
+    std::memset(block, 0x55, BlockBytes);
+    auto tall = TextureDescriptor(block, nullptr);
+    tall[2] = ((Side - 1u) >> 2u) | ((2 * Side - 1u) << 14u);
+    tall[6] = 0;
+    tall[7] = 0;
+    auto small = TextureDescriptor(block, nullptr);
+    small[6] = 0;
+    small[7] = 0;
+    std::vector<std::uint32_t> tallData(16, 0u);
+    std::copy(tall.begin(), tall.end(), tallData.begin() + 4);
+    std::vector<std::uint32_t> smallData(16, 0u);
+    std::copy(small.begin(), small.end(), smallData.begin() + 4);
+    std::lock_guard gpu(GpuMutex());
+    BumpCollectEpoch();
+    Dispatch(device, WriteCode, tallData);
+    const auto image = StorageTexture::FindPending(address, BlockBytes);
+    Require(image != nullptr && image->GuestBytes() == BlockBytes, "lent rows: the tall image has no pending results");
+    StorageTexture::FlushPending(address, BlockBytes, nullptr, "test lent rows");
+    device.WaitIdle();
+    for (int settle = 0; settle < 2; ++settle) {
+        BumpCollectEpoch();
+        image->Refresh();
+    }
+    BumpCollectEpoch();
+    Dispatch(device, WriteRowCode, smallData);
+    const auto lender = StorageTexture::FindPending(address, SurfaceBytes);
+    Require(lender != nullptr && lender != image && lender->GuestBytes() == SurfaceBytes, "lent rows: the small image has no pending results");
+    const auto before = StorageTexture::TrackCounters();
+    BumpCollectEpoch();
+    Require(!image->Refresh(), "lent rows: the small image's results did not reach the tall image");
+    const auto after = StorageTexture::TrackCounters();
+    Require(after.flushes == before.flushes, "lent rows: the refresh stored the small image instead of copying it");
+    Require(StorageTexture::FindPending(address, SurfaceBytes) == image, "lent rows: the tall image did not take over the small image's pending unit");
+    Require(Count(block, SurfaceBytes, 0xff) == Threads * 4u, "lent rows: the lent results reached guest memory before a write-back");
+    BumpCollectEpoch();
+    Require(image->Refresh(), "lent rows: a second refresh copied again");
+    StorageTexture::FlushPending(address, BlockBytes, nullptr, "test lent rows");
+    device.WaitIdle();
+    Require(Count(block, SurfaceBytes, 0xff) == 2u * Threads * 4u, "lent rows: the tall image's write-back lost the lent row or its own");
+    BumpCollectEpoch();
+    Require(lender->Refresh() == false || Count(block, SurfaceBytes, 0xff) == 2u * Threads * 4u, "lent rows: the small image lost the rows");
+}
+
 #ifdef _WIN32
 void RunHintedImport(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     using namespace AgcDriver::GuestMemory;
@@ -880,6 +929,9 @@ int main() {
             std::optional<GuestBlock> tracked;
             tracked.emplace(true);
             RunTrackedImport(*device, tracked->Data());
+            std::optional<GuestBlock> lentRows;
+            lentRows.emplace(true);
+            RunLentRows(*device, lentRows->Data());
 #ifdef _WIN32
             hinted.emplace(true);
             RunHintedImport(*device, hinted->Data());
