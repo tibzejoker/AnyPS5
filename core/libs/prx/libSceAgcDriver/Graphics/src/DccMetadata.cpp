@@ -711,7 +711,7 @@ void reportKeyWaits() {
     for (std::size_t index = 0; index < current.size(); ++index) delta[index] = static_cast<unsigned long long>(current[index] - seen[index]);
     seen = current;
     if (previous < 0) return;
-    std::fprintf(stderr, "[dcc-wait] last 10 s: keys known from recorded fills without a wait: %llu uncompressed, %llu clear; GPU waits to read keys: %llu under a unit shadow, %llu behind a writer of unknown bytes, %llu behind a fill of keys the format cannot encode\n", delta[0], delta[1], delta[2], delta[3], delta[4]);
+    std::fprintf(stderr, "[dcc-wait] last 10 s: keys known from recorded fills without a wait: %llu uncompressed, %llu clear; GPU waits to read keys: %llu under a unit shadow, %llu behind a writer of unknown bytes\n", delta[0], delta[1], delta[2], delta[3]);
 }
 
 enum class FillKeys : std::uint8_t { Known, Shadowed, Unknown };

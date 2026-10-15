@@ -517,6 +517,9 @@ private:
         std::uint64_t bytes = 0;
         // (lender unit, this image's unit) of the lender's pending units inside the overlap.
         std::vector<std::pair<std::uint32_t, std::uint32_t>> transfers;
+        // Every slice pair is a whole subresource of both images (mip or layer containment, no row
+        // shift): the lender could be a view of this image.
+        bool wholeSubresources = false;
     };
     enum class LendRefusal : std::uint8_t { Shape, Slices, Stamped, Pending, Straddle, Count };
     std::optional<Lender> lendable(StorageTexture& other, LendRefusal& refusal) const;
