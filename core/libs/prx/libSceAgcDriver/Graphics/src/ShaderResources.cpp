@@ -1204,6 +1204,10 @@ struct RegistryDevice {
     std::vector<std::pair<std::uint64_t, Registry::ModeSet>> modeSets;
     std::vector<std::uint32_t> regionBases;
     std::vector<std::pair<std::chrono::steady_clock::time_point, std::shared_ptr<Texture>>> retired;
+    // POC: slots a refresh moved an element away from, reusable two seconds later (the work that
+    // could still read them done), and whether a slot holds a live element.
+    std::vector<std::pair<std::chrono::steady_clock::time_point, std::uint32_t>> freedSlots;
+    std::vector<bool> slotFree;
     std::chrono::steady_clock::time_point lastRefresh{};
     // The element the next refresh starts at (refreshRegistry walks the registry round robin).
     std::uint32_t refreshCursor = 0;
@@ -1463,6 +1467,15 @@ std::vector<std::array<std::uint32_t, Count>> drainRing(std::span<std::uint32_t>
 // took longer than 16 ms, which a fresh build sampling a few textures never does. Replaced textures
 // stay alive two seconds for the command buffers still reading them.
 void refreshRegistry(const Context& context, RegistryDevice& registry) {
+    // POC: off by default. With it GTA Story lost the device in about a third of 5-minute runs (also
+    // with the slot moves below), without it 0 of 10, rendering unchanged (texture content is refreshed
+    // by the uses themselves). APS5_POC_REGISTRY_REFRESH=1 enables it.
+    static const bool noRefresh = std::getenv("APS5_POC_REGISTRY_REFRESH") == nullptr;
+    if (noRefresh) return;
+    // POC: a replaced texture moves to another slot (written while no submitted work reads it) and the
+    // map's records are redirected to it with single-word stores; the old slot is reused two seconds
+    // later (APS5_POC_REGISTRY_RELOCATE=1; by default the slot is rewritten in place as before).
+    static const bool rewrite = std::getenv("APS5_POC_REGISTRY_RELOCATE") == nullptr;
     const auto now = std::chrono::steady_clock::now();
     if (now - registry.lastRefresh < std::chrono::milliseconds(16)) return;
     registry.lastRefresh = now;
@@ -1472,14 +1485,49 @@ void refreshRegistry(const Context& context, RegistryDevice& registry) {
         if (visited != 0 && std::chrono::steady_clock::now() - now >= std::chrono::milliseconds(1)) break;
         const auto index = registry.refreshCursor++ % count;
         registry.refreshCursor %= count;
+        if (index < registry.slotFree.size() && registry.slotFree[index]) continue;
         auto& element = registry.elements[index];
         try {
             CompletePendingCpuWrites(context, element.resource.baseAddress, static_cast<std::size_t>(element.guestBytes));
             auto texture = cachedTexture(context, element.words, element.resource, element.components, element.guestBytes, element.depthCompare);
             if (texture == element.texture) continue;
-            registry.retired.emplace_back(now, std::move(element.texture));
-            element.texture = std::move(texture);
-            writeRegistryImage(context, registry, index);
+            if (rewrite) {
+                registry.retired.emplace_back(now, std::move(element.texture));
+                element.texture = std::move(texture);
+                writeRegistryImage(context, registry, index);
+                Registry::Global().refreshed.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
+            std::optional<std::uint32_t> target;
+            if (!registry.freedSlots.empty() && now - registry.freedSlots.front().first > std::chrono::seconds(2)) {
+                target = registry.freedSlots.front().second;
+                registry.freedSlots.erase(registry.freedSlots.begin());
+            } else if (registry.elements.size() < registry.imageCapacity) {
+                target = static_cast<std::uint32_t>(registry.elements.size());
+                registry.elements.emplace_back();
+            }
+            if (!target.has_value()) continue;
+            if (registry.slotFree.size() < registry.elements.size()) registry.slotFree.resize(registry.elements.size(), false);
+            auto& moved = registry.elements[*target];
+            auto& old = registry.elements[index];
+            moved = old;
+            moved.texture = std::move(texture);
+            registry.slotFree[*target] = false;
+            writeRegistryImage(context, registry, *target);
+            auto words = registry.Words();
+            for (const auto base : registry.regionBases) {
+                for (std::uint32_t entry = 0; entry < registry.images.size(); ++entry) {
+                    auto& record = words[base + entry];
+                    if ((record & Registry::RecordValid) == 0u || (record >> Registry::RecordElementShift) != index) continue;
+                    record = (*target << Registry::RecordElementShift) | (record & ((1u << Registry::RecordElementShift) - 1u));
+                }
+            }
+            for (auto& [key, slot] : registry.elementIndex) {
+                if (slot == index) slot = *target;
+            }
+            registry.retired.emplace_back(now, std::move(old.texture));
+            registry.slotFree[index] = true;
+            registry.freedSlots.emplace_back(now, index);
             Registry::Global().refreshed.fetch_add(1, std::memory_order_relaxed);
         } catch (const std::exception&) {
         }
