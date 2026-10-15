@@ -118,6 +118,8 @@ void BumpCollectEpoch();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
 std::uint64_t ThreadCollectEpoch();
+// POC (draw thread): the calling thread takes another thread's epoch (ThreadCollectEpoch there).
+void AdoptCollectEpoch(std::uint64_t epoch);
 std::uint64_t UnwatchSerial();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // The tracker's current generation (every collect and MarkWritten bumps it): a stamp taken after

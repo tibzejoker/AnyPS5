@@ -25,6 +25,10 @@ struct DeferredLabels {
 };
 
 DeferredLabels& deferredLabels();
+// POC draw thread (Draw.cpp): whether queue 0's draws are recorded on their own thread, and the wait
+// for the draws still in flight there.
+bool DrawThreadEnabled();
+void DrainDrawPipeline();
 
 bool DeferLabels();
 

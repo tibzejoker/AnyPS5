@@ -123,6 +123,10 @@ void Driver::execute(const Submission& submission) {
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
         auto nextCursor = cursor + count;
+        if (submission.queue == 0 && DrawThreadEnabled()) {
+            const bool keepsDraws = Pm4::DrawOpcode(opcode) || Pm4::IndirectRegisterOpcode(opcode) || opcode == 0x69 || opcode == 0x76 || opcode == 0x79 || opcode == 0x68 || opcode == 0x10 || opcode == 0x2a || opcode == 0x2f || opcode == 0x26 || opcode == 0x13 || opcode == 0x3c;
+            if (!keepsDraws || header == FlipPacketHeader || header == RenderingWaitPacketHeader) DrainDrawPipeline();
+        }
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         PerformanceTimer timing("Driver.Packet");
@@ -326,6 +330,7 @@ void Driver::execute(const Submission& submission) {
         cursor = nextCursor;
     }
 
+    if (submission.queue == 0) DrainDrawPipeline();
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;

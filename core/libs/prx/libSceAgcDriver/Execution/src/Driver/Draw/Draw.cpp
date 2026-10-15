@@ -1,13 +1,85 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <condition_variable>
+#include <cstdio>
 #include <cstdlib>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <thread>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// POC (APS5_POC_DRAW_THREAD=1): queue 0's draws are recorded on a thread of their own while the queue
+// worker prepares the next packet (decode, capture, shader lookup run unlocked; the recording takes
+// the GPU mutex). At most two draws are in flight; every packet other than a draw, a register write
+// or a WAIT_REG_MEM, the end of a submission and any draw the worker records itself wait for them
+// (DrainDrawPipeline).
+class DrawPipeline {
+public:
+    void Push(std::function<void()> job) {
+        std::unique_lock lock(mutex);
+        if (!thread.joinable()) thread = std::thread([this] { run(); });
+        space.wait(lock, [&] { return jobs.size() + running < 2; });
+        jobs.push_back(std::move(job));
+        ++inFlight;
+        ready.notify_one();
+    }
+    void Drain() {
+        if (inFlight.load(std::memory_order_acquire) == 0) return;
+        std::unique_lock lock(mutex);
+        idle.wait(lock, [&] { return jobs.empty() && running == 0; });
+    }
+
+private:
+    void run() {
+        std::unique_lock lock(mutex);
+        for (;;) {
+            ready.wait(lock, [&] { return !jobs.empty(); });
+            auto job = std::move(jobs.front());
+            jobs.pop_front();
+            running = 1;
+            lock.unlock();
+            job();
+            lock.lock();
+            running = 0;
+            --inFlight;
+            space.notify_all();
+            if (jobs.empty()) idle.notify_all();
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable ready, space, idle;
+    std::deque<std::function<void()>> jobs;
+    std::size_t running = 0;
+    std::atomic<std::size_t> inFlight{0};
+    std::thread thread;
+};
+
+DrawPipeline& drawPipeline() {
+    static auto* pipeline = new DrawPipeline();
+    return *pipeline;
+}
+
+}
+
+bool DrawThreadEnabled() {
+    static const bool enabled = std::getenv("APS5_POC_DRAW_THREAD") != nullptr;
+    return enabled;
+}
+
+void DrainDrawPipeline() {
+    if (DrawThreadEnabled()) drawPipeline().Drain();
+}
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
     PerformanceTimer timing("Driver.Draw");
@@ -275,6 +347,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("post_compile_prepare");
     const auto lockForDraw = [&] {
         if (gpuLock.owns_lock()) return;
+        DrainDrawPipeline();
         phaseTiming.Phase(DrawRowVectors);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         gpuLock.lock();
@@ -382,6 +455,65 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             rejected = std::move(*known);
             return DrawVerdict::Rejected;
         }
+    }
+    if (DrawThreadEnabled() && submission.queue == 0 && !gpuLock.owns_lock() && deferredLabels().labels.empty()) {
+        noteDrawWriters(stages, submission.queue);
+        struct Job {
+            std::shared_ptr<VulkanDevice> device;
+            std::shared_ptr<const DrawDecode> decode;
+            Pm4::DrawParameters parameters;
+            std::vector<ShaderRecompiler::RecompileResult> results;
+            std::vector<std::shared_ptr<DispatchVariant>> matched;
+            std::vector<Graphics::CompiledShader> stages;
+            std::vector<std::vector<std::byte>> bytes;
+            std::vector<Graphics::GuestMemorySnapshot> snapshots;
+            std::shared_ptr<const DrawRecipe> recipe;
+            std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
+            std::uint64_t drawKey = 0;
+            std::uint64_t epoch = 0;
+            std::uint32_t queue = 0;
+        };
+        auto job = std::make_shared<Job>();
+        job->device = localDevice;
+        job->decode = decode;
+        job->parameters = drawParameters;
+        job->results = std::move(results);
+        job->matched = matched;
+        job->stages = stages;
+        job->bytes.reserve(snapshots.size());
+        job->snapshots.reserve(snapshots.size());
+        for (const auto& item : snapshots) {
+            job->bytes.emplace_back(item.bytes.begin(), item.bytes.end());
+            job->snapshots.push_back({item.address, std::span<const std::byte>(job->bytes.back())});
+        }
+        job->recipe = recipe;
+        job->recipeStages = recipeStages;
+        job->drawKey = drawKey;
+        job->epoch = GuestMemory::ThreadCollectEpoch();
+        job->queue = submission.queue;
+        drawPipeline().Push([this, job] {
+            std::shared_lock deviceUse(deviceReplacement);
+            GuestMemory::AdoptCollectEpoch(job->epoch);
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+            std::unique_lock lock(GuestMemory::GpuMutex());
+            auto localDevice = job->device;
+            if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
+            try {
+                recordLabelsForPacket(localDevice.get(), job->queue);
+                if (job->recipe != nullptr) {
+                    if (localDevice->DrawFromRecipe(job->decode->state, job->parameters, job->stages, job->snapshots, job->recipe) == RecipeOutcome::Recorded) return;
+                    VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
+                }
+                std::shared_ptr<const DrawRecipe> built;
+                localDevice->Draw(job->decode->state, job->parameters, job->stages, job->snapshots, job->recipeStages.empty() ? nullptr : &built);
+                if (built != nullptr) attachDrawRecipe(job->drawKey, job->recipeStages, std::move(built));
+            } catch (const std::exception& error) {
+                static std::atomic<std::uint64_t> failures{0};
+                if (failures.fetch_add(1) < 50) std::fprintf(stderr, "[draw-thread] draw failed: %s\n", error.what());
+            }
+        });
+        timing.Mark("draw_and_resource_release");
+        return drawn();
     }
     lockForDraw();
     noteDrawWriters(stages, submission.queue);
