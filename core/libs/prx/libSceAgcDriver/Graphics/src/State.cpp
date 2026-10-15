@@ -1121,7 +1121,7 @@ std::uint32_t GuestFormatFor(VkFormat format, std::uint32_t elementBytes) {
 }
 
 GuestTextureResource SurfaceForTarget(const ColorTarget& color) {
-    static const bool residentLinear = std::getenv("APS5_POC_RESIDENT_LINEAR") != nullptr;
+    static const bool residentLinear = std::getenv("APS5_POC_NO_RESIDENT_LINEAR") == nullptr;
     Require(residentLinear || color.tileMode != ColorTileMode::Linear, "linear color targets are not resident");
     const bool chain = color.mipCount > 1;
     GuestTextureResource surface{};

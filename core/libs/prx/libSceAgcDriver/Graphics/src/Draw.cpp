@@ -1559,6 +1559,12 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
         if (index < slices.size()) residents[index]->MarkSliceDirty(slices[index]);
         else residents[index]->MarkDirty();
     }
+    // POC: a linear target's results reach guest memory after each draw (a recorded store, no CPU wait), as the
+    // synchronous draw of a non-resident linear target made them: CPU readers of such targets see them.
+    for (const auto& resident : residents) {
+        if (resident == nullptr || resident->Descriptor().tileMode != TextureTileMode::kLinear) continue;
+        StorageTexture::FlushPending(resident->Descriptor().baseAddress, static_cast<std::size_t>(resident->GuestBytes()), nullptr, "linear target");
+    }
 }
 
 // What recordDraw records from: the recorder, the resources, the pipeline and framebuffer, the
@@ -1961,10 +1967,13 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         // Debug aid: APS5_NO_RESIDENT_TARGETS=1 copies every target in and out again.
         static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
         // POC: linear targets get a resident image too (they took a synchronous draw each, 134 per 10 s
-        // in GTA Story, 8.4 -> 8.9 FPS) with APS5_POC_RESIDENT_LINEAR=1; off by default: their results never reach
-        // guest memory for a CPU reader (41 agc_driver tests fail with it).
-        static const bool residentLinear = std::getenv("APS5_POC_RESIDENT_LINEAR") != nullptr;
-        if ((binding.gpuTiling || ((color.tileMode != ColorTileMode::Linear || residentLinear) && context.detiler != nullptr)) && residentTargets) {
+        // in GTA Story, 8.4 -> 8.9 FPS); their results are written back to guest memory right after each draw (recorded
+        // GPU store, keepRecordedDraw), as the synchronous draw did; APS5_POC_NO_RESIDENT_LINEAR=1 restores the old path.
+        // (Without the write-back their results never reached guest memory for a CPU reader: 41 agc_driver tests
+        // failed.)
+        static const bool residentLinear = std::getenv("APS5_POC_NO_RESIDENT_LINEAR") == nullptr;
+        const bool linearResident = residentLinear && color.tileMode == ColorTileMode::Linear && HostImportFor(context, color.address, colorLayout.Bytes()) != nullptr;
+        if ((binding.gpuTiling || ((color.tileMode != ColorTileMode::Linear || linearResident) && context.detiler != nullptr)) && residentTargets) {
             // The lookup refreshes the image on every draw (StorageTexture::Refresh: FlushPending,
             // CollectWrites over the target's pages, the DCC key scan of TextureClearKeys, then
             // UnchangedSince). The page walk is skipped while the worker's collect epoch lasts
