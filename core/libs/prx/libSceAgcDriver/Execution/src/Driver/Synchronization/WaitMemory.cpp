@@ -184,8 +184,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     } waitTrace{traceGpu, queue, packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), std::chrono::steady_clock::now()};
     bool warned = false;
 
+    // POC: APS5_POC_NO_WAIT_EPOCH=1 keeps the collect epoch across WAIT_REG_MEM (submissions still bump).
+    static const bool waitEpoch = std::getenv("APS5_POC_NO_WAIT_EPOCH") == nullptr;
     struct EpochPoint {
-        bool bump = true;
+        bool bump = waitEpoch;
         ~EpochPoint() {
             if (bump) bumpEpoch(&EpochBumps::waits);
         }
