@@ -389,6 +389,21 @@ void Driver::execute(const Submission& submission) {
     // in flight on the draw thread carry over into it (APS5_POC_DRAW_THREAD_KEEP_END=1).
     static const bool keepEnd = std::getenv("APS5_POC_DRAW_THREAD_KEEP_END") != nullptr;
     const bool nextQueued = submission.queue == 0 && !submitAtEnd && submission.rewindTail == nullptr && workerQueued() != nullptr && workerQueued()->load(std::memory_order_acquire) != 0;
+    // POC: the end of a queue 0 submission is a draw thread job (its submit runs behind the draws in flight)
+    // instead of a drain, so the next chunk is decoded while they record (APS5_POC_END_JOB=1; no gain measured).
+    static const bool endJob = std::getenv("APS5_POC_END_JOB") != nullptr;
+    if (submission.queue == 0 && endJob && LabelJobsEnabled() && !submitAtEnd && deferredLabels().labels.empty()) {
+        PushDrawPipeline([this] {
+            if (!Graphics::Recorder::PendingLabelSince().has_value() && Graphics::Recorder::RecordedWorkSinceSubmit() == 0) return;
+            ++submissionCosts(0).endSubmits;
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::End);
+            std::lock_guard gpuLock(GuestMemory::GpuMutex());
+            const auto localDevice = device.Load();
+            if (localDevice != nullptr) localDevice->SubmitRecorded(true);
+        });
+        if (submission.rewindTail != nullptr) executeRewindTail(submission);
+        return;
+    }
     if (submission.queue == 0 && !(keepEnd && nextQueued)) DrainDrawWork();
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
