@@ -11,7 +11,9 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
+#include <set>
 #include <functional>
 #include <mutex>
 #include <thread>
@@ -180,6 +182,60 @@ void SubmitDrawPrep(std::uint64_t ticket, std::function<void()> job) {
         }
         turns.changed.notify_all();
     });
+}
+
+bool LabelJobsEnabled() {
+    static const bool enabled = DrawThreadEnabled() && std::getenv("APS5_POC_NO_LABEL_JOBS") == nullptr;
+    return enabled;
+}
+
+std::atomic<std::uint64_t>& PendingLabelJobs() {
+    static std::atomic<std::uint64_t> pending{0};
+    return pending;
+}
+
+namespace {
+struct PendingLabel {
+    std::uint64_t address = 0;
+    std::size_t size = 0;
+    std::uint64_t value = 0;
+};
+struct PendingLabels {
+    std::mutex mutex;
+    std::deque<PendingLabel> labels;
+};
+PendingLabels& pendingLabels() {
+    static auto* labels = new PendingLabels();
+    return *labels;
+}
+}
+
+void NotePendingLabel(std::uint64_t address, std::span<const std::byte> bytes, bool add) {
+    auto& pending = pendingLabels();
+    std::lock_guard lock(pending.mutex);
+    if (add) {
+        PendingLabel label{address, bytes.size(), 0};
+        std::memcpy(&label.value, bytes.data(), std::min<std::size_t>(bytes.size(), sizeof(label.value)));
+        pending.labels.push_back(label);
+        return;
+    }
+    const auto found = std::find_if(pending.labels.begin(), pending.labels.end(), [&](const PendingLabel& label) { return label.address == address && label.size == bytes.size(); });
+    if (found != pending.labels.end()) pending.labels.erase(found);
+}
+
+PendingLabelWait CheckPendingLabelWait(std::span<const std::uint32_t> packet) {
+    if (PendingLabelJobs().load(std::memory_order_acquire) == 0 || packet.size() < 4) return PendingLabelWait::None;
+    const std::uint64_t awaited = packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u);
+    const auto awaitedBytes = Pm4::WaitAwaitedBytes(packet);
+    auto& pending = pendingLabels();
+    std::lock_guard lock(pending.mutex);
+    for (auto label = pending.labels.rbegin(); label != pending.labels.rend(); ++label) {
+        if (label->address >= awaited + awaitedBytes || awaited >= label->address + label->size) continue;
+        if (label->address != awaited || label->size < awaitedBytes) return PendingLabelWait::Overlaps;
+        const auto value = awaitedBytes == 8 ? label->value : (label->value & 0xffffffffu);
+        return Pm4::WaitComparesValue(packet, value) ? PendingLabelWait::Ordered : PendingLabelWait::Overlaps;
+    }
+    return PendingLabelWait::None;
 }
 
 void DrainDrawWork() {

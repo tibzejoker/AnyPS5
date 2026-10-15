@@ -2,10 +2,12 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DEFERREDLABELS_HPP
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <span>
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
@@ -42,6 +44,17 @@ void SubmitDrawPrep(std::uint64_t ticket, std::function<void()> job);
 void ServeDrawTurn();
 // Waits for every submitted preparation, then for the draws still on the draw thread.
 void DrainDrawWork();
+// POC: RELEASE_MEM / WRITE_DATA labels of queue 0 (no end-of-pipe interrupt) are recorded by the draw thread
+// behind the draws before them instead of draining it (APS5_POC_NO_LABEL_JOBS=1 disables); the count of label
+// jobs not run yet (a WAIT_REG_MEM drains while any is pending).
+bool LabelJobsEnabled();
+std::atomic<std::uint64_t>& PendingLabelJobs();
+// The label jobs not run yet. A WAIT_REG_MEM whose compare holds for the newest pending value at its address
+// is ordered behind that label job like a wait on a recorded label; one that overlaps a pending label
+// otherwise drains the draw work first.
+enum class PendingLabelWait { None, Ordered, Overlaps };
+void NotePendingLabel(std::uint64_t address, std::span<const std::byte> bytes, bool add);
+PendingLabelWait CheckPendingLabelWait(std::span<const std::uint32_t> packet);
 
 bool DeferLabels();
 

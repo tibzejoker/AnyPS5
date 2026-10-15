@@ -124,8 +124,46 @@ void Driver::execute(const Submission& submission) {
         const auto opcode = (header >> 8u) & 0xffu;
         auto nextCursor = cursor + count;
         if (submission.queue == 0 && DrawThreadEnabled()) {
-            const bool keepsDraws = (opcode == 0x15 && DispatchThreadEnabled()) || Pm4::DrawOpcode(opcode) || Pm4::IndirectRegisterOpcode(opcode) || opcode == 0x69 || opcode == 0x76 || opcode == 0x79 || opcode == 0x68 || opcode == 0x10 || opcode == 0x2a || opcode == 0x2f || opcode == 0x26 || opcode == 0x13 || opcode == 0x3c;
-            if (!keepsDraws || header == FlipPacketHeader || header == RenderingWaitPacketHeader) DrainDrawWork();
+            // EVENT_WRITE (but a counter sample), ACQUIRE_MEM, PFP_SYNC_ME, SET_BASE and SET_UCONFIG_REG_INDEX do
+            // nothing the draws in flight must precede; a RELEASE_MEM / WRITE_DATA label without an end-of-pipe
+            // interrupt becomes a draw thread job (PacketMemory.cpp); a WAIT_REG_MEM on a pending label job is ordered
+            // behind it when the pending value satisfies it, and drains otherwise.
+            const bool quietEvent = LabelJobsEnabled() && ((opcode == 0x46 && packet.size() >= 2 && (packet[1] & 0x3fu) != 0x39u) || opcode == 0x58 || opcode == 0x42 || opcode == 0x11 || opcode == 0x7a || opcode == 0x59);
+            const bool labelJob = LabelJobsEnabled() && (opcode == 0x37 || (opcode == 0x49 && packet.size() >= 3 && [&] { const auto select = (packet[2] >> 24u) & 7u; return select == 0 || select == 3; }())) && [&] {
+                const auto label = Pm4::DecodeLabelWrite(packet);
+                return label.has_value() && label->Bytes().size() <= DeferredLabel::Capacity && label->Bytes().size() % 4 == 0 && label->address % 4 == 0;
+            }();
+            const auto pendingWait = opcode == 0x3c && !Pm4::Predicated(header) ? CheckPendingLabelWait(packet) : PendingLabelWait::None;
+            if (pendingWait == PendingLabelWait::Ordered) {
+                cursor = nextCursor;
+                continue;
+            }
+            const bool waitWithLabels = pendingWait == PendingLabelWait::Overlaps;
+            const bool keepsDraws = !waitWithLabels && (quietEvent || labelJob || (opcode == 0x15 && DispatchThreadEnabled()) || Pm4::DrawOpcode(opcode) || Pm4::IndirectRegisterOpcode(opcode) || opcode == 0x69 || opcode == 0x76 || opcode == 0x79 || opcode == 0x68 || opcode == 0x10 || opcode == 0x2a || opcode == 0x2f || opcode == 0x26 || opcode == 0x13 || opcode == 0x3c);
+            if (!keepsDraws || header == FlipPacketHeader || header == RenderingWaitPacketHeader) {
+                // POC: which packets drain the draw work, and the time they wait ([drain] every 10 s).
+                static std::array<std::atomic<std::uint64_t>, 257> counts{};
+                static std::array<std::atomic<std::uint64_t>, 257> waitedUs{};
+                static std::atomic<long long> reported{0};
+                const auto slot = header == FlipPacketHeader ? 256u : opcode;
+                const auto started = std::chrono::steady_clock::now();
+                DrainDrawWork();
+                counts[slot].fetch_add(1, std::memory_order_relaxed);
+                waitedUs[slot].fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
+                const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+                if (auto last = reported.load(std::memory_order_relaxed); last != now && reported.compare_exchange_strong(last, now)) {
+                    std::string line = "[drain] last 10 s by opcode (count/ms waited):";
+                    for (std::size_t index = 0; index < counts.size(); ++index) {
+                        const auto count = counts[index].exchange(0);
+                        const auto us = waitedUs[index].exchange(0);
+                        if (count == 0) continue;
+                        char item[64];
+                        std::snprintf(item, sizeof(item), " %s=%llu/%llu", index == 256 ? "flip" : Pm4::Name(static_cast<std::uint32_t>(index) << 8u).c_str(), static_cast<unsigned long long>(count), static_cast<unsigned long long>(us / 1000));
+                        line += item;
+                    }
+                    std::fprintf(stderr, "%s\n", line.c_str());
+                }
+            }
         }
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());

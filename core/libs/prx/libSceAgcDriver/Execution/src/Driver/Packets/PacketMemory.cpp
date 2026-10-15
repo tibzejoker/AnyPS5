@@ -71,7 +71,33 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     if (!drainAll && !endOfPipeInterrupt && (opcode == 0x49 || opcode == 0x37)) {
         if (const auto label = Pm4::DecodeLabelWrite(packet)) {
             const auto bytes = label->Bytes();
-            if (DeferLabels() && bytes.size() <= DeferredLabel::Capacity && bytes.size() % 4 == 0 && label->address % 4 == 0) {
+            if (submission.queue == 0 && LabelJobsEnabled() && bytes.size() <= DeferredLabel::Capacity && bytes.size() % 4 == 0 && label->address % 4 == 0) {
+                // Recorded by the draw thread behind the draws queued before it (see LabelJobsEnabled).
+                DeferredLabel entry;
+                entry.address = label->address;
+                entry.size = bytes.size();
+                std::memcpy(entry.bytes.data(), bytes.data(), bytes.size());
+                const auto stamp = ++eventSerial;
+                const auto queueId = submission.queue;
+                PendingLabelJobs().fetch_add(1, std::memory_order_acq_rel);
+                NotePendingLabel(entry.address, std::span<const std::byte>(entry.bytes.data(), entry.size), true);
+                PushDrawPipeline([this, entry, stamp, queueId] {
+                    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+                    {
+                        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                        const auto localDevice = device.Load();
+                        const auto bytes = std::span<const std::byte>(entry.bytes.data(), entry.size);
+                        const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(entry.address, bytes, stamp, queueId) : 4;
+                        if (reason == 1) GuestMemory::Write(entry.address, bytes, 4);
+                        if (reason == 0 || reason == 1 || reason == 5) noteLabelStore(entry.address, bytes, stamp, queueId);
+                        Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
+                    }
+                    NotePendingLabel(entry.address, std::span<const std::byte>(entry.bytes.data(), entry.size), false);
+                    PendingLabelJobs().fetch_sub(1, std::memory_order_acq_rel);
+                });
+                ++queuedLabels;
+                wroteOnGpu = true;
+            } else if (DeferLabels() && bytes.size() <= DeferredLabel::Capacity && bytes.size() % 4 == 0 && label->address % 4 == 0) {
 
                 auto& deferred = deferredLabels();
                 if (deferred.labels.empty()) deferred.since = std::chrono::steady_clock::now();
@@ -82,6 +108,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 ++queuedLabels;
                 wroteOnGpu = true;
             } else {
+                if (submission.queue == 0 && LabelJobsEnabled()) DrainDrawWork();
                 GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
                 std::lock_guard gpuLock(GuestMemory::GpuMutex());
                 const auto localDevice = device.Load();
