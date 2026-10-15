@@ -3,6 +3,7 @@
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include <array>
 #include <bit>
+#include <cstdlib>
 #include <string>
 
 namespace ShaderRecompiler {
@@ -226,6 +227,18 @@ static std::uint32_t DefineBdaNoteWrite(SpirvEmitterState& state) {
 void DefineGetBdaPointer(SpirvEmitterState& state) {
     if (state.faultBufferVariable != 0) DefineBdaFaultFunction(state);
     if (!state.program.Info().usesDma) return;
+    // APS5_BDA_SLOW_FAULTS=1: programs whose fault checks are elided (GPU-resolved descriptors) still
+    // record faults in the out-of-line helpers defined here (a read site's miss path: range search,
+    // byte reads), while the inline hit paths stay unchecked; a recorded fault fails its draw or
+    // dispatch as with APS5_BDA_FAULTS, naming the address.
+    static const bool slowFaults = std::getenv("APS5_BDA_SLOW_FAULTS") != nullptr;
+    const bool elided = state.bdaFaultsElided;
+    if (slowFaults && state.faultBufferVariable != 0 && state.bdaFaultFunction != 0) state.bdaFaultsElided = false;
+    struct Restore {
+        SpirvEmitterState& state;
+        bool elided;
+        ~Restore() { state.bdaFaultsElided = elided; }
+    } restore{state, elided};
     state.bdaPointerFunction = DefineBdaLookupPair(state, "get_bda_pointer", true);
     if (!BdaByteReadsForced()) state.bdaProbeFunction = DefineBdaLookupPair(state, "probe_bda_pointer", false);
     DefineBdaDwordReadFunctions(state);

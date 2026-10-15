@@ -47,7 +47,10 @@ inline void Require(bool condition, const std::string& reason) {
     if (!condition) throw std::runtime_error("AGC graphics: " + reason);
 }
 
+void ReportDeviceLost();
+
 inline void Check(VkResult result, const char* operation) {
+    if (result == VK_ERROR_DEVICE_LOST) ReportDeviceLost();
     if (result != VK_SUCCESS) throw std::runtime_error(std::string("AGC graphics: ") + operation + ": Vulkan result " + std::to_string(result));
 }
 

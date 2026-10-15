@@ -480,6 +480,13 @@ public:
     enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, Count };
     static constexpr std::uint64_t ClassKey(CommandClass which) { return 0x10 + static_cast<std::uint64_t>(which); }
     std::uint32_t BeginGpuTiming(CommandClass which) { return BeginGpuTiming(ClassKey(which)); }
+    // APS5_GPU_TIME=1 (or APS5_PROFILE_GPU): a draw's own range, keyed by its program (DrawProgramKey
+    // of the pixel program's guest address, else the vertex program's), recorded around the draw
+    // commands in `commands` when that is the open batch's buffer and the batch already has its
+    // timestamp pool (no pool reset inside a render pass); NoTiming otherwise.
+    static constexpr std::uint64_t DrawProgramTag = 0xd0ull << 56u;
+    static constexpr std::uint64_t DrawProgramKey(std::uint64_t address) { return DrawProgramTag | (address & 0x00ffffffffffffffull); }
+    std::uint32_t BeginDrawTiming(VkCommandBuffer commands, std::uint64_t key);
     static void CountBarriers(CommandClass which, std::uint32_t count = 1);
     // A leading barrier a command left out because the previous trailing barrier covered its
     // accesses (see Commands), on the [barriers] line as 'merged'. Debug aid: APS5_FULL_BARRIERS=1

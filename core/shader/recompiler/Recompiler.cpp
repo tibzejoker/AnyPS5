@@ -946,6 +946,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         result.imageTableFaults = tables.faults;
     }
     registerModeSets(variant, snapshot);
+    result.codeAddress = request.shader.codeAddress;
     return result;
 }
 

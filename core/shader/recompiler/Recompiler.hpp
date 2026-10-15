@@ -544,6 +544,8 @@ struct ShaderInvocation {
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     bool cacheHit = false;
     std::uint32_t workgroupMemoryDwords = 0;
+    // The guest address of the program this result was compiled from (the [gpu-time] key).
+    std::uint64_t codeAddress = 0;
     [[nodiscard]] std::uint64_t PipelineVariantId() const { return specializationId != 0 ? specializationId : variantId; }
 };
 

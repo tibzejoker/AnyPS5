@@ -24,8 +24,11 @@ public:
         worker = std::thread([this] { run(); });
     }
 
+    // A static instance is destroyed at process exit, after Windows has ended the writer thread:
+    // joining it there never returns (a test exiting from main after a profile line hung), so the
+    // destructor lets it go; the driver's teardown stops it properly (StopProfileOutput).
     ~ProfileOutput() {
-        Stop();
+        if (worker.joinable()) worker.detach();
     }
 
     void Stop() {

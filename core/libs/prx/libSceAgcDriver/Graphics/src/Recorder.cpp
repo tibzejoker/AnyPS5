@@ -1840,7 +1840,7 @@ void Recorder::FlushStores() {
 
 namespace {
 
-constexpr std::uint32_t MaxTimedRanges = 512;
+constexpr std::uint32_t MaxTimedRanges = 4096;
 constexpr std::size_t CommandClasses = static_cast<std::size_t>(Recorder::CommandClass::Count);
 constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh"};
 // [barriers] counters by class (relaxed: only reported) and the [gputime] totals, which the
@@ -1920,7 +1920,7 @@ void reportBarriers() {
 }
 
 bool Recorder::GpuTimingEnabled() {
-    static const bool enabled = std::getenv("APS5_PROFILE_GPU") != nullptr;
+    static const bool enabled = std::getenv("APS5_PROFILE_GPU") != nullptr || std::getenv("APS5_GPU_TIME") != nullptr;
     return enabled;
 }
 
@@ -2046,6 +2046,11 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     // (a top-of-pipe stamp is not held back by the barrier that precedes the work).
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2);
     return index;
+}
+
+std::uint32_t Recorder::BeginDrawTiming(VkCommandBuffer commands, std::uint64_t key) {
+    if (!GpuTimingEnabled() || open == nullptr || open->commands != commands || open->queries == VK_NULL_HANDLE) return NoTiming;
+    return beginTiming(key);
 }
 
 void Recorder::EndGpuTiming(std::uint32_t index, std::uint64_t bytes) {
@@ -2472,7 +2477,9 @@ void Recorder::readSamples(Batch& batch) {
 }
 
 void Recorder::readGpuTiming(Batch& batch) {
-    if (batch.queries == VK_NULL_HANDLE || batch.timedKeys.empty()) return;
+    // A batch that was never submitted (dropped at teardown) wrote no stamps: waiting for its results
+    // would never return.
+    if (batch.queries == VK_NULL_HANDLE || batch.timedKeys.empty() || !batch.submitted) return;
     std::vector<std::uint64_t> stamps(batch.timedKeys.size() * 2);
     const auto result = context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, batch.queries, 0, static_cast<std::uint32_t>(stamps.size()), stamps.size() * sizeof(std::uint64_t), stamps.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
     if (result != VK_SUCCESS) return;
@@ -2536,6 +2543,32 @@ void Recorder::readGpuTiming(Batch& batch) {
         }
     }
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+    {
+        // [gpu-time]: the hottest programs (draw ranges cover the draw commands, dispatch ranges the
+        // dispatch) and the GPU time by category of the driver's command classes.
+        const auto classMs = [&](std::initializer_list<CommandClass> classes) {
+            double total = 0;
+            for (const auto which : classes) {
+                if (const auto found = timingByKey.find(ClassKey(which)); found != timingByKey.end()) total += found->second.ms;
+            }
+            return total;
+        };
+        double drawProgramMs = 0, dispatchProgramMs = 0;
+        for (const auto& [key, totals] : hot) ((key & 0xff00000000000000ull) == DrawProgramTag ? drawProgramMs : dispatchProgramMs) += totals.ms;
+        std::string top;
+        for (std::size_t i = 0; i < hot.size() && i < 15u; ++i) {
+            const bool draw = (hot[i].first & 0xff00000000000000ull) == DrawProgramTag;
+            char text[128];
+            std::snprintf(text, sizeof(text), " 0x%llx %s x%llu %.1fms %.0fus", static_cast<unsigned long long>(draw ? hot[i].first & 0x00ffffffffffffffull : hot[i].first), draw ? "draw" : "dispatch", static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms, hot[i].second.count != 0 ? hot[i].second.ms * 1000.0 / static_cast<double>(hot[i].second.count) : 0.0);
+            top += text;
+        }
+        std::fprintf(stderr, "[gpu-time] last 10 s, %llu presents, %llu batches %.0f ms first to last command: draws %.0f ms (draw commands %.0f ms), dispatches %.0f ms (with barriers and indirect arguments %.0f ms), copies/uploads %.0f ms, clears %.0f ms, driver passes %.0f ms (labels, DCC keys, shadow publish, template refresh, present blit); top 15 programs (address kind count total avg):%s\n",
+            static_cast<unsigned long long>(timingPresents.load(std::memory_order_relaxed)), static_cast<unsigned long long>(timingBatches), timingBatchMs,
+            classMs({CommandClass::Draw}), drawProgramMs, dispatchProgramMs, dispatchProgramMs + classMs({CommandClass::DispatchLeading, CommandClass::DispatchTrailing, CommandClass::IndirectArguments}),
+            classMs({CommandClass::Copy, CommandClass::StagingIn, CommandClass::StagingOut, CommandClass::StorageUpload, CommandClass::StorageWriteBack}),
+            classMs({CommandClass::Fill, CommandClass::FillClear, CommandClass::DccClear}),
+            classMs({CommandClass::LabelRun, CommandClass::DccKeyStore, CommandClass::ShadowPublish, CommandClass::TemplateDataRefresh, CommandClass::PresentBlit}), top.c_str());
+    }
     // The first field stays the program sum: the measure scripts match on it.
     AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over 10 s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
     for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);

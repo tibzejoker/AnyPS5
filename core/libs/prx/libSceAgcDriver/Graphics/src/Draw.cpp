@@ -17,6 +17,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DeviceDiagnostics.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -1328,8 +1329,30 @@ struct IndirectRecord {
 
 // The draw commands of one draw: the vertex and index buffer binds, then the direct draw, the
 // GPU-side indirect draw from `argumentBuffer` or the CPU-read records with the driver's rules.
+// The [gpu-time] key of the draw being recorded on this thread (Recorder::DrawProgramKey), set by
+// the draw paths before they record its commands.
+thread_local std::uint64_t drawProgramKey = 0;
+
+std::uint64_t drawKeyOf(std::span<const CompiledShader> shaders) {
+    std::uint64_t vertex = 0;
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) continue;
+        if (shader.stage == ShaderRecompiler::ShaderStage::Fragment && shader.program->codeAddress != 0) return Recorder::DrawProgramKey(shader.program->codeAddress);
+        if (vertex == 0) vertex = shader.program->codeAddress;
+    }
+    return Recorder::DrawProgramKey(vertex);
+}
+
 void recordDrawCommands(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, const IndirectRecord* indirect, VkBuffer argumentBuffer, VkDeviceSize argumentOffset) {
     if (context.recorder != nullptr) context.recorder->NoteSampledDraw(commands);
+    struct ProgramTiming {
+        Recorder* recorder;
+        std::uint32_t index;
+        ~ProgramTiming() {
+            if (recorder != nullptr) recorder->EndGpuTiming(index);
+        }
+    } programTiming{context.recorder, context.recorder != nullptr && Recorder::GpuTimingEnabled() ? context.recorder->BeginDrawTiming(commands, drawProgramKey) : Recorder::NoTiming};
+    if (GpuCheckpointsRequested()) NoteCheckpoint(commands, CheckpointKind::Draw, drawProgramKey & 0x00ffffffffffffffull);
     const auto* args = indirect != nullptr ? indirect->args : nullptr;
     if (state.stages.mesh && args != nullptr) {
         context.Function<PFN_vkCmdDrawMeshTasksIndirectEXT>("vkCmdDrawMeshTasksIndirectEXT")(commands, argumentBuffer, argumentOffset, 1, sizeof(VkDrawMeshTasksIndirectCommandEXT));
@@ -1721,6 +1744,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // The draw's [gputime] class range: from its first barrier to the pass's trailing barrier (a
     // continued draw lies inside its pass's range).
     const auto drawTiming = !continued ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
+    if (Recorder::GpuTimingEnabled() || GpuCheckpointsRequested()) drawProgramKey = drawKeyOf(shaders);
     if (!continued && Recorder::BarrierValidate()) {
         auto reads = resources.InPlaceReads();
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
@@ -2225,6 +2249,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     APS5_LOG_CHARS_OUT_DEBUG("CommandBatch created");
     // The draw's [gputime] class range: from its first barrier to the download barrier.
     const auto drawTiming = recorded ? recorder->BeginGpuTiming(CommandClass::Draw) : Recorder::NoTiming;
+    if (Recorder::GpuTimingEnabled() || GpuCheckpointsRequested()) drawProgramKey = drawKeyOf(shaders);
     if (recorded && Recorder::BarrierValidate()) {
         auto reads = resources->InPlaceReads();
         reads.insert(reads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
