@@ -2770,14 +2770,36 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     original.resize(static_cast<std::size_t>(guestBytes));
     GuestMemory::ReadCommitted(descriptor.baseAddress, original);
     {
-            Buffer staging(context, original.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            auto stagingOwner = std::make_shared<Buffer>(context, original.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            auto& staging = *stagingOwner;
             if (uploadedKeys == DccKeys::Uncompressed) std::memcpy(staging.Bytes().data(), original.data(), original.size());
             else ReadTextureSurface(descriptor, uploadedKeys, staging.Bytes().first(original.size()));
-            DeviceBuffer tiled(context, original.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-            DeviceBuffer linear(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            auto tiledOwner = std::make_shared<DeviceBuffer>(context, original.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            auto linearOwner = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            auto& tiled = *tiledOwner;
+            auto& linear = *linearOwner;
             detiler.BeginBatch();
-            CommandBatch batch(context);
-            const auto commands = batch.Handle();
+            // Recorded into the open batch like the import path's upload (the staging bytes are
+            // final before the recording, the buffers and the image kept by it): a batch of its own
+            // waited for all the recorder's work under the GPU mutex. APS5_NO_RECORDED_CPU_UPLOAD=1
+            // waits as before.
+            static const bool recordCpuUpload = std::getenv("APS5_NO_RECORDED_CPU_UPLOAD") == nullptr;
+            auto* recorder = recordCpuUpload ? Recorder::Active() : nullptr;
+            std::unique_ptr<CommandBatch> batch;
+            VkCommandBuffer commands = VK_NULL_HANDLE;
+            auto timing = Recorder::NoTiming;
+            if (recorder != nullptr) {
+                commands = recorder->Commands();
+                timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
+                recorder->Keep(stagingOwner, original.size());
+                recorder->Keep(tiledOwner, original.size());
+                recorder->Keep(linearOwner, static_cast<std::size_t>(linearBytes));
+                if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
+                Recorder::CountBarriers(Recorder::CommandClass::StorageUpload, 4);
+            } else {
+                batch = std::make_unique<CommandBatch>(context);
+                commands = batch->Handle();
+            }
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             CopyBuffer(context, commands, staging.Handle(), 0, tiled.Handle(), 0, original.size());
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
@@ -2807,7 +2829,8 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
             context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &toGeneral);
             APS5_LOG_CHARS_OUT("StorageTexture upload submit");
-            batch.SubmitAndWait();
+            if (batch) batch->SubmitAndWait();
+            else recorder->EndGpuTiming(timing, original.size());
             APS5_LOG_CHARS_OUT("StorageTexture upload done");
     }
     countStorageUpload(2, guestBytes);
