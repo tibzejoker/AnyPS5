@@ -309,6 +309,59 @@ void SampleSliceZero(AgcDriver::VulkanDevice& device, std::uint8_t* texels, std:
     AgcDriver::Graphics::ClearCachedTextures(device.Device());
 }
 
+alignas(256) constexpr std::array<std::uint32_t, 10> StoreArrayLayerCode{
+    0x7e020280, 0x7e040282, 0x7e0602f2, 0x7e0802f2, 0x7e0a02f2, 0x7e0c02f2, 0xf0201f28, 0x00010300, 0xbf810000, 0xbf810000,
+};
+alignas(256) constexpr std::array<std::uint32_t, 8> Store2DCode{
+    0x7e020281, 0x7e0402f2, 0x7e0602f2, 0x7e0802f2, 0x7e0a02f2, 0xf0201f08, 0x00010200, 0xbf810000,
+};
+
+// A 2D surface over one slice of a cached array storage image is that image's memory: it shares
+// the array's image at the slice (StorageTexture::SharedRootFor), its writes are the array's
+// pending results, and both reach guest memory with one write-back.
+void RunSharedSlice(AgcDriver::VulkanDevice& device, std::uint8_t* texels) {
+    const auto surface = AddressOf(texels);
+    auto* words = reinterpret_cast<std::uint32_t*>(texels);
+    std::fill_n(words, SurfaceBytes / 4u, Initial);
+    AgcDriver::GuestMemory::CollectWrites(surface, SurfaceBytes);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+    std::vector<std::uint32_t> arrayData(16, 0u);
+    const auto array = SurfaceDescriptor(surface, TileR64KBX, Type2DArray, Layers - 1u);
+    std::copy(array.begin(), array.end(), arrayData.begin() + 4);
+    Dispatch(device, StoreArrayLayerCode, arrayData);
+    const auto image = StorageTexture::FindPending(surface, SurfaceBytes);
+    Require(image != nullptr && image->Descriptor().dimension == TextureDimension::k2DArray && !image->SharesImage(), "shared slice: the array store left no pending array image");
+    StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "test shared slice");
+    device.WaitIdle();
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    image->Refresh();
+    const auto shared = StorageTexture::SharedStorageCounts();
+    const auto before = StorageTexture::TrackCounters();
+    char message0[256];
+    std::vector<std::uint32_t> sliceData(16, 0u);
+    const auto slice = SurfaceDescriptor(surface + 3 * LayerBytes, TileR64KBX, Type2D, 0u);
+    std::copy(slice.begin(), slice.end(), sliceData.begin() + 4);
+    AgcDriver::GuestMemory::BumpCollectEpoch();
+    Dispatch(device, Store2DCode, sliceData);
+    Require(StorageTexture::SharedStorageCounts().created == shared.created + 1, "shared slice: the 2D surface over slice 3 did not share the array image");
+    {
+        const auto found = StorageTexture::FindPending(surface, SurfaceBytes);
+        std::snprintf(message0, sizeof(message0), "shared slice: the slice writes are not the array image's pending results (found %p 0x%llx shares %d, array %p)", static_cast<const void*>(found.get()), found ? static_cast<unsigned long long>(found->Descriptor().baseAddress) : 0ull, found ? found->SharesImage() : -1, static_cast<const void*>(image.get()));
+        Require(found == image, message0);
+    }
+    const auto after = StorageTexture::TrackCounters();
+    Require(after.flushes == before.flushes && after.uploadedBytes == before.uploadedBytes, "shared slice: the array was stored or uploaded for the slice");
+    StorageTexture::FlushPending(surface, SurfaceBytes, nullptr, "test shared slice");
+    device.WaitIdle();
+    const auto one = std::bit_cast<std::uint32_t>(1.0f);
+    const auto ones = [&](std::size_t from, std::size_t count) { return static_cast<std::size_t>(std::count(words + from / 4u, words + (from + count) / 4u, one)); };
+    char message[192];
+    std::snprintf(message, sizeof(message), "shared slice: %zu texels of 1.0 in slice 2 (array store), %zu in slice 3 (2D store), %zu elsewhere", ones(2 * LayerBytes, LayerBytes), ones(3 * LayerBytes, LayerBytes), ones(0, 2 * LayerBytes));
+    Require(ones(2 * LayerBytes, LayerBytes) == Threads && ones(3 * LayerBytes, LayerBytes) == Threads && ones(0, 2 * LayerBytes) == 0, message);
+    AgcDriver::Graphics::ClearCachedTextures(device.Device());
+}
+
 }
 
 int main() {
@@ -319,6 +372,7 @@ int main() {
         Run(*device, block.Data(), TileR64KBX);
         Run(*device, block.Data(), static_cast<std::uint32_t>(AgcDriver::Graphics::ColorTileMode::D64KBX));
         for (std::uint32_t slice = 1; slice < Layers; ++slice) Run(*device, block.Data(), TileR64KBX, true, slice);
+        RunSharedSlice(*device, block.Data());
         std::puts("array layer target tests passed");
         return 0;
     } catch (const std::exception& error) {

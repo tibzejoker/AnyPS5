@@ -371,6 +371,10 @@ void reportTrack(const Context& context) {
     AgcDriver::ProfilePrint_nid_no_patch("[track-lend] last 10 s: %llu lenders used, %llu image copies (%.1f MiB), %llu skipped (copied already at the same versions), %llu pending units handed over; refused: shape %llu, slices %llu, stamped %llu, pending here %llu, straddling unit %llu; %llu lends back to an image that lent to this one before (ping-pong); shape refusals: no block units or 3D %llu, compressed keys %llu, tile mode or pipe-bank xor %llu, element size %llu, storage texel size %llu; %llu lenders whose slices are whole subresources of both images\n", lend[0], lend[1], lend[2] / 1048576.0, lend[3], lend[4], lend[5], lend[6], lend[7], lend[8], lend[9], lend[10], lend[11], lend[12], lend[13], lend[14], lend[15], lend[16]);
     AgcDriver::ProfilePrint_nid_no_patch("[track-why] last 10 s: uploads by reason/path (count/MiB):%s; refresh uploads: %llu with every unit changed, %llu with some units, %llu moved more than their changed units (+%.1f MiB); changed units by cause:%s; other images stored by refreshes: %llu over the same range (%llu of the same size and texel width), %llu containing it, %llu inside it, %llu crossing it; same-shape alias images: %llu found, refused for %llu keys or no import, %llu an untracked unit, %llu a unit pending in both; %llu lent their units; import windows %llu: %llu pages the import call marked with unchanged bytes (not stamped), %llu changed during the call (stamped as CPU stores), %llu windows left the range unwatched\n", uploads.empty() ? " none" : uploads.c_str(), whole, partial, widened, widenedBytes / 1048576.0, units.c_str(), sameRange, sameShape, containing, inside, crossing, aliasFound, aliasKeys, aliasUntracked, aliasBoth, aliasBorrowed, static_cast<unsigned long long>(windows.imports - seen.imports), static_cast<unsigned long long>(windows.pagesHeld - seen.pagesHeld), static_cast<unsigned long long>(windows.pagesDiffered - seen.pagesDiffered), static_cast<unsigned long long>(windows.unwatched - seen.unwatched));
     track.reportedWindows = windows;
+    static StorageTexture::SharedCounts sharedSeen{};
+    const auto sharedNow = StorageTexture::SharedStorageCounts();
+    AgcDriver::ProfilePrint_nid_no_patch("[track-shared] last 10 s: %llu surfaces made views of a root image; root candidates refused: shape %llu, slices %llu, DCC keys %llu\n", static_cast<unsigned long long>(sharedNow.created - sharedSeen.created), static_cast<unsigned long long>(sharedNow.refusedShape - sharedSeen.refusedShape), static_cast<unsigned long long>(sharedNow.refusedSlices - sharedSeen.refusedSlices), static_cast<unsigned long long>(sharedNow.refusedKeys - sharedSeen.refusedKeys));
+    sharedSeen = sharedNow;
 }
 
 // Per-layer validity of array surfaces (see StorageTexture::layerBegin): a fill of one layer clears
@@ -822,11 +826,11 @@ bool Texture::RefreshDepthCopy() {
         region.bufferOffset = offset;
         region.bufferRowLength = 0;
         region.bufferImageHeight = 0;
-        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, copyLayers};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level + storageSource->ImageBaseLevel(), storageSource->ImageBaseLayer(), copyLayers};
         region.imageOffset = {0, 0, 0};
         region.imageExtent = extent;
         fromSource.push_back(region);
-        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+        region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, level, 0, copyLayers};
         toDepth.push_back(region);
         offset += static_cast<std::uint64_t>(extent.width) * extent.height * copyElementBytes * copyLayers;
     }
@@ -886,8 +890,8 @@ bool Texture::refreshBlockCopy() {
     std::vector<VkImageCopy> regions;
     for (std::uint32_t level = 0; level < copyLevels; ++level) {
         VkImageCopy region{};
-        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, copyLayers};
-        region.dstSubresource = region.srcSubresource;
+        region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level + storageSource->ImageBaseLevel(), storageSource->ImageBaseLayer(), copyLayers};
+        region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, 0, copyLayers};
         region.extent = {std::max(copyWidth >> level, 1u) / 4u, std::max(copyHeight >> level, 1u) / 4u, 1u};
         regions.push_back(region);
     }
@@ -960,7 +964,7 @@ Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& 
         viewInfo.format = vkFormat;
         viewFormat = vkFormat;
         viewInfo.components = components;
-        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, descriptor.baseLevel, viewLevelCount, descriptor.baseArray, viewLayerCount};
+        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, descriptor.baseLevel + source->ImageBaseLevel(), viewLevelCount, descriptor.baseArray + source->ImageBaseLayer(), viewLayerCount};
         VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
         ChainMinLod(context, descriptor, viewInfo, minLod);
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView storage view");
@@ -1279,7 +1283,116 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
     return texture;
 }
 
-StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel) : context(context), detiler(detiler), descriptor(descriptor) {
+namespace {
+
+std::atomic<std::uint64_t> sharedCreated{0}, sharedRefusedShape{0}, sharedRefusedSlices{0}, sharedRefusedKeys{0};
+
+// Live surfaces sharing a root's image (StorageTexture::CreateShared): FindPending serves a surface
+// whose results are its root's pending ones through its own views. The mutex is a leaf.
+struct SharedViewList {
+    std::mutex mutex;
+    std::vector<StorageTexture*> textures;
+};
+
+SharedViewList& SharedViews() {
+    static SharedViewList list;
+    return list;
+}
+
+bool SharedStorageEnabled() {
+    static const bool disabled = std::getenv("APS5_NO_SHARED_STORAGE") != nullptr;
+    return !disabled;
+}
+
+std::uint32_t TexelBytes(VkFormat format);
+
+std::uint32_t SharedTexelBytes(VkFormat format) {
+    return TexelBytes(format);
+}
+
+}
+
+std::optional<std::pair<std::uint32_t, std::uint32_t>> StorageTexture::holdsSlices(const GuestTextureResource& other, const SurfaceGeometry& otherGeometry, VkFormat otherFormat) const {
+    const auto refuse = [](std::atomic<std::uint64_t>& counter) -> std::optional<std::pair<std::uint32_t, std::uint32_t>> {
+        counter.fetch_add(1, std::memory_order_relaxed);
+        return std::nullopt;
+    };
+    const auto oneDimensional = [](TextureDimension dimension) { return dimension == TextureDimension::k1D || dimension == TextureDimension::k1DArray; };
+    if (root != nullptr || !blockUnits || geometry.thick || otherGeometry.thick || geometry.imageDepth != 1 || otherGeometry.imageDepth != 1 || otherGeometry.mips.empty()) return refuse(sharedRefusedShape);
+    if (other.dimension == TextureDimension::k3D || descriptor.dimension == TextureDimension::k3D || oneDimensional(other.dimension) != oneDimensional(descriptor.dimension) || (other.dimension == TextureDimension::kCube && descriptor.dimension != TextureDimension::kCube)) return refuse(sharedRefusedShape);
+    if (descriptor.tileMode != other.tileMode || descriptor.pipeBankXor != other.pipeBankXor || BytesPerElement(descriptor.format) != BytesPerElement(other.format)) return refuse(sharedRefusedShape);
+    const auto texelBytes = SharedTexelBytes(storageFormat);
+    if (texelBytes == 0 || texelBytes != SharedTexelBytes(otherFormat)) return refuse(sharedRefusedShape);
+    if (!((other.dccAddress == 0 && descriptor.dccAddress == 0) || (other.baseAddress == descriptor.baseAddress && other.dccAddress == descriptor.dccAddress))) return refuse(sharedRefusedKeys);
+    const auto sliceBegin = [](const GuestTextureResource& resource, const SurfaceGeometry& shape, std::uint32_t level, std::uint32_t layer) { return resource.baseAddress + shape.GuestLayerOffset(layer) + shape.mips[level].tiledOffset; };
+    const auto same = [](const TileMipLayout& a, const TileMipLayout& b) { return !a.tail && !b.tail && a.width == b.width && a.height == b.height && a.pitchBytes == b.pitchBytes && a.blocksPerRow == b.blocksPerRow && a.tiledSize == b.tiledSize; };
+    const auto first = sliceBegin(other, otherGeometry, 0, 0);
+    for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
+        for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
+            if (!geometry.HasLayer(level, layer) || sliceBegin(descriptor, geometry, level, layer) != first) continue;
+            bool holds = true;
+            for (std::uint32_t otherLevel = 0; holds && otherLevel < other.mipCount; ++otherLevel) {
+                for (std::uint32_t otherLayer = 0; holds && otherLayer < otherGeometry.layers; ++otherLayer) {
+                    if (!otherGeometry.HasLayer(otherLevel, otherLayer)) continue;
+                    const auto myLevel = otherLevel + level;
+                    const auto myLayer = otherLayer + layer;
+                    holds = myLevel < descriptor.mipCount && myLayer < arrayLayers && geometry.HasLayer(myLevel, myLayer) && sliceBegin(descriptor, geometry, myLevel, myLayer) == sliceBegin(other, otherGeometry, otherLevel, otherLayer) && same(mips[myLevel], otherGeometry.mips[otherLevel]);
+                }
+            }
+            if (holds && (other.dimension != TextureDimension::kCube || layer % 6 == 0)) return std::pair{level, layer};
+        }
+    }
+    return refuse(sharedRefusedSlices);
+}
+
+std::shared_ptr<StorageTexture> StorageTexture::SharedRootFor(const Context& context, const GuestTextureResource& descriptor, std::uint32_t& level, std::uint32_t& layer) {
+    if (!SharedStorageEnabled() || IsBlockCompressed(descriptor.format)) return nullptr;
+    const auto geometry = DescribeSurface(descriptor);
+    if (geometry.guestBytes == 0) return nullptr;
+    const auto format = StorageFormatFor(context, ResolveTextureFormat(descriptor.format));
+    std::vector<std::shared_ptr<StorageTexture>> candidates;
+    {
+        auto& live = Live();
+        std::lock_guard lock(live.mutex);
+        for (auto* texture : live.textures) {
+            if (texture->root != nullptr || texture->released || !texture->Cached() || texture->context.device != context.device) continue;
+            if (descriptor.baseAddress < texture->descriptor.baseAddress || descriptor.baseAddress + geometry.guestBytes > texture->descriptor.baseAddress + texture->guestBytes) continue;
+            if (auto alive = texture->weak_from_this().lock()) candidates.push_back(std::move(alive));
+        }
+    }
+    for (const auto& candidate : candidates) {
+        if (const auto offset = candidate->holdsSlices(descriptor, geometry, format)) {
+            level = offset->first;
+            layer = offset->second;
+            return candidate;
+        }
+    }
+    return nullptr;
+}
+
+std::shared_ptr<StorageTexture> StorageTexture::CreateShared(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel, std::shared_ptr<StorageTexture> root, std::uint32_t level, std::uint32_t layer) {
+    auto texture = std::shared_ptr<StorageTexture>(new StorageTexture(context, detiler, descriptor, mipLevel, std::move(root), level, layer));
+    texture->defaultMip = mipLevel;
+    texture->view = texture->createView(mipLevel, false, texture->storageFormat);
+    sharedCreated.fetch_add(1, std::memory_order_relaxed);
+    {
+        auto& views = SharedViews();
+        std::lock_guard lock(views.mutex);
+        views.textures.push_back(texture.get());
+    }
+    static const bool trace = std::getenv("APS5_TRACE_SHARED_STORAGE") != nullptr;
+    if (trace) std::fprintf(stderr, "[shared-storage] 0x%llx %ux%u mips %u layers %u format %u shares 0x%llx %ux%u mips %u format %u at level %u layer %u\n", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.mipCount, texture->arrayLayers, descriptor.format, static_cast<unsigned long long>(texture->root->descriptor.baseAddress), texture->root->descriptor.width, texture->root->descriptor.height, texture->root->descriptor.mipCount, texture->root->descriptor.format, level, layer);
+    return texture;
+}
+
+StorageTexture::SharedCounts StorageTexture::SharedStorageCounts() {
+    return {sharedCreated.load(std::memory_order_relaxed), sharedRefusedShape.load(std::memory_order_relaxed), sharedRefusedSlices.load(std::memory_order_relaxed), sharedRefusedKeys.load(std::memory_order_relaxed)};
+}
+
+StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel, std::shared_ptr<StorageTexture> sharedRoot, std::uint32_t level, std::uint32_t layer) : context(context), detiler(detiler), descriptor(descriptor) {
+    root = std::move(sharedRoot);
+    rootLevel = level;
+    rootLayer = layer;
     try {
         Require(!IsBlockCompressed(descriptor.format), "block-compressed textures cannot be storage images");
         Require(mipLevel < descriptor.mipCount, "storage texture mip level is outside the texture");
@@ -1306,6 +1419,14 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         layerOriginal.assign(trackedLayers, true);
         sliceLinearBytes = geometry.sliceLinearBytes;
         const auto linearBytes = sliceLinearBytes * arrayLayers;
+        if (root != nullptr) {
+            image = root->image;
+            VkFormatProperties properties{};
+            context.formatProperties(context.physical, vkFormat, &properties);
+            attachable = root->attachable && (descriptor.dimension == TextureDimension::k2D || descriptor.dimension == TextureDimension::k2DArray) && (properties.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
+            static_cast<void>(linearBytes);
+            return;
+        }
 
         VkImageCreateInfo imageInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
         // Sampled views of other same-size formats (sRGB, reinterpretations) read the image directly.
@@ -1686,7 +1807,7 @@ VkImageView StorageTexture::createView(std::uint32_t mip, bool firstLayer, VkFor
     viewInfo.viewType = firstLayer ? VK_IMAGE_VIEW_TYPE_2D : descriptor.dimension == TextureDimension::k1D ? VK_IMAGE_VIEW_TYPE_1D : descriptor.dimension == TextureDimension::k2D ? VK_IMAGE_VIEW_TYPE_2D : descriptor.dimension == TextureDimension::k3D ? VK_IMAGE_VIEW_TYPE_3D : descriptor.dimension == TextureDimension::k1DArray ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     viewInfo.format = format;
     viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1u, descriptor.baseArray, viewLayerCount};
+    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip + rootLevel, 1u, descriptor.baseArray + rootLayer, viewLayerCount};
     VkImageView created = VK_NULL_HANDLE;
     Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &created), "vkCreateImageView storage");
     return created;
@@ -1718,7 +1839,7 @@ VkImageView StorageTexture::elementLayerView(std::uint32_t level, std::uint32_t 
     viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format = TextureDetiler::ImageElementFormat(BytesPerElement(descriptor.format));
     viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level, 1u, geometry.CopyLayer(layer), 1u};
+    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, level + rootLevel, 1u, geometry.CopyLayer(layer) + rootLayer, 1u};
     VkImageView created = VK_NULL_HANDLE;
     Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &created), "vkCreateImageView storage element");
     elementLayerViews.emplace(key, created);
@@ -1741,7 +1862,7 @@ VkImageView StorageTexture::AttachmentView(VkFormat format, std::uint32_t mip, s
     viewInfo.viewType = layers > 1 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
     viewInfo.format = format;
     viewInfo.components = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1u, volume ? depthSlice : descriptor.baseArray + layer, layers};
+    viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip + rootLevel, 1u, volume ? depthSlice : descriptor.baseArray + layer + rootLayer, layers};
     VkImageView created = VK_NULL_HANDLE;
     Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &created), "vkCreateImageView attachment");
     attachmentViews.emplace(std::tuple{format, mip, depthSlice, layers, layer}, created);
@@ -1792,11 +1913,11 @@ VkImageView StorageTexture::AttachmentProxyView() {
 
 namespace {
 
-void blitWhole(const Context& context, VkCommandBuffer commands, VkImage source, VkImage destination, std::uint32_t width, std::uint32_t height) {
+void blitWhole(const Context& context, VkCommandBuffer commands, VkImage source, VkImage destination, std::uint32_t width, std::uint32_t height, std::uint32_t sourceLevel = 0, std::uint32_t sourceLayer = 0, std::uint32_t destinationLevel = 0, std::uint32_t destinationLayer = 0) {
     VkImageBlit region{};
-    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, sourceLevel, sourceLayer, 1};
     region.srcOffsets[1] = {static_cast<std::int32_t>(width), static_cast<std::int32_t>(height), 1};
-    region.dstSubresource = region.srcSubresource;
+    region.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, destinationLevel, destinationLayer, 1};
     region.dstOffsets[1] = region.srcOffsets[1];
     context.Function<PFN_vkCmdBlitImage>("vkCmdBlitImage")(commands, source, VK_IMAGE_LAYOUT_GENERAL, destination, VK_IMAGE_LAYOUT_GENERAL, 1, &region, VK_FILTER_NEAREST);
 }
@@ -1822,7 +1943,7 @@ void StorageTexture::RecordAttachmentProxyLoad(VkCommandBuffer commands, VkImage
     const VkMemoryBarrier written{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
     const auto discard = proxyBarrier(proxyImage, 0, VK_ACCESS_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
     barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &written, 0, nullptr, 1, &discard);
-    blitWhole(context, commands, image, proxyImage, descriptor.width, descriptor.height);
+    blitWhole(context, commands, image, proxyImage, descriptor.width, descriptor.height, rootLevel, rootLayer, 0, 0);
     const auto attach = proxyBarrier(proxyImage, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL, attachmentLayout);
     barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, 0, nullptr, 0, nullptr, 1, &attach);
 }
@@ -1832,7 +1953,7 @@ void StorageTexture::RecordAttachmentProxyStore(VkCommandBuffer commands, VkImag
     const auto barrier = context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier");
     const auto detach = proxyBarrier(proxyImage, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, attachmentLayout, VK_IMAGE_LAYOUT_GENERAL);
     barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &detach);
-    blitWhole(context, commands, proxyImage, image, descriptor.width, descriptor.height);
+    blitWhole(context, commands, proxyImage, image, descriptor.width, descriptor.height, 0, 0, rootLevel, rootLayer);
     const VkMemoryBarrier stored{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT};
     barrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &stored, 0, nullptr, 0, nullptr);
 }
@@ -1920,6 +2041,7 @@ LookupOutcomes& ThreadLookupOutcomes() {
 }
 
 bool StorageTexture::Refresh() {
+    if (root != nullptr) return root->Refresh();
     const bool profile = LookupOutcomes::Profiled();
     countTrack(Track().refreshes, nullptr, 0);
     const TrackBackingScope backing(context, descriptor.baseAddress, guestBytes);
@@ -2261,6 +2383,7 @@ bool StorageTexture::Refresh() {
 }
 
 DccKeys StorageTexture::ProvedKeys() const {
+    if (root != nullptr) return root->ProvedKeys();
     std::optional<DccKeys> keys;
     if (descriptor.dccAddress != 0 && uploadedKeys == DccKeys::Uncompressed) keys = WaitForKeyWriters(descriptor, guestBytes);
     if (keys.has_value()) keyProof = {};
@@ -2330,6 +2453,7 @@ void StorageTexture::CountSnapshotCompare(std::size_t bytes) {
 }
 
 bool StorageTexture::ServesKeysAt(std::uint64_t dccAddress) const {
+    if (root != nullptr) return root->ServesKeysAt(dccAddress);
     const bool locked = GuestMemory::GpuMutex().HeldByThisThread();
     const auto readFollowed = [&] {
         DccKeyProof unlocked;
@@ -3285,7 +3409,23 @@ bool StorageTexture::keysFillMatches(std::uint64_t address, std::size_t bytes, b
     return !overlapped || bytes <= DccKeyCount(descriptor, guestBytes);
 }
 
+void StorageTexture::markRangePending(std::uint64_t address, std::uint64_t bytes) {
+    const auto begin = std::max(address, descriptor.baseAddress);
+    const auto end = std::min(address + bytes, descriptor.baseAddress + guestBytes);
+    if (!blockUnits || begin >= end || (descriptor.dccAddress != 0 && (IsDccClear(uploadedKeys) || uploadedKeys == DccKeys::ClearSingle) && !IsDccClear(filledKeys))) {
+        MarkDirty();
+        return;
+    }
+    const auto first = static_cast<std::uint32_t>((begin - descriptor.baseAddress) / trackedLayerBytes);
+    const auto last = static_cast<std::uint32_t>((end - 1 - descriptor.baseAddress) / trackedLayerBytes);
+    markLayersPending(first, last - first + 1);
+}
+
 void StorageTexture::MarkDirty() {
+    if (root != nullptr) {
+        root->markRangePending(descriptor.baseAddress, guestBytes);
+        return;
+    }
     if (descriptor.dccAddress != 0 && (IsDccClear(uploadedKeys) || uploadedKeys == DccKeys::ClearSingle) && !IsDccClear(filledKeys)) {
         traceKeyStore("first write", descriptor, guestBytes);
         MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, DccKeyCount(descriptor, guestBytes));
@@ -3295,6 +3435,11 @@ void StorageTexture::MarkDirty() {
 }
 
 void StorageTexture::MarkSliceDirty(std::uint32_t slice) {
+    if (root != nullptr) {
+        if (geometry.thick || slice >= geometry.imageLayers || geometry.layerBytes == 0) root->markRangePending(descriptor.baseAddress, guestBytes);
+        else root->markRangePending(descriptor.baseAddress + geometry.GuestLayerOffset(slice), geometry.layerBytes);
+        return;
+    }
     if (geometry.thick || geometry.imageLayers <= 1 || slice >= geometry.imageLayers || geometry.layerBytes == 0 || trackedLayerBytes == 0 || descriptor.dccAddress != 0) {
         MarkDirty();
         return;
@@ -3379,6 +3524,7 @@ void StorageTexture::Flush() {
         std::lock_guard lock(live.mutex);
         released = true;
     }
+    if (root != nullptr) return;
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
@@ -3619,7 +3765,14 @@ std::shared_ptr<StorageTexture> StorageTexture::FindPending(std::uint64_t addres
         // shorter) is served by the chain's image; CanCopyFrom then checks the geometry.
         if (containing == nullptr) containing = texture;
     }
-    return containing != nullptr ? containing->weak_from_this().lock() : nullptr;
+    if (containing != nullptr) return containing->weak_from_this().lock();
+    auto& views = SharedViews();
+    std::lock_guard viewsLock(views.mutex);
+    for (auto* texture : views.textures) {
+        if (texture->descriptor.baseAddress != address || texture->guestBytes < bytes || !texture->root->dirty || !texture->root->pendingUnitInside(address, static_cast<std::size_t>(bytes))) continue;
+        if (auto alive = texture->weak_from_this().lock()) return alive;
+    }
+    return nullptr;
 }
 
 std::shared_ptr<StorageTexture> StorageTexture::FindPendingSlice(std::uint64_t address, std::uint64_t bytes) {
@@ -3679,6 +3832,7 @@ std::uint64_t StorageTexture::PendingSerial() {
 }
 
 void StorageTexture::NoteProved() const {
+    if (root != nullptr) root->NoteProved();
     provedPresent.store(Recorder::Presents(), std::memory_order_relaxed);
 }
 
@@ -4103,6 +4257,11 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
 }
 
 bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::uint32_t layer, const char*& refusal) {
+    if (root != nullptr) {
+        if (layer == WholeImage && rootLevel == 0 && descriptor.mipCount == root->descriptor.mipCount && geometry.imageLayers == 1) return root->FillClear(pattern, rootLayer, refusal);
+        refusal = "part of a shared image";
+        return false;
+    }
     // Debug aid (APS5_TRACE_FILL_COVER=1): the first layer covers refused, with the surface, the
     // pattern and the generation the refusal was memoized at (ClassifyFill's layerRefusedGeneration).
     static const bool trace = std::getenv("APS5_TRACE_FILL_COVER") != nullptr;
@@ -4261,6 +4420,12 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
 }
 
 void StorageTexture::WriteBack() {
+    if (root != nullptr) {
+        const auto previous = std::exchange(flushReason, "explicit");
+        root->writeBack(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+        flushReason = previous;
+        return;
+    }
     const auto previous = std::exchange(flushReason, "explicit");
     writeBack(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     flushReason = previous;
@@ -4284,6 +4449,10 @@ bool StorageTexture::SameSurfaceShape(const StorageTexture& other) const {
 }
 
 bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
+    if (root != nullptr || source.root != nullptr) {
+        refusal = "shared image";
+        return false;
+    }
     if (&source == this || !SameSurfaceShape(source)) {
         refusal = "shape";
         return false;
@@ -5215,6 +5384,11 @@ StorageTexture::~StorageTexture() {
         std::lock_guard lock(live.mutex);
         std::erase(live.textures, this);
     }
+    if (root != nullptr) {
+        auto& views = SharedViews();
+        std::lock_guard lock(views.mutex);
+        std::erase(views.textures, this);
+    }
     // Cache eviction flushes first; anything still pending here is being torn down with the device.
     {
         auto& pending = Pending();
@@ -5249,7 +5423,7 @@ void StorageTexture::release() noexcept {
     if (proxyImage) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, proxyImage, nullptr);
     if (proxyMemory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, proxyMemory, nullptr);
     if (view) context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr);
-    if (image) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
+    if (image && root == nullptr) context.Function<PFN_vkDestroyImage>("vkDestroyImage")(context.device, image, nullptr);
     if (memory) context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, memory, nullptr);
 }
 

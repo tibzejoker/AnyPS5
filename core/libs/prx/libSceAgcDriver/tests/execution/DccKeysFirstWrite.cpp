@@ -771,6 +771,48 @@ void RunLentRows(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     Require(lender->Refresh() == false || Count(block, SurfaceBytes, 0xff) == 2u * Threads * 4u, "lent rows: the small image lost the rows");
 }
 
+// The same surface bound under another storage format of the same texel size is the first
+// image's memory: it opens views on that image instead of having one of its own, its writes are
+// the first image's pending results, and nothing is copied, lent or stored between the two.
+void RunSharedAlias(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+    using namespace AgcDriver::GuestMemory;
+    constexpr std::uint32_t Format32Float = 22;
+    const auto address = AddressOf(block);
+    std::memset(block, 0x55, BlockBytes);
+    auto unorm = TextureDescriptor(block, nullptr);
+    unorm[6] = 0;
+    unorm[7] = 0;
+    auto single = unorm;
+    single[1] = (single[1] & ~(0x1ffu << 20u)) | (Format32Float << 20u);
+    std::vector<std::uint32_t> unormData(16, 0u);
+    std::copy(unorm.begin(), unorm.end(), unormData.begin() + 4);
+    std::vector<std::uint32_t> singleData(16, 0u);
+    std::copy(single.begin(), single.end(), singleData.begin() + 4);
+    std::lock_guard gpu(GpuMutex());
+    BumpCollectEpoch();
+    Dispatch(device, WriteCode, unormData);
+    const auto image = StorageTexture::FindPending(address, SurfaceBytes);
+    Require(image != nullptr && !image->SharesImage(), "shared alias: the RGBA8 surface has no pending image of its own");
+    StorageTexture::FlushPending(address, SurfaceBytes, nullptr, "test shared alias");
+    device.WaitIdle();
+    BumpCollectEpoch();
+    image->Refresh();
+    const auto shared = StorageTexture::SharedStorageCounts();
+    const auto before = StorageTexture::TrackCounters();
+    BumpCollectEpoch();
+    Dispatch(device, WriteRowCode, singleData);
+    Require(StorageTexture::SharedStorageCounts().created == shared.created + 1, "shared alias: the R32 binding of the surface did not share the RGBA8 image");
+    Require(StorageTexture::FindPending(address, SurfaceBytes) == image, "shared alias: the R32 writes are not the RGBA8 image's pending results");
+    BumpCollectEpoch();
+    Require(image->Refresh(), "shared alias: the shared image was uploaded after a write through its other format");
+    const auto after = StorageTexture::TrackCounters();
+    Require(after.flushes == before.flushes && after.uploadedBytes == before.uploadedBytes, "shared alias: the two formats copied or stored to each other");
+    StorageTexture::FlushPending(address, SurfaceBytes, nullptr, "test shared alias");
+    device.WaitIdle();
+    Require(Count(block, SurfaceBytes, 0xff) == Threads * 4u, "shared alias: the RGBA8 row was lost");
+    Require(Count(block, SurfaceBytes, 0x3f) == Threads, "shared alias: the R32 row did not reach guest memory");
+}
+
 #ifdef _WIN32
 void RunHintedImport(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     using namespace AgcDriver::GuestMemory;
@@ -932,6 +974,9 @@ int main() {
             std::optional<GuestBlock> lentRows;
             lentRows.emplace(true);
             RunLentRows(*device, lentRows->Data());
+            std::optional<GuestBlock> sharedAlias;
+            sharedAlias.emplace(true);
+            RunSharedAlias(*device, sharedAlias->Data());
 #ifdef _WIN32
             hinted.emplace(true);
             RunHintedImport(*device, hinted->Data());

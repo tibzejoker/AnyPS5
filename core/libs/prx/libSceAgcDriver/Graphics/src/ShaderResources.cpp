@@ -909,8 +909,11 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
         } else {
             if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
-            if (StorageTexture::FlushPending(resource.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage image creation", PublishScope::None) && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
-            CachedStorageTexture entry{key, mip, StorageTexture::Create(context, *context.detiler, resource, mip)};
+            std::uint32_t rootLevel = 0, rootLayer = 0;
+            auto root = StorageTexture::SharedRootFor(context, resource, rootLevel, rootLayer);
+            if (root != nullptr) root->Refresh();
+            else if (StorageTexture::FlushPending(resource.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage image creation", PublishScope::None) && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
+            CachedStorageTexture entry{key, mip, root != nullptr ? StorageTexture::CreateShared(context, *context.detiler, resource, mip, std::move(root), rootLevel, rootLayer) : StorageTexture::Create(context, *context.detiler, resource, mip)};
             static const bool keepNew = std::getenv("APS5_NO_KEEP_NEW_STORAGE") == nullptr;
             if (auto* recorder = Recorder::Active(); keepNew && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread() && recorder->Recording()) recorder->Keep(entry.texture);
             entry.accounted = heldBytes(*entry.texture);
