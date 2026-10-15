@@ -139,6 +139,7 @@ std::uint32_t DefineBdaLookupPair(SpirvEmitterState& state, const char* name, bo
     std::array<std::uint32_t, 3> cache{};
     const auto function = DefineBdaLookup(state, name, recordFaults, cache, permission);
     if (!recordFaults && permission == BdaAbi::Read) state.bdaProbeCache = cache;
+    if (recordFaults && permission == BdaAbi::Write) state.bdaWriteCache = cache;
     return function;
 }
 }
@@ -248,6 +249,7 @@ void DefineGetBdaPointer(SpirvEmitterState& state) {
         if (!BdaByteReadsForced()) state.bdaWriteProbeFunction = DefineBdaLookupPair(state, "probe_bda_write_pointer", false, BdaAbi::Write);
         state.bdaAtomicPointerFunction = DefineBdaLookupPair(state, "get_bda_atomic_pointer", true, BdaAbi::Read | BdaAbi::Write);
         state.bdaNoteWriteFunction = DefineBdaNoteWrite(state);
+        DefineBdaWriteSiteFunctions(state);
         DefineBdaByteWriteFunctions(state);
     }
 }

@@ -2404,8 +2404,13 @@ void EmitImageBvhIntersectRay(SpirvValueEmitContext& ctx, const IrValue& inst) {
             }
             const auto pc = BdaInstructionPc(state, inst);
             const auto bytes = uint(count * 4u);
-            const auto physical = state.module.AllocateId();
-            state.module.AddFunction(spv::OpFunctionCall, u64, physical, state.bdaProbeFunction, nodeAddress, bytes, pc);
+            std::uint32_t physical = 0;
+            if (BdaSitePhysicalAvailable(state)) {
+                physical = EmitBdaSitePhysical(state, nodeAddress, count * 4u, pc);
+            } else {
+                physical = state.module.AllocateId();
+                state.module.AddFunction(spv::OpFunctionCall, u64, physical, state.bdaProbeFunction, nodeAddress, bytes, pc);
+            }
             const auto mapped = both(op(spv::OpINotEqual, boolean, physical, BdaConstant(state, 0u)), op(spv::OpIEqual, boolean, op(spv::OpBitwiseAnd, u64, physical, BdaConstant(state, 3u)), BdaConstant(state, 0u)));
             if (!state.bdaFaultsElided) EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, mapped), [&] { RecordBdaFault(state, nodeAddress, bytes, pc, BdaAbi::FaultReason::Unmapped); });
             for (std::uint32_t first = 0; first < count; first += 4u) {
@@ -2537,6 +2542,30 @@ void EmitImageBvhIntersectRay(SpirvValueEmitContext& ctx, const IrValue& inst) {
         const auto box16 = EmitValueOrDefaultIfCondition(state, isBox16, result4, tested, [&] { return boxes(true); });
         return EmitValueOrDefaultIfCondition(state, isBox32, result4, box16, [&] { return boxes(false); });
     };
+    const auto inactive = compose({invalid, invalid, invalid, invalid});
+    // In main the intersection is emitted in place: a call per BVH node (the traversal loop runs one
+    // per node and lane) cost NVIDIA more than the test, and in place the node fetch goes through
+    // the read sites' cached range instead of a probe call per node.
+    if (BdaSitePhysicalAvailable(state)) {
+        ctx.Define(inst, EmitValueOrDefaultIfCondition(state, ctx.Arg(inst, 2), result4, inactive, [&] {
+            const auto descriptor = ctx.Arg(inst, 0);
+            const IrValue* address = ctx.ImageAddress(inst.Argument(1));
+            std::array<std::uint32_t, 4> words{};
+            for (std::uint32_t i = 0; i < 4u; ++i) {
+                words[i] = state.module.AllocateId();
+                state.module.AddFunction(spv::OpCompositeExtract, u32, words[i], descriptor, i);
+            }
+            std::vector<std::uint32_t> components;
+            for (std::uint32_t i = 0; i < componentCount; ++i) components.push_back(ctx.Arg(*address, i));
+            const auto pcOverride = std::exchange(state.bdaPcOverride, 0u);
+            const auto stops = std::exchange(state.bdaStopsInvocations, false);
+            const auto value = query(words, components);
+            state.bdaPcOverride = pcOverride;
+            state.bdaStopsInvocations = stops;
+            return value;
+        }));
+        return;
+    }
     const std::array<std::uint32_t, 3> key{a16 ? 1u : 0u, node64 ? 1u : 0u, ctx.Memory(inst).coherent ? 1u : 0u};
     auto function = state.bvhIntersectFunctions.find(key);
     if (function == state.bvhIntersectFunctions.end()) {
@@ -2572,7 +2601,6 @@ void EmitImageBvhIntersectRay(SpirvValueEmitContext& ctx, const IrValue& inst) {
         state.module.AddFunction(spv::OpFunctionEnd);
         function = state.bvhIntersectFunctions.emplace(key, id).first;
     }
-    const auto inactive = compose({invalid, invalid, invalid, invalid});
     ctx.Define(inst, EmitValueOrDefaultIfCondition(state, ctx.Arg(inst, 2), result4, inactive, [&] {
         const auto descriptor = ctx.Arg(inst, 0);
         const IrValue* address = ctx.ImageAddress(inst.Argument(1));

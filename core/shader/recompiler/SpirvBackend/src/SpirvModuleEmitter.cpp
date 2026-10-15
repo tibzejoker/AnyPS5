@@ -1071,6 +1071,10 @@ void EmitProgram(SpirvEmitterState& state) {
     if (state.bdaSiteCache[0] != 0u) {
         for (const auto variable : state.bdaSiteCache) state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, TypeScalarU64(state)), variable, spv::StorageClassFunction, BdaConstant(state, 0u));
         state.bdaSiteCacheDeclared = true;
+        if (state.bdaSiteWriteCache[0] != 0u) {
+            for (const auto variable : state.bdaSiteWriteCache) state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, TypeScalarU64(state)), variable, spv::StorageClassFunction, BdaConstant(state, 0u));
+        }
+        if (state.bdaNotedPage != 0u) state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, TypeScalarU64(state)), state.bdaNotedPage, spv::StorageClassFunction, BdaConstant(state, ~std::uint64_t{0}));
     }
     for (std::uint32_t half = 0; half < state.laneCount; half++) {
         auto& lane = half == 0u ? ctx : high;

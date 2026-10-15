@@ -36,6 +36,14 @@ std::uint32_t EmitBdaAtomic(SpirvValueEmitContext& ctx, const IrValue& inst, std
 // the only path under APS5_BDA_BYTE_READS=1). Dwords the program never extracts are neither read
 std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t dwords, bool everyDword = false);
 bool BdaByteReadsForced();
+// In main, with the read sites' range variables declared: the device address of [address,
+// address + bytes) through the sites' cached range (inline), else through probe_bda_pointer out of
+// line, which refills that range; 0 when unmapped. Callers fall back to probe_bda_pointer when
+// BdaSitePhysicalAvailable is false.
+bool BdaSitePhysicalAvailable(const SpirvEmitterState& state);
+// Defines the store sites' refill (get_bda_write_pointer through main's write range variables).
+void DefineBdaWriteSiteFunctions(SpirvEmitterState& state);
+std::uint32_t EmitBdaSitePhysical(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction);
 std::uint32_t AddBdaAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, bool subtract);
 std::uint32_t AddBdaImmediate(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::int32_t immediate);
 

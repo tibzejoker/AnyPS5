@@ -72,7 +72,10 @@ std::uint32_t RuntimeMipCount(SpirvEmitterState& state, std::uint32_t resource) 
 }
 
 void DecorateTableNonUniform(SpirvEmitterState& state, std::uint32_t id) {
-    if (!state.tableIndexNonUniform) return;
+    // A registry element comes from probing the descriptor words, which may differ per lane (a T# read
+    // from a table at a lane's own index): its index into the registry arrays is non-uniform unless
+    // proven otherwise, which nothing here does.
+    if (!state.tableIndexNonUniform && !state.tableAccess.registryImage && !state.tableAccess.registrySampler) return;
     state.module.EmitCapability(spv::CapabilityShaderNonUniform);
     state.module.EmitCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
     state.module.AddAnnotation(spv::OpDecorate, id, spv::DecorationNonUniform);

@@ -149,7 +149,14 @@ struct SpirvEmitterState {
     std::array<std::uint32_t, 3> bdaProbeCache {};
     std::array<std::uint32_t, 3> bdaSiteCache {};
     bool bdaSiteCacheDeclared = false;
+    // The page main last noted as BDA-written (EmitBdaNoteWrite), declared with the site cache.
+    std::uint32_t bdaNotedPage = 0;
     std::array<std::array<std::uint32_t, 2>, 2> bdaSpanMissFunctions {};
+    std::uint32_t bdaProbeMissFunction = 0;
+    // The same for BDA stores: get_bda_write_pointer's cached range, main's copy, its refill.
+    std::array<std::uint32_t, 3> bdaWriteCache {};
+    std::array<std::uint32_t, 3> bdaSiteWriteCache {};
+    std::uint32_t bdaWriteMissFunction = 0;
     std::uint32_t bdaStopValue = 0;
     std::uint32_t bdaPcOverride = 0;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).

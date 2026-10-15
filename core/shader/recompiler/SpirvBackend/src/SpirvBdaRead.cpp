@@ -94,14 +94,80 @@ std::uint32_t UsedBdaDwords(const IrValue& inst, std::uint32_t dwords) {
     return used;
 }
 
+// Notes a BDA store's page for the CPU (note_bda_write: atomics on one shared hash table). In main a
+// store to the page this invocation noted last notes nothing, and lanes storing to one page let one
+// of them note it: every lane of every wave noting every store hammered the same slots (GTA's ray
+// traced passes store a few dwords per lane into one page).
+void EmitBdaNoteWrite(SpirvEmitterState& state, std::uint32_t address) {
+    const auto call = [&] { state.module.AddFunction(spv::OpFunctionCall, state.module.Type(spv::OpTypeVoid), state.module.AllocateId(), state.bdaNoteWriteFunction, address); };
+    if (!state.bdaSiteCacheDeclared || state.bdaNotedPage == 0u || state.module.InHelperFunction()) {
+        call();
+        return;
+    }
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    const auto page = Binary(state, spv::OpShiftRightLogical, u64, address, BdaConstant(state, BdaAbi::WrittenPageShift));
+    const auto noted = state.module.AllocateId();
+    state.module.AddFunction(spv::OpLoad, u64, noted, state.bdaNotedPage);
+    EmitIfCondition(state, Binary(state, spv::OpINotEqual, boolean, page, noted), [&] {
+        // Equal across the active lanes when no lane differs from the first: a ballot, not a vote
+        // (devices without GroupNonUniformVote in every stage run these programs too).
+        state.module.EmitCapability(spv::CapabilityGroupNonUniform);
+        state.module.EmitCapability(spv::CapabilityGroupNonUniformBallot);
+        const auto scope = ConstantU32(state, spv::ScopeSubgroup);
+        const auto first = [&](std::uint32_t value) {
+            const auto result = state.module.AllocateId();
+            state.module.AddFunction(spv::OpGroupNonUniformBroadcastFirst, u32, result, scope, value);
+            return result;
+        };
+        const auto low = Unary(state, spv::OpUConvert, u32, page);
+        const auto high = Unary(state, spv::OpUConvert, u32, Binary(state, spv::OpShiftRightLogical, u64, page, BdaConstant(state, 32u)));
+        const auto differs = Binary(state, spv::OpLogicalOr, boolean, Binary(state, spv::OpINotEqual, boolean, low, first(low)), Binary(state, spv::OpINotEqual, boolean, high, first(high)));
+        const auto ballot = state.module.AllocateId();
+        state.module.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot, scope, differs);
+        const auto anyDiffers = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAny, boolean, anyDiffers, Binary(state, spv::OpINotEqual, state.module.Type(spv::OpTypeVector, boolean, 4u), ballot, ConstantU32CompositeZero(state, 4u)));
+        const auto shared = Unary(state, spv::OpLogicalNot, boolean, anyDiffers);
+        const auto elected = state.module.AllocateId();
+        state.module.AddFunction(spv::OpGroupNonUniformElect, boolean, elected, scope);
+        EmitIfCondition(state, Binary(state, spv::OpLogicalOr, boolean, Unary(state, spv::OpLogicalNot, boolean, shared), elected), call);
+        state.module.AddFunction(spv::OpStore, state.bdaNotedPage, page);
+    });
+}
+
+// A store's device address: in main through the store sites' cached range (inline compares, the
+// write lookup out of line on a miss, which refills it); elsewhere the write lookup itself.
+std::uint32_t EmitBdaWritePhysical(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction) {
+    const auto u64 = TypeScalarU64(state);
+    if (state.bdaWriteMissFunction == 0 || !state.bdaSiteCacheDeclared || state.module.InHelperFunction()) {
+        const auto physical = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionCall, u64, physical, state.bdaWritePointerFunction, address, ConstantU32(state, bytes), instruction);
+        return physical;
+    }
+    const auto boolean = TypeBool(state);
+    const auto load = [&](std::uint32_t variable) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u64, value, variable);
+        return value;
+    };
+    const auto end = Binary(state, spv::OpIAdd, u64, address, BdaConstant(state, bytes));
+    auto hit = Binary(state, spv::OpUGreaterThanEqual, boolean, address, load(state.bdaSiteWriteCache[0]));
+    hit = Binary(state, spv::OpLogicalAnd, boolean, hit, Binary(state, spv::OpULessThanEqual, boolean, end, load(state.bdaSiteWriteCache[1])));
+    return EmitValueIfElse(state, hit, u64, [&] { return Binary(state, spv::OpIAdd, u64, address, load(state.bdaSiteWriteCache[2])); }, [&] {
+        const auto physical = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionCall, u64, physical, state.bdaWriteMissFunction, address, ConstantU32(state, bytes), instruction, state.bdaSiteWriteCache[0], state.bdaSiteWriteCache[1], state.bdaSiteWriteCache[2]);
+        return physical;
+    });
+}
+
 void EmitBdaStoreAt(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t pointerType, std::uint32_t value, std::uint32_t instruction, std::uint32_t accessMask) {
-    const auto physical = state.module.AllocateId();
-    state.module.AddFunction(spv::OpFunctionCall, TypeScalarU64(state), physical, state.bdaWritePointerFunction, address, ConstantU32(state, bytes), instruction);
+    const auto physical = EmitBdaWritePhysical(state, address, bytes, instruction);
     EmitIfCondition(state, Binary(state, spv::OpINotEqual, TypeBool(state), physical, BdaConstant(state, 0u)), [&] {
         const auto pointer = state.module.AllocateId();
         state.module.AddFunction(spv::OpConvertUToPtr, pointerType, pointer, physical);
         state.module.AddFunction(spv::OpStore, pointer, value, accessMask, bytes);
-        state.module.AddFunction(spv::OpFunctionCall, state.module.Type(spv::OpTypeVoid), state.module.AllocateId(), state.bdaNoteWriteFunction, address);
+        EmitBdaNoteWrite(state, address);
     });
 }
 
@@ -274,6 +340,40 @@ std::uint32_t DefineBdaSpanMissFunction(SpirvEmitterState& state, bool coherent,
     state.module.AddFunction(spv::OpFunctionEnd);
     return function;
 }
+
+// probe_bda_pointer for a read site in main: the device address, and the range it went through,
+// stored through the pointers to main's site variables (end 0 when the delta is not 4-aligned).
+std::uint32_t DefineBdaProbeMissFunction(SpirvEmitterState& state, std::uint32_t lookup, const std::array<std::uint32_t, 3>& cache, const char* name) {
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    const auto pointer = TypePointer(state, spv::StorageClassFunction, u64);
+    const auto function = state.module.AllocateId();
+    state.module.AddName(function, name);
+    state.module.AddFunction(spv::OpFunction, u64, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, u64, u64, u32, u32, pointer, pointer, pointer));
+    std::array<std::uint32_t, 6> parameters{};
+    const std::array<std::uint32_t, 6> types{u64, u32, u32, pointer, pointer, pointer};
+    for (std::size_t index = 0; index < parameters.size(); ++index) {
+        parameters[index] = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionParameter, types[index], parameters[index]);
+    }
+    EmitLabel(state, state.module.AllocateId());
+    const auto physical = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionCall, u64, physical, lookup, parameters[0], parameters[1], parameters[2]);
+    std::array<std::uint32_t, 3> range{};
+    for (std::size_t index = 0; index < range.size(); ++index) {
+        range[index] = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u64, range[index], cache[index]);
+    }
+    const auto delta = Binary(state, spv::OpISub, u64, range[2], range[0]);
+    const auto aligned = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u64, delta, BdaConstant(state, 3u)), BdaConstant(state, 0u));
+    state.module.AddFunction(spv::OpStore, parameters[3], range[0]);
+    state.module.AddFunction(spv::OpStore, parameters[4], Select(state, u64, aligned, range[1], BdaConstant(state, 0u)));
+    state.module.AddFunction(spv::OpStore, parameters[5], delta);
+    state.module.AddFunction(spv::OpReturnValue, physical);
+    state.module.AddFunction(spv::OpFunctionEnd);
+    return function;
+}
 }
 
 void DefineBdaDwordReadFunctions(SpirvEmitterState& state) {
@@ -341,6 +441,8 @@ void DefineBdaDwordReadFunctions(SpirvEmitterState& state) {
 void DefineBdaSpanReadFunctions(SpirvEmitterState& state) {
     if (state.bdaProbeFunction == 0) return;
     for (auto& variable : state.bdaSiteCache) variable = state.module.AllocateId();
+    if (state.program.Info().bdaWrites) state.bdaNotedPage = state.module.AllocateId();
+    state.bdaProbeMissFunction = DefineBdaProbeMissFunction(state, state.bdaProbeFunction, state.bdaProbeCache, "probe_bda_site_miss");
     const auto& memory = state.program.Resources().memoryInfo;
     const bool coherentAccesses = std::any_of(memory.begin(), memory.end(), [](const MemoryInfo& info) { return info.coherent; });
     const bool stops = state.bdaStopsInvocations;
@@ -587,11 +689,11 @@ void EmitBdaDwordWrites(SpirvValueEmitContext& ctx, const IrValue& inst, std::ui
         EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, vectorAligned), separate);
     }
     const auto last = addresses[dwords - 1u];
-    state.module.AddFunction(spv::OpFunctionCall, state.module.Type(spv::OpTypeVoid), state.module.AllocateId(), state.bdaNoteWriteFunction, addresses[0]);
+    EmitBdaNoteWrite(state, addresses[0]);
     const auto pageShift = BdaConstant(state, BdaAbi::WrittenPageShift);
     const auto crosses = Binary(state, spv::OpINotEqual, boolean, Binary(state, spv::OpShiftRightLogical, u64, addresses[0], pageShift), Binary(state, spv::OpShiftRightLogical, u64, last, pageShift));
     EmitIfCondition(state, crosses, [&] {
-        state.module.AddFunction(spv::OpFunctionCall, state.module.Type(spv::OpTypeVoid), state.module.AllocateId(), state.bdaNoteWriteFunction, last);
+        EmitBdaNoteWrite(state, last);
     });
     state.module.AddFunction(spv::OpBranch, merge);
     EmitLabel(state, dwordLabel);
@@ -616,7 +718,7 @@ std::uint32_t EmitBdaAtomic(SpirvValueEmitContext& ctx, const IrValue& inst, std
             const auto pointer = state.module.AllocateId();
             state.module.AddFunction(spv::OpConvertUToPtr, TypePointer(state, spv::StorageClassPhysicalStorageBuffer, type), pointer, physical);
             const auto old = operation(pointer);
-            state.module.AddFunction(spv::OpFunctionCall, state.module.Type(spv::OpTypeVoid), state.module.AllocateId(), state.bdaNoteWriteFunction, address);
+            EmitBdaNoteWrite(state, address);
             return old;
         });
     });
@@ -674,6 +776,34 @@ std::uint32_t EmitBdaSpanSite(SpirvValueEmitContext& ctx, const IrValue& inst, s
         const auto read = state.module.AllocateId();
         state.module.AddFunction(spv::OpFunctionCall, result, read, state.bdaSpanMissFunctions[state.bdaStopsInvocations][coherent], address, ConstantU32(state, offset), ConstantU32(state, used), instruction, state.bdaSiteCache[0], state.bdaSiteCache[1], state.bdaSiteCache[2]);
         return read;
+    });
+}
+
+void DefineBdaWriteSiteFunctions(SpirvEmitterState& state) {
+    if (state.bdaWritePointerFunction == 0 || state.bdaWriteCache[0] == 0 || state.bdaSiteCache[0] == 0) return;
+    for (auto& variable : state.bdaSiteWriteCache) variable = state.module.AllocateId();
+    state.bdaWriteMissFunction = DefineBdaProbeMissFunction(state, state.bdaWritePointerFunction, state.bdaWriteCache, "get_bda_write_site_miss");
+}
+
+bool BdaSitePhysicalAvailable(const SpirvEmitterState& state) {
+    return state.bdaSiteCacheDeclared && state.bdaProbeMissFunction != 0 && !state.module.InHelperFunction();
+}
+
+std::uint32_t EmitBdaSitePhysical(SpirvEmitterState& state, std::uint32_t address, std::uint32_t bytes, std::uint32_t instruction) {
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    const auto load = [&](std::uint32_t variable) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u64, value, variable);
+        return value;
+    };
+    const auto end = Binary(state, spv::OpIAdd, u64, address, BdaConstant(state, bytes));
+    auto hit = Binary(state, spv::OpUGreaterThanEqual, boolean, address, load(state.bdaSiteCache[0]));
+    hit = Binary(state, spv::OpLogicalAnd, boolean, hit, Binary(state, spv::OpULessThanEqual, boolean, end, load(state.bdaSiteCache[1])));
+    return EmitValueIfElse(state, hit, u64, [&] { return Binary(state, spv::OpIAdd, u64, address, load(state.bdaSiteCache[2])); }, [&] {
+        const auto physical = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionCall, u64, physical, state.bdaProbeMissFunction, address, ConstantU32(state, bytes), instruction, state.bdaSiteCache[0], state.bdaSiteCache[1], state.bdaSiteCache[2]);
+        return physical;
     });
 }
 
