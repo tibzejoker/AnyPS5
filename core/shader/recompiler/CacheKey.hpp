@@ -3,6 +3,7 @@
 
 #include "Recompiler.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
+#include "ImageTableRegistry.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <cstdlib>
 #include <stdexcept>
@@ -90,6 +91,8 @@ private:
         append(key, DebugProbeActive());
         append(key, RayTracingStrict());
         append(key, RayTracingMiss());
+        append(key, ImageTableRegistry::PocNoGraphicsBda());
+        append(key, ImageTableRegistry::GpuResolvedStage(IrShaderStage::Pixel));
     }
 
     static void appendMesh(std::vector<std::uint64_t>& key, const RecompileRequest& request) {

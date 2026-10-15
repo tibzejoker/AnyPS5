@@ -211,16 +211,21 @@ struct State {
     std::uint64_t reportedCommandBuffers = 0;
 };
 
+// POC: APS5_POC_NO_GRAPHICS_REGISTRY=1 resolves vertex and pixel image/sampler handles on the CPU
+// again (the registry probes run per pixel otherwise).
 inline bool GpuResolvedStage(IrShaderStage stage) {
+    static const bool noGraphics = std::getenv("APS5_POC_NO_GRAPHICS_REGISTRY") != nullptr;
+    if (noGraphics) return stage == IrShaderStage::Compute;
     return stage == IrShaderStage::Compute || stage == IrShaderStage::Vertex || stage == IrShaderStage::Pixel;
 }
 
 // Buffer and address handles read from guest memory are resolved on the GPU (BDA) in compute only:
 // graphics draws have no BDA page table.
-// TEMPORARY bisection switches (POC): APS5_POC_NO_GRAPHICS_BDA keeps vertex and pixel buffer/address
-// handles on the CPU path (v8 behaviour); APS5_POC_NO_VERTEX_PULL does so for the vertex stage only.
+// TEMPORARY switches (POC): vertex and pixel buffer/address handles stay on the CPU path (v8
+// behaviour; per-pixel BDA resolution cost GTA Story 5.2 vs 8.7 FPS once GPU-bound) unless
+// APS5_POC_GRAPHICS_BDA=1; APS5_POC_NO_VERTEX_PULL keeps the vertex stage on the CPU path alone.
 inline bool PocNoGraphicsBda() {
-    static const bool off = std::getenv("APS5_POC_NO_GRAPHICS_BDA") != nullptr;
+    static const bool off = std::getenv("APS5_POC_GRAPHICS_BDA") == nullptr;
     return off;
 }
 
