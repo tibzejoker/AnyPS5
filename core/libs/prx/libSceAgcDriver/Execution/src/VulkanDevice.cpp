@@ -945,7 +945,31 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
         create.ppEnabledExtensionNames = instanceExtensions.data();
     }
+    bool addressReport = false;
+    if (Graphics::GpuCheckpointsRequested()) {
+        std::uint32_t availableCount = 0;
+        const auto enumerateExtensions = state->InstanceFunction<PFN_vkEnumerateInstanceExtensionProperties>("vkEnumerateInstanceExtensionProperties");
+        if (enumerateExtensions(nullptr, &availableCount, nullptr) == VK_SUCCESS) {
+            std::vector<VkExtensionProperties> available(availableCount);
+            if (enumerateExtensions(nullptr, &availableCount, available.data()) == VK_SUCCESS && std::any_of(available.begin(), available.end(), [](const auto& item) { return std::strcmp(item.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0; })) {
+                instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+                create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
+                create.ppEnabledExtensionNames = instanceExtensions.data();
+                addressReport = true;
+            }
+        }
+    }
     check(state->InstanceFunction<PFN_vkCreateInstance>("vkCreateInstance")(&create, nullptr, &state->instance), "vkCreateInstance");
+    if (addressReport) {
+        const auto createMessenger = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(state->instanceProc(state->instance, "vkCreateDebugUtilsMessengerEXT"));
+        VkDebugUtilsMessengerCreateInfoEXT messenger{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+        messenger.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+        messenger.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT;
+        messenger.pfnUserCallback = &Graphics::AddressBindingCallback;
+        VkDebugUtilsMessengerEXT handle = VK_NULL_HANDLE;
+        const bool made = createMessenger != nullptr && createMessenger(state->instance, &messenger, nullptr, &handle) == VK_SUCCESS;
+        std::fprintf(stderr, "[device-lost] address binding messenger %s\n", made ? "on" : "unavailable");
+    }
     APS5_LOG_OUT("Vulkan instance created instance=%p", reinterpret_cast<void*>(state->instance));
     if (window != nullptr) {
         state->surface = window->createSurface(window->context, state->instance);
@@ -1663,6 +1687,13 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             faultFeatures.pNext = bdaFeatures.pNext;
             bdaFeatures.pNext = &faultFeatures;
             deviceExtensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+        }
+        if (hasExtension(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME)) {
+            static VkPhysicalDeviceAddressBindingReportFeaturesEXT bindingReport{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT};
+            bindingReport.reportAddressBinding = VK_TRUE;
+            bindingReport.pNext = bdaFeatures.pNext;
+            bdaFeatures.pNext = &bindingReport;
+            deviceExtensions.push_back(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
         }
         checkpoints = hasExtension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
         if (checkpoints) deviceExtensions.push_back(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
