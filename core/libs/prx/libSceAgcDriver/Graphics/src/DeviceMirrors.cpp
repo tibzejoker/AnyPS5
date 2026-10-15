@@ -417,6 +417,11 @@ void NoteDeviceMirrorTouched(std::uint64_t begin, std::uint64_t end) {
     if (state.device == VK_NULL_HANDLE || end <= begin) return;
     std::lock_guard lock(state.mutex);
     if (const auto refused = state.untracked.find(begin); refused != state.untracked.end() && refused->second == end) return;
+    // A mirrored run's own entry: its chunks are hot already, under their own ends.
+    if (const auto held = state.held.find(begin); held != state.held.end() && held->second->end == end) {
+        held->second->lastUse = std::chrono::steady_clock::now();
+        return;
+    }
     const auto [entry, inserted] = state.wanted.try_emplace(begin, end);
     if (!inserted && entry->second == end) {
         if (auto held = state.held.upper_bound(begin); held != state.held.begin() && (--held)->second->end > begin) held->second->lastUse = std::chrono::steady_clock::now();
