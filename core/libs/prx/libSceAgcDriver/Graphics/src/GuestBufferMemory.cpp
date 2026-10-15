@@ -98,6 +98,10 @@ struct GuestBufferMemory::AddressSpace {
     std::uint64_t serial = 0;
     GuestAllocations::Lease lease;
     std::vector<Region> base;
+    // The [begin, end) of the `base` regions read in place (`direct`), in `base` order, and whether
+    // they are sorted and disjoint (lookups may then search them).
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> inPlaceReads;
+    bool inPlaceReadsOrdered = true;
     struct HeapRun {
         std::uint64_t begin;
         std::uint64_t bytes;
@@ -2570,6 +2574,11 @@ void GuestBufferMemory::AcquireRegistered() {
                 regions = std::move(extras);
                 lease.clear();
                 planSpaceMirrors(*built);
+                for (const auto& region : built->base) {
+                    if (region.direct == nullptr) continue;
+                    if (!built->inPlaceReads.empty() && built->inPlaceReads.back().second > region.begin) built->inPlaceReadsOrdered = false;
+                    built->inPlaceReads.emplace_back(region.begin, region.end);
+                }
                 space = std::move(built);
                 spaces.droppedByWaiter.store(false, std::memory_order_relaxed);
                 spaces.current.store(space);
@@ -4030,15 +4039,47 @@ std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> GuestBufferM
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::InPlaceReads() const {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
     if (!uploaded || committed) return result;
-    if (space != nullptr) {
-        for (const auto& region : space->base) {
-            if (region.direct != nullptr) result.emplace_back(region.begin, region.end);
-        }
-    }
+    const auto shared = SharedInPlaceReads();
+    result.reserve(shared.size() + regions.size());
+    result.assign(shared.begin(), shared.end());
     for (const auto& region : regions) {
         if (region.direct != nullptr) result.emplace_back(region.begin, region.end);
     }
     return result;
+}
+
+std::span<const std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::SharedInPlaceReads() const {
+    if (!uploaded || committed || space == nullptr) return {};
+    return space->inPlaceReads;
+}
+
+std::uint64_t GuestBufferMemory::SharedInPlaceReadsKey() const {
+    return SharedInPlaceReads().empty() ? 0 : space->serial;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::OwnInPlaceReads() const {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
+    if (!uploaded || committed) return result;
+    for (const auto& region : regions) {
+        if (region.direct != nullptr) result.emplace_back(region.begin, region.end);
+    }
+    return result;
+}
+
+bool GuestBufferMemory::ReadInPlace(std::uint64_t address, std::uint64_t bytes, bool contained) const {
+    if (!uploaded || committed) return false;
+    const auto hit = [&](std::uint64_t begin, std::uint64_t end) {
+        return contained ? address >= begin && address < end && bytes <= end - address : address < end && begin < address + bytes;
+    };
+    for (const auto& region : regions) {
+        if (region.direct != nullptr && hit(region.begin, region.end)) return true;
+    }
+    const auto shared = SharedInPlaceReads();
+    if (shared.empty()) return false;
+    if (!space->inPlaceReadsOrdered) return std::any_of(shared.begin(), shared.end(), [&](const auto& range) { return hit(range.first, range.second); });
+    auto at = std::upper_bound(shared.begin(), shared.end(), address, [](std::uint64_t value, const auto& range) { return value < range.first; });
+    if (at != shared.begin() && hit(std::prev(at)->first, std::prev(at)->second)) return true;
+    return !contained && at != shared.end() && hit(at->first, at->second);
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::DeviceReads() const {

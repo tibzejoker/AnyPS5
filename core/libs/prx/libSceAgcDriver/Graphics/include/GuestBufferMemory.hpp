@@ -6,6 +6,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
@@ -284,6 +285,13 @@ public:
     // the GPU copies out of an import (gpuCopy) notes its read itself when the copy is recorded.
     // For the recorder's read tracking (ShaderResources::MarkGpuWrites); nothing once committed.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const;
+    // InPlaceReads in two parts: the address space's (shared by every build over it, built once with
+    // the space; SharedInPlaceReadsKey names it by the space's serial, 0 when empty) and this build's own regions.
+    std::span<const std::pair<std::uint64_t, std::uint64_t>> SharedInPlaceReads() const;
+    std::uint64_t SharedInPlaceReadsKey() const;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> OwnInPlaceReads() const;
+    // Whether InPlaceReads holds [address, address + bytes) (contained) or overlaps it.
+    bool ReadInPlace(std::uint64_t address, std::uint64_t bytes, bool contained) const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const;
 
 private:

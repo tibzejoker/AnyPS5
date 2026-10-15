@@ -2982,6 +2982,14 @@ void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::ui
     readsNoted.fetch_add(ranges.size(), std::memory_order_relaxed);
 }
 
+void Recorder::NoteSharedPendingReads(std::uint64_t key, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind) {
+    if (key == 0 || ranges.empty() || !ReadTrackingEnabled()) return;
+    ensureOpen();
+    if (std::find(open->sharedReads.begin(), open->sharedReads.end(), key) != open->sharedReads.end()) return;
+    open->sharedReads.push_back(key);
+    NotePendingReads(ranges, kind);
+}
+
 const Recorder::Batch::Read* Recorder::readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end) {
     for (const auto& read : batch.reads) {
         if (address < read.end && read.begin < end) return &read;
