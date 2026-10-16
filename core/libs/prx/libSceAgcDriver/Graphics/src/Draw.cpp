@@ -1909,7 +1909,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         record.pipeline->ContinueSecondChannel(commands);
         recordDrawCommands(context, commands, state, draw, inputs, record.indirect, argumentBuffer, argumentOffset);
     }
-    if (!record.stencilReplay.empty() || record.pipeline->SplitsFaces() || record.pipeline->SplitsSecondChannel()) recorder->PassBound() = {};
+    if (record.pipeline->SplitsFaces() || record.pipeline->SplitsSecondChannel()) recorder->PassBound() = {};
     if (meshArguments != nullptr) recorder->Keep(meshArguments);
     if (args != nullptr) CountIndirectDraw(record.indirect->path, record.indirect->readMs, rewritten);
     auto checkRecords = indirectRecordCheck(record.indirect);
