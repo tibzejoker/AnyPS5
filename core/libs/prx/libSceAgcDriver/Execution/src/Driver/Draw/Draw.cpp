@@ -38,8 +38,11 @@ std::atomic<std::thread::id> drawThreadId{};
 // time the worker or the preparations block on a full pipeline.
 struct IdleStats {
     std::atomic<std::uint64_t> prepNs{0}, workerNs{0}, fullNs{0}, idles{0}, jobs{0};
+    // Preparations: count, time without the turn wait, GPU waits inside, turn waits, and the slow ones (> 1 ms).
+    std::atomic<std::uint64_t> preps{0}, prepWorkNs{0}, prepGpuUs{0}, prepTurnNs{0}, slowPreps{0}, slowPrepNs{0};
     std::atomic<long long> shown{0};
 };
+thread_local std::uint64_t turnWaitNs = 0;
 IdleStats& idleStats() {
     static IdleStats stats;
     return stats;
@@ -92,7 +95,7 @@ private:
                 auto& stats = idleStats();
                 stats.jobs.fetch_add(1, std::memory_order_relaxed);
                 const auto window = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
-                if (auto last = stats.shown.load(std::memory_order_relaxed); last != window && stats.shown.compare_exchange_strong(last, window)) std::fprintf(stderr, "[draw-idle] last 10 s: %llu jobs, %llu idle periods; idle while preparations ran %.0f ms, while none was outstanding %.0f ms; pushes blocked on a full pipeline %.0f ms\n", static_cast<unsigned long long>(stats.jobs.exchange(0)), static_cast<unsigned long long>(stats.idles.exchange(0)), stats.prepNs.exchange(0) / 1e6, stats.workerNs.exchange(0) / 1e6, stats.fullNs.exchange(0) / 1e6);
+                if (auto last = stats.shown.load(std::memory_order_relaxed); last != window && stats.shown.compare_exchange_strong(last, window)) std::fprintf(stderr, "[draw-idle] last 10 s: %llu jobs, %llu idle periods; idle while preparations ran %.0f ms, while none was outstanding %.0f ms; pushes blocked on a full pipeline %.0f ms; preparations %llu: work %.0f ms (GPU waits %.0f ms), turn waits %.0f ms, %llu over 1 ms (%.0f ms)\n", static_cast<unsigned long long>(stats.jobs.exchange(0)), static_cast<unsigned long long>(stats.idles.exchange(0)), stats.prepNs.exchange(0) / 1e6, stats.workerNs.exchange(0) / 1e6, stats.fullNs.exchange(0) / 1e6, static_cast<unsigned long long>(stats.preps.exchange(0)), stats.prepWorkNs.exchange(0) / 1e6, stats.prepGpuUs.exchange(0) / 1e3, stats.prepTurnNs.exchange(0) / 1e6, static_cast<unsigned long long>(stats.slowPreps.exchange(0)), stats.slowPrepNs.exchange(0) / 1e6);
             }
             auto job = std::move(jobs.front());
             jobs.pop_front();
@@ -165,6 +168,8 @@ public:
 private:
     void run() {
         PinWorkerThread("draw prep");
+        static std::atomic<bool> sampled{false};
+        if (std::getenv("APS5_SAMPLE_PREP_THREAD") != nullptr && !sampled.exchange(true)) StartWorkerSampler();
         std::unique_lock lock(mutex);
         for (;;) {
             ready.wait(lock, [&] { return !jobs.empty(); });
@@ -253,7 +258,9 @@ void ServeDrawTurn() {
     if (!ticketActive || ticketServed) return;
     auto& turns = drawTurns();
     std::unique_lock lock(turns.mutex);
+    const auto waitStart = std::chrono::steady_clock::now();
     turns.changed.wait(lock, [&] { return turns.finished == currentTicket; });
+    turnWaitNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count());
     ticketServed = true;
 }
 
@@ -264,6 +271,26 @@ void SubmitDrawPrep(std::uint64_t ticket, std::function<void()> job) {
         currentTicket = ticket;
         ticketActive = true;
         ticketServed = false;
+        turnWaitNs = 0;
+        const auto prepStart = std::chrono::steady_clock::now();
+        const auto gpuBefore = Graphics::Recorder::ThreadWaitedMs();
+        struct PrepTiming {
+            std::chrono::steady_clock::time_point start;
+            double gpuBefore;
+            ~PrepTiming() {
+                auto& stats = idleStats();
+                const auto total = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+                const auto work = total > turnWaitNs ? total - turnWaitNs : 0;
+                stats.preps.fetch_add(1, std::memory_order_relaxed);
+                stats.prepWorkNs.fetch_add(work, std::memory_order_relaxed);
+                stats.prepTurnNs.fetch_add(turnWaitNs, std::memory_order_relaxed);
+                stats.prepGpuUs.fetch_add(static_cast<std::uint64_t>((Graphics::Recorder::ThreadWaitedMs() - gpuBefore) * 1000.0), std::memory_order_relaxed);
+                if (work > 1000000) {
+                    stats.slowPreps.fetch_add(1, std::memory_order_relaxed);
+                    stats.slowPrepNs.fetch_add(work, std::memory_order_relaxed);
+                }
+            }
+        } prepTiming{prepStart, gpuBefore};
         try {
             job();
         } catch (const std::exception& error) {
