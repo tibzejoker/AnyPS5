@@ -321,6 +321,63 @@ std::optional<DccKeys> PendingStoreKeys(Recorder& recorder, std::uint64_t begin,
     return keys;
 }
 
+// The key bytes the recorded writes over [begin, begin + count) leave, newest note first, with the
+// bytes no pending write covers read as they are: one byte value (or -1 when nothing decided it),
+// whether two values were seen, and whether a writer of unrecorded bytes covers part of the range.
+// Nullopt: the range is not readable or lies under a unit shadow.
+struct PendingFillScan {
+    int value = -1;
+    bool mixed = false;
+    bool unknown = false;
+};
+
+std::optional<PendingFillScan> ScanPendingFills(const Recorder& recorder, std::uint64_t begin, std::size_t count) {
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), count) || AnyShadowedOverlaps(begin, count)) return std::nullopt;
+    auto writes = recorder.PendingWritesOver(begin, count);
+    std::sort(writes.begin(), writes.end(), [](const Recorder::PendingWrite& a, const Recorder::PendingWrite& b) { return a.note > b.note; });
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> unwritten{{begin, begin + count}};
+    PendingFillScan scan;
+    const auto see = [&](int key) {
+        if (scan.value < 0) scan.value = key;
+        else if (scan.value != key) scan.mixed = true;
+    };
+    for (const auto& write : writes) {
+        if (scan.mixed || unwritten.empty()) break;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> rest;
+        bool covered = false;
+        for (const auto& [from, to] : unwritten) {
+            if (write.end <= from || to <= write.begin) {
+                rest.emplace_back(from, to);
+                continue;
+            }
+            covered = true;
+            if (from < write.begin) rest.emplace_back(from, write.begin);
+            if (write.end < to) rest.emplace_back(write.end, to);
+        }
+        unwritten = std::move(rest);
+        if (!covered) continue;
+        if (write.value >= 0) see(write.value);
+        else scan.unknown = true;
+    }
+    for (const auto& [from, to] : unwritten) {
+        if (scan.mixed) break;
+        const auto* keys = reinterpret_cast<const std::uint8_t*>(from);
+        if (AllKeysEqual(keys + 1, static_cast<std::size_t>(to - from) - 1, keys[0])) see(keys[0]);
+        else scan.mixed = true;
+    }
+    return scan;
+}
+
+// POC (APS5_POC_NO_FILL_KEYS=1 disables): the raw keys a pending range of recorded fills leaves, known
+// without waiting for the GPU when no writer of unrecorded bytes covers it.
+std::optional<DccKeys> PendingFillRawKeys(const Recorder& recorder, std::uint64_t begin, std::size_t count) {
+    static const bool disabled = std::getenv("APS5_POC_NO_FILL_KEYS") != nullptr;
+    if (disabled) return std::nullopt;
+    const auto scan = ScanPendingFills(recorder, begin, count);
+    if (!scan || scan->unknown || scan->value < 0) return std::nullopt;
+    return scan->mixed ? DccKeys::Mixed : ByteKeys(static_cast<std::uint8_t>(scan->value));
+}
+
 // Whether the keys already read as uncompressed: scans the same bytes as ReadDccKeys, so it counts
 // as a scan too.
 bool AlreadyUncompressed(std::uint64_t metaAddress, std::size_t count) {
@@ -442,6 +499,39 @@ std::size_t DccKeyCount(const GuestTextureResource& surface, std::uint64_t surfa
 
 namespace {
 
+// POC diagnostic (APS5_TRACK_STATS): what the GPU syncs before a key read wait for, every 10 s: by
+// site, the overlapping pending writes' sizes (a whole-heap V# over the metadata vs a write of the
+// key range itself) and whether their bytes are known.
+void noteKeySync(int site, const Recorder& recorder, std::uint64_t address, std::size_t count) {
+    static const bool enabled = std::getenv("APS5_TRACK_STATS") != nullptr;
+    if (!enabled) return;
+    static std::mutex mutex;
+    static std::array<std::array<std::uint64_t, 6>, 2> buckets{};
+    static std::array<std::uint64_t, 2> known{}, syncs{};
+    static std::atomic<long long> shown{-1};
+    const auto writes = recorder.PendingWritesOver(address, count);
+    std::uint64_t smallest = ~0ull;
+    bool valued = false;
+    for (const auto& write : writes) {
+        smallest = std::min<std::uint64_t>(smallest, write.end - write.begin);
+        valued = valued || write.value >= 0;
+    }
+    const auto bucket = smallest <= count ? 0 : smallest <= 4 * count ? 1 : smallest < (1ull << 20) ? 2 : smallest < (64ull << 20) ? 3 : smallest != ~0ull ? 4 : 5;
+    std::lock_guard lock(mutex);
+    ++buckets[site][bucket];
+    ++syncs[site];
+    if (valued) ++known[site];
+    const auto window = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (shown.exchange(window) == window) return;
+    for (int which = 0; which < 2; ++which) {
+        const auto& b = buckets[which];
+        std::fprintf(stderr, "[dcc-sync] last 10 s %s: %llu syncs (%llu with a valued writer); smallest overlapping write: <= keys %llu, <= 4x keys %llu, < 1 MiB %llu, < 64 MiB %llu, larger %llu, none %llu\n", which == 0 ? "currentDccKeys" : "WaitForKeyWriters", static_cast<unsigned long long>(syncs[which]), static_cast<unsigned long long>(known[which]), static_cast<unsigned long long>(b[0]), static_cast<unsigned long long>(b[1]), static_cast<unsigned long long>(b[2]), static_cast<unsigned long long>(b[3]), static_cast<unsigned long long>(b[4]), static_cast<unsigned long long>(b[5]));
+    }
+    buckets = {};
+    known = {};
+    syncs = {};
+}
+
 // ReadDccKeys, saying in `memoized` whether the answer came from the pending-store memo rather
 // than the bytes.
 DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized) {
@@ -501,6 +591,11 @@ DccKeys currentDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoi
                 memoized = true;
                 return *keys;
             }
+            if (const auto keys = PendingFillRawKeys(*recorder, metaAddress, count)) {
+                memoized = true;
+                return *keys;
+            }
+            noteKeySync(0, *recorder, metaAddress, count);
             Recorder::CountSync(2);
             recorder->SyncThrough(metaAddress, count);
         }
@@ -731,41 +826,11 @@ enum class FillKeys : std::uint8_t { Known, Shadowed, Unknown };
 std::optional<DccKeys> PendingFillKeys(const Recorder& recorder, const GuestTextureResource& resource, std::size_t count, FillKeys& why) {
     const auto begin = resource.dccAddress;
     why = FillKeys::Shadowed;
-    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), count) || AnyShadowedOverlaps(begin, count)) return std::nullopt;
-    auto writes = recorder.PendingWritesOver(begin, count);
-    std::sort(writes.begin(), writes.end(), [](const Recorder::PendingWrite& a, const Recorder::PendingWrite& b) { return a.note > b.note; });
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> unwritten{{begin, begin + count}};
-    int value = -1;
-    bool mixed = false;
-    bool unknown = false;
-    const auto see = [&](int key) {
-        if (value < 0) value = key;
-        else if (value != key) mixed = true;
-    };
-    for (const auto& write : writes) {
-        if (mixed || unwritten.empty()) break;
-        std::vector<std::pair<std::uint64_t, std::uint64_t>> rest;
-        bool covered = false;
-        for (const auto& [from, to] : unwritten) {
-            if (write.end <= from || to <= write.begin) {
-                rest.emplace_back(from, to);
-                continue;
-            }
-            covered = true;
-            if (from < write.begin) rest.emplace_back(from, write.begin);
-            if (write.end < to) rest.emplace_back(write.end, to);
-        }
-        unwritten = std::move(rest);
-        if (!covered) continue;
-        if (write.value >= 0) see(write.value);
-        else unknown = true;
-    }
-    for (const auto& [from, to] : unwritten) {
-        if (mixed) break;
-        const auto* keys = reinterpret_cast<const std::uint8_t*>(from);
-        if (AllKeysEqual(keys + 1, static_cast<std::size_t>(to - from) - 1, keys[0])) see(keys[0]);
-        else mixed = true;
-    }
+    const auto scan = ScanPendingFills(recorder, begin, count);
+    if (!scan) return std::nullopt;
+    const int value = scan->value;
+    const bool mixed = scan->mixed;
+    const bool unknown = scan->unknown;
     why = FillKeys::Known;
     if (mixed) return DccKeys::Uncompressed;
     why = FillKeys::Unknown;
@@ -800,6 +865,7 @@ std::optional<DccKeys> WaitForKeyWriters(const GuestTextureResource& resource, s
     // renders and stores uncompressed) instead of waiting for it. APS5_POC_GUESS_KEYS=1.
     static const bool guess = std::getenv("APS5_POC_GUESS_KEYS") != nullptr;
     if (guess && why == FillKeys::Unknown) return DccKeys::Uncompressed;
+    noteKeySync(1, *recorder, metaAddress, count);
     Recorder::CountSync(2);
     recorder->SyncThrough(metaAddress, count);
     return std::nullopt;

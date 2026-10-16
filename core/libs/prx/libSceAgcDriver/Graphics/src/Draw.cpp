@@ -849,6 +849,28 @@ bool DrawRecipes() {
     return !noDrawRecipe;
 }
 
+namespace {
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(RecipeStage::Count)>& recipeStages() {
+    static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(RecipeStage::Count)> counters{};
+    return counters;
+}
+}
+
+void NoteRecipeStage(RecipeStage stage) {
+    recipeStages()[static_cast<std::size_t>(stage)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::string RecipeStageStats() {
+    static constexpr std::array<const char*, static_cast<std::size_t>(RecipeStage::Count)> names{"draws", "register key", "draw hit", "stages", "recipe found", "recorded from recipe", "recipe rebuilt", "recipe built", "no out", "not cacheable", "waited", "indirect", "not reusable", "moved", "multisampled", "synchronous"};
+    std::string text;
+    char item[64];
+    for (std::size_t index = 0; index < names.size(); ++index) {
+        std::snprintf(item, sizeof(item), "%s%s %llu", index == 0 ? "" : ", ", names[index], static_cast<unsigned long long>(recipeStages()[index].exchange(0, std::memory_order_relaxed)));
+        text += item;
+    }
+    return text;
+}
+
 const char* DrawRecipeMissName(DrawRecipeMiss miss) {
     constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof"};
     return names[static_cast<std::size_t>(miss)];
@@ -2211,6 +2233,14 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
+        if (recipeOut == nullptr) NoteRecipeStage(RecipeStage::NoOut);
+        else if (!cacheable) NoteRecipeStage(RecipeStage::NotCacheable);
+        else if (outcome.waited) NoteRecipeStage(RecipeStage::Waited);
+        else if (args != nullptr) NoteRecipeStage(RecipeStage::Indirect);
+        else if (!resources->Reusable()) NoteRecipeStage(RecipeStage::NotReusable);
+        else if (!resolved.moved.empty()) NoteRecipeStage(RecipeStage::Moved);
+        else if (multisampled) NoteRecipeStage(RecipeStage::Multisampled);
+        else NoteRecipeStage(RecipeStage::Built);
         if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && resolved.moved.empty() && !multisampled) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;
@@ -2238,6 +2268,7 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
         return;
     }
     APS5_LOG_CHARS_OUT_DEBUG("Creating CommandBatch");
+    NoteRecipeStage(RecipeStage::Synchronous);
     std::optional<CommandBatch> batch;
     if (!recorded) {
         // The color-target detiles below take their descriptor sets from a fresh batch.

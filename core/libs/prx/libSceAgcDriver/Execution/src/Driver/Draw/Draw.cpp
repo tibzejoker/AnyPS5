@@ -650,6 +650,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         return drawn();
     }
 
+    Graphics::NoteRecipeStage(Graphics::RecipeStage::Draws);
+    if (registerKey) Graphics::NoteRecipeStage(Graphics::RecipeStage::RegisterKey);
+    if (drawHit) Graphics::NoteRecipeStage(Graphics::RecipeStage::DrawHit);
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
     if (registerKey && !drawParameters.indirect && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());
@@ -658,8 +661,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     std::shared_ptr<const DrawRecipe> recipe;
     if (drawHit && !recipeStages.empty()) {
+        Graphics::NoteRecipeStage(Graphics::RecipeStage::Stages);
         recipe = findDrawRecipe(drawKey, recipeStages);
         if (recipe == nullptr) VulkanDevice::NoteDrawRecipeMiss(VulkanDevice::DrawRecipePrecheck::NoRecipe);
+        else Graphics::NoteRecipeStage(Graphics::RecipeStage::Found);
     }
     if (recipe == nullptr) {
         if (auto known = localDevice->KnownDrawRejection(graphics, stages)) {
@@ -713,7 +718,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             try {
                 recordLabelsForPacket(localDevice.get(), job->queue);
                 if (job->recipe != nullptr) {
-                    if (localDevice->DrawFromRecipe(job->decode->state, job->parameters, job->stages, job->snapshots, job->recipe) == RecipeOutcome::Recorded) return;
+                    if (localDevice->DrawFromRecipe(job->decode->state, job->parameters, job->stages, job->snapshots, job->recipe) == RecipeOutcome::Recorded) {
+                        Graphics::NoteRecipeStage(Graphics::RecipeStage::Recorded);
+                        return;
+                    }
+                    Graphics::NoteRecipeStage(Graphics::RecipeStage::Rebuilt);
                     VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
                 }
                 std::shared_ptr<const DrawRecipe> built;

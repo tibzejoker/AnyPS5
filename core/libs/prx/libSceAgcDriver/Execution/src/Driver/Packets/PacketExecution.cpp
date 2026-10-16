@@ -131,7 +131,11 @@ void Driver::execute(const Submission& submission) {
             if (Pm4::DrawOpcode(opcode)) draws.fetch_add(1, std::memory_order_relaxed);
             else if (opcode == 0x15 || opcode == 0x16) dispatches.fetch_add(1, std::memory_order_relaxed);
             const auto window = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
-            if (auto last = shown.load(std::memory_order_relaxed); last != window && shown.compare_exchange_strong(last, window)) std::fprintf(stderr, "[activity] last 10 s: draws=%llu dispatches=%llu\n", static_cast<unsigned long long>(draws.exchange(0)), static_cast<unsigned long long>(dispatches.exchange(0)));
+            if (auto last = shown.load(std::memory_order_relaxed); last != window && shown.compare_exchange_strong(last, window)) {
+                std::fprintf(stderr, "[activity] last 10 s: draws=%llu dispatches=%llu\n", static_cast<unsigned long long>(draws.exchange(0)), static_cast<unsigned long long>(dispatches.exchange(0)));
+                std::fprintf(stderr, "[recipe-stages] %s\n", Graphics::RecipeStageStats().c_str());
+                VulkanDevice::ReportRecipeLine();
+            }
         }
         if (submission.queue == 0 && DrawThreadEnabled()) {
             // EVENT_WRITE (but a counter sample), ACQUIRE_MEM, PFP_SYNC_ME, SET_BASE and SET_UCONFIG_REG_INDEX do

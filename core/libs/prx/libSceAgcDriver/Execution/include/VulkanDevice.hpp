@@ -284,6 +284,7 @@ public:
     static void NoteRecipe(RecipeEvent event, RecipeKind kind);
     enum class DrawRecipePrecheck : std::size_t { NoRecipe, Device };
     static void NoteDrawRecipeMiss(DrawRecipePrecheck miss);
+    static void ReportRecipeLine();
     // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, direct draw
     // built for its draw-cache entry (design_cpu_final M8); null otherwise.
     void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);

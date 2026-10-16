@@ -3794,6 +3794,10 @@ void VulkanDevice::NoteRecipe(RecipeEvent event, RecipeKind kind) {
     (event == RecipeEvent::Restart ? counters.restarts : counters.attaches).fetch_add(1, std::memory_order_relaxed);
 }
 
+void VulkanDevice::ReportRecipeLine() {
+    reportRecipes();
+}
+
 void VulkanDevice::NoteDrawRecipeMiss(DrawRecipePrecheck miss) {
     auto& counters = Recipes().kinds[static_cast<std::size_t>(RecipeKind::Draw)];
     counters.precheckMisses[miss == DrawRecipePrecheck::NoRecipe ? MissNoRecipe : MissDevice].fetch_add(1, std::memory_order_relaxed);

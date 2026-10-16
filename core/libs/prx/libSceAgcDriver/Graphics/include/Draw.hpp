@@ -87,6 +87,10 @@ struct DrawRecipeOutcome {
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe);
 // Whether recorded draws build recipes and draw-cache hits use them (APS5_NO_DRAW_RECIPE unset).
 bool DrawRecipes();
+// POC: where draws leave the recipe path (counted always, printed with the [activity] line).
+enum class RecipeStage : std::size_t { Draws, RegisterKey, DrawHit, Stages, Found, Recorded, Rebuilt, Built, NoOut, NotCacheable, Waited, Indirect, NotReusable, Moved, Multisampled, Synchronous, Count };
+void NoteRecipeStage(RecipeStage stage);
+std::string RecipeStageStats();
 
 // How an indirect draw's records were read, for the [draws] line (APS5_PROFILE_DRAW): Gpu is
 // vkCmdDrawIndirect from the host import; every other value names why the CPU read them instead,
