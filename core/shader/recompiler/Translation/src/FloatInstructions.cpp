@@ -86,7 +86,8 @@ bool TranslationContext::packedFloat16(const RdnaInstruction& inst, IrOpcode opc
                 }
                 lane = IrU32(ir.Select(overflow.Value(), ir.BitwiseOr(ir.BitwiseAnd(lane.Value(), ir.Constant(0x8000u)), ir.Constant(0x7bffu)), lane.Value()));
             }
-            if (fastMath && native && !quietSnan) return lane;
+            static const bool hostNans = std::getenv("APS5_POC_EXACT_NAN_CONVERT") == nullptr;
+            if (fastMath && hostNans && native && !quietSnan) return lane;
             if (quietSnan) {
                 lane = IrU32(ir.Select(isNan(bits[0]).Value(), bits[1].Value(), lane.Value()));
                 lane = IrU32(ir.Select(isNan(bits[1]).Value(), bits[0].Value(), lane.Value()));
