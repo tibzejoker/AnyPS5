@@ -57,6 +57,8 @@ target_include_directories(libc PRIVATE
 )
 
 if(WIN32)
+    target_sources(libc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/windows/HostHeap.cpp)
+    target_include_directories(libc PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/mimalloc/include)
     target_link_libraries(libc PRIVATE advapi32 ws2_32 iphlpapi)
 endif()
 
