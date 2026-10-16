@@ -102,7 +102,7 @@ std::uint32_t HostSubgroupSize(const RecompileRequest& request) {
 
 bool RunsWave64OneLane(const RecompileRequest& request, const IrProgram& program, const ShaderStageInputInfo& inputInfo) {
     if (request.shader.stage != ShaderStage::Compute || inputInfo.compute == nullptr || program.WaveSize() != 64u || inputInfo.compute->hostSubgroupSize != 32u) return false;
-    static const bool twoLanes = std::getenv("APS5_TWO_LANE") != nullptr;
+    static const bool twoLanes = std::getenv("APS5_ONE_LANE_LAYOUT") == nullptr;
     if (twoLanes) return false;
     const auto& threads = inputInfo.compute->threadsNum;
     IrOpcode blocker = IrOpcode::Void;

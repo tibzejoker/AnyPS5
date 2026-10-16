@@ -98,6 +98,7 @@ private:
         append(key, std::getenv("APS5_POC_FAST_F16") != nullptr);
         append(key, std::getenv("APS5_POC_EXACT_FMA_MIX") != nullptr);
         append(key, std::getenv("APS5_POC_EXACT_MATH") != nullptr);
+        append(key, std::getenv("APS5_ONE_LANE_LAYOUT") != nullptr);
         append(key, std::getenv("APS5_SINGLE_LANE") != nullptr);
         append(key, ImageTableRegistry::GpuResolvedBufferStage(IrShaderStage::Compute));
     }
