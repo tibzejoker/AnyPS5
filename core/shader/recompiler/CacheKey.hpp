@@ -96,6 +96,7 @@ private:
         append(key, std::getenv("APS5_POC_ELIDE_BDA_FAULTS") == nullptr);
         append(key, ImageTableRegistry::GpuResolvedStage(IrShaderStage::Compute));
         append(key, std::getenv("APS5_POC_FAST_F16") != nullptr);
+        append(key, std::getenv("APS5_POC_EXACT_FMA_MIX") != nullptr);
         append(key, std::getenv("APS5_SINGLE_LANE") != nullptr);
         append(key, ImageTableRegistry::GpuResolvedBufferStage(IrShaderStage::Compute));
     }

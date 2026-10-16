@@ -1,4 +1,5 @@
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
+#include <cstdlib>
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
 #include <array>
@@ -280,6 +281,14 @@ std::uint32_t Interpolate(SpirvEmitterState& state, std::uint32_t delta, std::ui
     delta = FlushDenormal32(state, delta, flush16, 0x38800000u);
     coordinate = FlushDenormal32(state, coordinate, flush32, 0x00800000u);
     base = halfResult ? FlushDenormal32(state, base, flush32, 0x00800000u) : FlushDenormal32(state, base, flush16, 0x38800000u);
+    // POC (APS5_POC_EXACT_FMA_MIX=1 restores the exact path): the host's fused f32 FMA instead of the
+    // f64 emulation (f64 runs at 1/64 rate on consumer GPUs). An f16 result is rounded from the f32
+    // result by its writer (double rounding on ties), NaN payloads are the host's.
+    static const bool exactMix = std::getenv("APS5_POC_EXACT_FMA_MIX") != nullptr;
+    if (!exactMix && (!halfResult || ((mode >> InterpolationRound16Shift) & 3u) == 0u)) {
+        const auto fused = Glsl(state, TypeF32(state), GLSLstd450Fma, delta, coordinate, base);
+        return halfResult ? FlushDenormal32(state, fused, flush16, 0x38800000u) : FlushDenormal32(state, fused, flush32, 0x00800000u);
+    }
     const auto product = Exact(state, spv::OpFMul, FromF32Exact(state, delta), FromF32Exact(state, coordinate));
     const auto sum = AddRoundToOdd(state, product, FromF32Exact(state, base));
     const std::uint32_t rounding16 = halfResult ? (mode >> InterpolationRound16Shift) & 3u : 0u;
