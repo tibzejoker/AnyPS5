@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
+#include <span>
 #include <string>
 
 namespace {
@@ -67,13 +68,14 @@ constexpr std::uint32_t Words = 12;
 constexpr std::uint32_t Sentinel = 0xdeadbeefu;
 alignas(256) std::array<std::uint32_t, Rows.size() * Words + 4> Data{};
 
-RecompileResult Compile(std::uint32_t mode) {
+RecompileResult Compile(std::span<const std::uint32_t> modes, bool integer, bool raw, std::uint32_t words) {
     IrProgram program;
     const ShaderStageInputInfo inputs{};
     SpirvEmitterState state(program, inputs);
+    state.integerInterpolation = integer;
     auto& module = state.module;
     module.EmitCapability(spv::CapabilityShader);
-    module.EmitCapability(spv::CapabilityFloat64);
+    module.EmitCapability(integer ? spv::CapabilityInt64 : spv::CapabilityFloat64);
     module.EmitCapability(spv::CapabilitySignedZeroInfNanPreserve);
     module.EmitExtension("SPV_KHR_float_controls");
     module.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
@@ -92,14 +94,15 @@ RecompileResult Compile(std::uint32_t mode) {
     const auto voidType = module.Type(spv::OpTypeVoid);
     module.EmitEntryPoint(spv::ExecutionModelGLCompute, main, "main", {invocation});
     module.AddExecutionMode(main, spv::ExecutionModeLocalSize, static_cast<std::uint32_t>(Rows.size()), 1u, 1u);
-    for (const auto width : {32u, 64u}) module.AddExecutionMode(main, spv::ExecutionModeSignedZeroInfNanPreserve, width);
+    module.AddExecutionMode(main, spv::ExecutionModeSignedZeroInfNanPreserve, 32u);
+    if (!integer) module.AddExecutionMode(main, spv::ExecutionModeSignedZeroInfNanPreserve, 64u);
     module.AddFunction(spv::OpFunction, voidType, main, spv::FunctionControlMaskNone, module.Type(spv::OpTypeFunction, voidType));
     module.AddFunction(spv::OpLabel, module.AllocateId());
     const auto id = module.AllocateId();
     module.AddFunction(spv::OpLoad, TypeU32Vector(state, 3u), id, invocation);
     const auto lane = module.AllocateId();
     module.AddFunction(spv::OpCompositeExtract, u32, lane, id, 0u);
-    const auto rowBase = Binary(state, spv::OpIMul, u32, lane, ConstantU32(state, Words));
+    const auto rowBase = Binary(state, spv::OpIMul, u32, lane, ConstantU32(state, words));
     const auto address = [&](std::uint32_t offset) {
         const auto pointer = module.AllocateId();
         module.AddFunction(spv::OpAccessChain, element, pointer, buffer, ConstantU32(state, 0u), Binary(state, spv::OpIAdd, u32, rowBase, ConstantU32(state, offset)));
@@ -113,14 +116,18 @@ RecompileResult Compile(std::uint32_t mode) {
     IrProgram constants;
     IrBuilder builder(constants);
     builder.SetInsertionPoint(constants.CreateBlock());
-    const auto* flags = &builder.Constant(mode);
-    for (std::uint32_t op = 0; op < 3u; ++op) {
-        const auto delta = load(op * 3u);
-        const auto coordinate = load(op * 3u + 1u);
-        const auto base = load(op * 3u + 2u);
-        const auto value = op == 1u ? EmitFPInterpolateF16(state, delta, coordinate, base, flags) : EmitFPInterpolateF32(state, delta, coordinate, base, flags);
-        const auto result = op == 1u ? EmitConvertF16F32(state, value) : Unary(state, spv::OpBitcast, u32, value);
-        module.AddFunction(spv::OpStore, address(9u + op), result);
+    std::array<std::uint32_t, 9> operands{};
+    for (std::uint32_t index = 0; index < operands.size(); ++index) operands[index] = load(index);
+    for (std::uint32_t slot = 0; slot < modes.size(); ++slot) {
+        const auto* flags = &builder.Constant(modes[slot]);
+        for (std::uint32_t op = 0; op < 3u; ++op) {
+            const auto delta = operands[op * 3u];
+            const auto coordinate = operands[op * 3u + 1u];
+            const auto base = operands[op * 3u + 2u];
+            const auto value = op == 1u ? EmitFPInterpolateF16(state, delta, coordinate, base, flags) : EmitFPInterpolateF32(state, delta, coordinate, base, flags);
+            const auto result = op == 1u && !raw ? EmitConvertF16F32(state, value) : Unary(state, spv::OpBitcast, u32, value);
+            module.AddFunction(spv::OpStore, address(9u + slot * 3u + op), result);
+        }
     }
     module.AddFunction(spv::OpReturn);
     module.AddFunction(spv::OpFunctionEnd);
@@ -132,10 +139,11 @@ RecompileResult Compile(std::uint32_t mode) {
     return result;
 }
 
-void Run(AgcDriver::VulkanDevice& device, std::uint32_t mode) {
+void Run(AgcDriver::VulkanDevice& device, std::uint32_t mode, bool integer) {
     Data.fill(Sentinel);
     for (std::uint32_t row = 0; row < Rows.size(); ++row) std::copy(Rows[row].input.begin(), Rows[row].input.end(), Data.begin() + row * Words);
-    device.Dispatch(Compile(ModeFlags[mode]), 1u, 1u, 1u);
+    const std::array<std::uint32_t, 1> modes{ModeFlags[mode]};
+    device.Dispatch(Compile(modes, integer, false, Words), 1u, 1u, 1u);
     device.WaitIdle();
     for (std::uint32_t row = 0; row < Rows.size(); ++row) {
         for (std::uint32_t input = 0; input < 9u; ++input) Require(Data[row * Words + input] == Rows[row].input[input], "interpolation modes changed an input");
@@ -143,7 +151,7 @@ void Run(AgcDriver::VulkanDevice& device, std::uint32_t mode) {
             const auto actual = Data[row * Words + 9u + op];
             const auto expected = Rows[row].expected[mode][op];
             char message[200];
-            std::snprintf(message, sizeof(message), "%s, %s, row %u: got 0x%08x, expected 0x%08x", OpNames[op], ModeNames[mode], row, actual, expected);
+            std::snprintf(message, sizeof(message), "%s (%s), %s, row %u: got 0x%08x, expected 0x%08x", OpNames[op], integer ? "integer" : "Float64", ModeNames[mode], row, actual, expected);
             Require(actual == expected, message);
         }
     }
@@ -157,12 +165,13 @@ int main() {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         const auto target = device->Target();
-        if (std::find(target.supportedCapabilities.begin(), target.supportedCapabilities.end(), spv::CapabilityFloat64) == target.supportedCapabilities.end()) {
-            std::puts("skipped, interpolation modes require Float64");
-            return VulkanTestSkipped;
+        const bool float64 = std::find(target.supportedCapabilities.begin(), target.supportedCapabilities.end(), spv::CapabilityFloat64) != target.supportedCapabilities.end();
+        for (std::uint32_t mode = 0; mode < ModeFlags.size(); ++mode) {
+            Run(*device, mode, true);
+            if (float64) Run(*device, mode, false);
         }
-        for (std::uint32_t mode = 0; mode < ModeFlags.size(); ++mode) Run(*device, mode);
-        std::puts("interpolation modes passed: 32 hardware rows, 3 ops, 8 float modes");
+        std::puts(float64 ? "interpolation modes passed: 32 hardware rows, 3 ops, 8 float modes, integer and Float64 paths"
+                          : "interpolation modes passed: 32 hardware rows, 3 ops, 8 float modes, integer path (the device has no Float64)");
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
