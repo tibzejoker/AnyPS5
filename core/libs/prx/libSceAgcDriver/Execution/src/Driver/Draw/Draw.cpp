@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <immintrin.h>
 #include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
@@ -79,7 +80,17 @@ private:
         PinWorkerThread("draw thread");
         if (std::getenv("APS5_SAMPLE_DRAW_THREAD") != nullptr) StartWorkerSampler();
         std::unique_lock lock(mutex);
+        // POC (idea from MichonGoddijn231849's gta-v/testing): spin briefly before sleeping, since the next job usually
+        // arrives within microseconds and a condition-variable wakeup costs tens of them on Windows
+        // (APS5_POC_DRAW_SPIN_US=<us>, off by default: no gain measured, 20.9 vs 21.3).
+        static const std::uint32_t spinUs = [] { const char* text = std::getenv("APS5_POC_DRAW_SPIN_US"); return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10)) : 0u; }();
         for (;;) {
+            if (jobs.empty() && spinUs != 0) {
+                lock.unlock();
+                const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(spinUs);
+                while (inFlight.load(std::memory_order_acquire) == 0 && std::chrono::steady_clock::now() < until) _mm_pause();
+                lock.lock();
+            }
             if (jobs.empty()) {
                 lock.unlock();
                 const bool prep = PrepOutstanding();
@@ -114,7 +125,10 @@ private:
             lock.lock();
             running = 0;
             --inFlight;
-            space.notify_all();
+            // POC: a pusher blocked on a full pipeline is woken once it drained to half, not for every slot
+            // (APS5_POC_HYSTERESIS=1; off by default, no gain measured).
+            static const bool hysteresis = std::getenv("APS5_POC_HYSTERESIS") != nullptr;
+            if (!hysteresis || jobs.size() <= DrawThreadDepth() / 2) space.notify_all();
             if (jobs.empty()) idle.notify_all();
         }
     }
