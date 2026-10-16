@@ -17,6 +17,7 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
@@ -60,6 +61,15 @@ private:
             running = 1;
             lock.unlock();
             job();
+            // POC: the job's captures (snapshots, shared objects) are released on a reclaim thread, not
+            // on the draw thread (APS5_POC_NO_JOB_RECLAIM=1 releases them here).
+            static const bool reclaim = std::getenv("APS5_POC_NO_JOB_RECLAIM") == nullptr;
+            if (reclaim) {
+                std::lock_guard graveyard(reclaimMutex);
+                if (!reclaimThread.joinable()) reclaimThread = std::thread([this] { reclaimLoop(); });
+                reclaimed.push_back(std::move(job));
+                reclaimReady.notify_one();
+            }
             lock.lock();
             running = 0;
             --inFlight;
@@ -68,6 +78,22 @@ private:
         }
     }
 
+    void reclaimLoop() {
+        std::unique_lock lock(reclaimMutex);
+        for (;;) {
+            reclaimReady.wait(lock, [&] { return !reclaimed.empty(); });
+            auto batch = std::move(reclaimed);
+            reclaimed.clear();
+            lock.unlock();
+            batch.clear();
+            lock.lock();
+        }
+    }
+
+    std::mutex reclaimMutex;
+    std::condition_variable reclaimReady;
+    std::vector<std::function<void()>> reclaimed;
+    std::thread reclaimThread;
     std::mutex mutex;
     std::condition_variable ready, space, idle;
     std::deque<std::function<void()>> jobs;

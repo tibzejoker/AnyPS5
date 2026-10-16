@@ -63,6 +63,14 @@ bool SingleKeysReadable(const GuestTextureResource& resource) {
 }
 
 void ExpandSingleBlocks(std::span<std::byte> bytes, std::size_t elementBytes) {
+    if ((elementBytes == 4 || elementBytes == 8 || elementBytes == 16) && bytes.size() % KeyBytes == 0) {
+        for (std::size_t block = 0; block < bytes.size(); block += KeyBytes) {
+            std::byte pattern[16];
+            for (std::size_t offset = 0; offset < sizeof(pattern); offset += elementBytes) std::memcpy(pattern + offset, bytes.data() + block, elementBytes);
+            for (std::size_t offset = 0; offset < KeyBytes; offset += sizeof(pattern)) std::memcpy(bytes.data() + block + offset, pattern, sizeof(pattern));
+        }
+        return;
+    }
     for (std::size_t block = 0; block < bytes.size(); block += KeyBytes) {
         const auto blockBytes = std::min<std::size_t>(KeyBytes, bytes.size() - block);
         auto* first = bytes.data() + block;

@@ -426,7 +426,11 @@ void SleepNanos(std::uint64_t nanos) {
         SleepNanosCoarse(nanos);
         return;
     }
-    if (nanos < YIELD_BELOW_NANOS) {
+    // POC: APS5_POC_SHORT_SLEEP_SPIN=1 waits out a short sleep with pause instructions instead of one
+    // SwitchToThread, which returns at once when nothing else is ready (a usleep(30) poll loop then
+    // makes ~2 M system calls per second on one core).
+    static const bool spin = std::getenv("APS5_POC_SHORT_SLEEP_SPIN") != nullptr;
+    if (nanos < YIELD_BELOW_NANOS && !spin) {
         SwitchToThread();
         return;
     }
