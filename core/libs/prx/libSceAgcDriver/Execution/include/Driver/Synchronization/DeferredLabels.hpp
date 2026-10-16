@@ -32,7 +32,8 @@ DeferredLabels& deferredLabels();
 // for the draws still in flight there.
 bool DrawThreadEnabled();
 void DrainDrawPipeline();
-// POC: direct dispatches of queue 0 recorded on the draw thread too (APS5_POC_DISPATCH_THREAD=1).
+// POC: direct dispatches of queue 0 prepared on the draw preparation pool and recorded on the draw thread
+// (APS5_POC_NO_DISPATCH_THREAD=1 disables, APS5_POC_NO_DISPATCH_PREP=1 prepares on the draw thread).
 bool DispatchThreadEnabled();
 void PushDrawPipeline(std::function<void()> job);
 // POC parallel draw preparation (APS5_POC_PARALLEL_PREP=<threads>, default 3, 0 disables): queue 0's draw packets are prepared on a pool

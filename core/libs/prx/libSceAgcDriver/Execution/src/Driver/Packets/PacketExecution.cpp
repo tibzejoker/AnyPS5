@@ -123,6 +123,16 @@ void Driver::execute(const Submission& submission) {
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
         auto nextCursor = cursor + count;
+        {
+            // POC: [activity] every 10 s, the draws and dispatches of all queues (benchmarks tell the game scene
+            // from loading screens with it).
+            static std::atomic<std::uint64_t> draws{0}, dispatches{0};
+            static std::atomic<long long> shown{0};
+            if (Pm4::DrawOpcode(opcode)) draws.fetch_add(1, std::memory_order_relaxed);
+            else if (opcode == 0x15 || opcode == 0x16) dispatches.fetch_add(1, std::memory_order_relaxed);
+            const auto window = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+            if (auto last = shown.load(std::memory_order_relaxed); last != window && shown.compare_exchange_strong(last, window)) std::fprintf(stderr, "[activity] last 10 s: draws=%llu dispatches=%llu\n", static_cast<unsigned long long>(draws.exchange(0)), static_cast<unsigned long long>(dispatches.exchange(0)));
+        }
         if (submission.queue == 0 && DrawThreadEnabled()) {
             // EVENT_WRITE (but a counter sample), ACQUIRE_MEM, PFP_SYNC_ME, SET_BASE and SET_UCONFIG_REG_INDEX do
             // nothing the draws in flight must precede; a RELEASE_MEM / WRITE_DATA label without an end-of-pipe

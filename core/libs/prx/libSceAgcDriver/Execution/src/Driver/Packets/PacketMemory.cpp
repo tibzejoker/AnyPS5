@@ -83,14 +83,22 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 NotePendingLabel(entry.address, std::span<const std::byte>(entry.bytes.data(), entry.size), true);
                 PushDrawPipeline([this, entry, stamp, queueId] {
                     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
-                    {
+                    try {
                         std::lock_guard gpuLock(GuestMemory::GpuMutex());
                         const auto localDevice = device.Load();
                         const auto bytes = std::span<const std::byte>(entry.bytes.data(), entry.size);
                         const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(entry.address, bytes, stamp, queueId) : 4;
                         if (reason == 1) GuestMemory::Write(entry.address, bytes, 4);
-                        if (reason == 0 || reason == 1 || reason == 5) noteLabelStore(entry.address, bytes, stamp, queueId);
+                        if (reason != 0 && reason != 1 && reason != 5) {
+                            // Not storable on the GPU (no import, no recorder): the CPU stores it once the
+                            // work recorded before it has completed, as the packet's own path does.
+                            if (auto* recorder = Graphics::Recorder::Active()) recorder->Sync();
+                            GuestMemory::Write(entry.address, bytes, 4);
+                        }
+                        noteLabelStore(entry.address, bytes, stamp, queueId);
                         Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
+                    } catch (...) {
+                        ReportFailure(std::current_exception());
                     }
                     NotePendingLabel(entry.address, std::span<const std::byte>(entry.bytes.data(), entry.size), false);
                     PendingLabelJobs().fetch_sub(1, std::memory_order_acq_rel);

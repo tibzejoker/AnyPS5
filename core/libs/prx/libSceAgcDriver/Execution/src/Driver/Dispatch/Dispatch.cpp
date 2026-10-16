@@ -390,7 +390,23 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         job->queue = submission.queue;
         job->dataHit = dataHit;
         job->cached = cached;
-        PushDrawPipeline([this, job] {
+        // POC: the unlocked preparation (recipe check, resource build) runs on the draw preparation pool
+        // under a draw ticket, the recording on the draw thread in packet order (APS5_POC_NO_DISPATCH_PREP=1:
+        // both on the draw thread).
+        struct Prepared {
+            std::shared_ptr<RecipeHit> recipeHit;
+            std::shared_ptr<PreparedDispatch> prepared;
+            bool done = false;
+        };
+        auto early = std::make_shared<Prepared>();
+        const auto prepare = [this, job, early] {
+            auto localDevice = job->device;
+            if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
+            if (job->cached && job->keep != nullptr && !stampValidate()) early->recipeHit = localDevice->PrepareRecipe(job->keep->recipe.load(std::memory_order_acquire), false);
+            if (early->recipeHit == nullptr || VulkanDevice::VerifyRecipes()) early->prepared = localDevice->PrepareDispatch(*job->compiled, job->snapshots, job->threads);
+            early->done = true;
+        };
+        auto record = [this, job, early] {
             std::shared_lock deviceUse(deviceReplacement);
             GuestMemory::AdoptCollectEpoch(job->epoch);
             auto localDevice = job->device;
@@ -398,12 +414,16 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             const auto& compiled = *job->compiled;
             try {
                 std::shared_ptr<RecipeHit> recipeHit;
-                if (job->cached && job->keep != nullptr && !stampValidate()) recipeHit = localDevice->PrepareRecipe(job->keep->recipe.load(std::memory_order_acquire), false);
+                if (early->done) recipeHit = std::move(early->recipeHit);
+                else if (job->cached && job->keep != nullptr && !stampValidate()) recipeHit = localDevice->PrepareRecipe(job->keep->recipe.load(std::memory_order_acquire), false);
                 auto* const attachTo = stampValidate() ? nullptr : job->keep != nullptr ? job->keep.get() : job->attach.get();
                 std::shared_ptr<const Recipe> builtRecipe;
+                bool first = true;
                 for (;;) {
                     std::shared_ptr<PreparedDispatch> prepared;
-                    if (recipeHit == nullptr || VulkanDevice::VerifyRecipes()) prepared = localDevice->PrepareDispatch(compiled, job->snapshots, job->threads);
+                    if (first && early->done) prepared = std::move(early->prepared);
+                    else if (recipeHit == nullptr || VulkanDevice::VerifyRecipes()) prepared = localDevice->PrepareDispatch(compiled, job->snapshots, job->threads);
+                    first = false;
                     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
                     std::lock_guard gpuLock(GuestMemory::GpuMutex());
                     recordLabelsForPacket(localDevice.get(), job->queue);
@@ -432,7 +452,20 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 static std::atomic<std::uint64_t> failures{0};
                 if (failures.fetch_add(1) < 50) std::fprintf(stderr, "[draw-thread] compute shader 0x%llx failed: %s\n", static_cast<unsigned long long>(job->address), error.what());
             }
-        });
+        };
+        static const bool prepInPool = std::getenv("APS5_POC_NO_DISPATCH_PREP") == nullptr;
+        if (prepInPool && ParallelPrepThreads() != 0) {
+            SubmitDrawPrep(TakeDrawTicket(), [prepare, record] {
+                try {
+                    prepare();
+                } catch (...) {
+                }
+                ServeDrawTurn();
+                PushDrawPipeline(record);
+            });
+        } else {
+            PushDrawPipeline(record);
+        }
         if (profile) {
             auto& pending = pendingDispatchPhases();
             pending.outcome = DispatchOutcome::Real;

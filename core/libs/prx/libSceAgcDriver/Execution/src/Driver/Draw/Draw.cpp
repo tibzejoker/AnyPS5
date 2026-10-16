@@ -279,7 +279,7 @@ bool DrawThreadEnabled() {
 }
 
 bool DispatchThreadEnabled() {
-    static const bool enabled = DrawThreadEnabled() && std::getenv("APS5_POC_DISPATCH_THREAD") != nullptr;
+    static const bool enabled = DrawThreadEnabled() && std::getenv("APS5_POC_NO_DISPATCH_THREAD") == nullptr;
     return enabled;
 }
 
