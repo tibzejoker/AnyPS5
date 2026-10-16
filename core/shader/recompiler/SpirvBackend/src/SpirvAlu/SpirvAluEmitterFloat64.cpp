@@ -275,7 +275,7 @@ std::uint32_t FlushDenormal32(SpirvEmitterState& state, std::uint32_t value, boo
     return Unary(state, spv::OpBitcast, TypeF32(state), Select(state, u32, denormal, Binary(state, spv::OpBitwiseAnd, u32, bits, ConstantU32(state, 0x80000000u)), bits));
 }
 
-std::uint32_t Interpolate(SpirvEmitterState& state, std::uint32_t delta, std::uint32_t coordinate, std::uint32_t base, bool halfResult, std::uint32_t mode) {
+std::uint32_t Interpolate(SpirvEmitterState& state, std::uint32_t delta, std::uint32_t coordinate, std::uint32_t base, bool halfResult, std::uint32_t mode, bool exact = false) {
     const auto u32 = TypeU32(state);
     const bool quietNans = halfResult || (mode & InterpolationQuiet) != 0u;
     const bool flush32 = (mode & InterpolationFlush32) != 0u;
@@ -287,7 +287,7 @@ std::uint32_t Interpolate(SpirvEmitterState& state, std::uint32_t delta, std::ui
     // f64 emulation (f64 runs at 1/64 rate on consumer GPUs). An f16 result is rounded from the f32
     // result by its writer (double rounding on ties), NaN payloads are the host's.
     static const bool exactMix = std::getenv("APS5_POC_EXACT_FMA_MIX") != nullptr;
-    if (!exactMix && (!halfResult || ((mode >> InterpolationRound16Shift) & 3u) == 0u)) {
+    if (!exactMix && !exact && (!halfResult || ((mode >> InterpolationRound16Shift) & 3u) == 0u)) {
         const auto fused = Glsl(state, TypeF32(state), GLSLstd450Fma, delta, coordinate, base);
         return halfResult ? FlushDenormal32(state, fused, flush16, 0x38800000u) : FlushDenormal32(state, fused, flush32, 0x00800000u);
     }
@@ -978,7 +978,82 @@ std::uint32_t InterpolateFunction(SpirvEmitterState& state, bool halfResult, std
         state.module.AddFunction(spv::OpFunctionParameter, f32, parameter);
     }
     EmitLabel(state, state.module.AllocateId());
-    state.module.AddFunction(spv::OpReturnValue, (state.integerInterpolation ? InterpolateInteger : Interpolate)(state, parameters[0], parameters[1], parameters[2], halfResult, mode));
+    // POC (APS5_POC_GUARDED_FMA_MIX=1): the host's fused f32 FMA where it is exact, the exact path otherwise.
+    // Exact when every flushed input and the result are finite normal f32 values (no denormal handling or NaN
+    // payload involved, one rounding) and, for an f16 result rounded to nearest, the result is a normal f16 and
+    // not an f16 rounding midpoint (no double rounding); the f16 rounding is then done on the f32 bits.
+    static const bool guarded = std::getenv("APS5_POC_GUARDED_FMA_MIX") != nullptr;
+    if (guarded && (!halfResult || ((mode >> InterpolationRound16Shift) & 3u) == 0u)) {
+        const auto u32 = TypeU32(state);
+        const auto boolean = TypeBool(state);
+        const bool flush32 = (mode & InterpolationFlush32) != 0u;
+        const bool flush16 = (mode & InterpolationFlush16) != 0u;
+        const auto delta = FlushDenormal32(state, parameters[0], flush16, 0x38800000u);
+        const auto coordinate = FlushDenormal32(state, parameters[1], flush32, 0x00800000u);
+        const auto base = halfResult ? FlushDenormal32(state, parameters[2], flush32, 0x00800000u) : FlushDenormal32(state, parameters[2], flush16, 0x38800000u);
+        const auto magnitude = [&](std::uint32_t value) { return Binary(state, spv::OpBitwiseAnd, u32, Unary(state, spv::OpBitcast, u32, value), ConstantU32(state, 0x7fffffffu)); };
+        const auto plain = [&](std::uint32_t value) {
+            const auto bits = magnitude(value);
+            const auto normal = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpUGreaterThanEqual, boolean, bits, ConstantU32(state, 0x00800000u)), Binary(state, spv::OpULessThan, boolean, bits, ConstantU32(state, 0x7f800000u)));
+            return Binary(state, spv::OpLogicalOr, boolean, normal, Binary(state, spv::OpIEqual, boolean, bits, ConstantU32(state, 0u)));
+        };
+        const auto fused = Glsl(state, TypeF32(state), GLSLstd450Fma, delta, coordinate, base);
+        const auto fusedBits = Unary(state, spv::OpBitcast, u32, fused);
+        const auto fusedMagnitude = magnitude(fused);
+        auto safe = Binary(state, spv::OpLogicalAnd, boolean, plain(delta), plain(coordinate));
+        safe = Binary(state, spv::OpLogicalAnd, boolean, safe, plain(base));
+        std::uint32_t fast = fused;
+        if (halfResult) {
+            const auto inRange = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpUGreaterThanEqual, boolean, fusedMagnitude, ConstantU32(state, 0x38800000u)), Binary(state, spv::OpULessThan, boolean, fusedMagnitude, ConstantU32(state, 0x477ff000u)));
+            const auto midpoint = Binary(state, spv::OpIEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, fusedBits, ConstantU32(state, 0x1fffu)), ConstantU32(state, 0x1000u));
+            // At an f16 midpoint of the f32 result, the sign of the exact residual (delta * coordinate + base - fused) picks the
+            // direction: product error by FMA, sums by TwoSum, all exact while the product does not underflow.
+            const auto f32 = TypeF32(state);
+            const auto twoSum = [&](std::uint32_t lhs, std::uint32_t rhs) {
+                const auto sum = ExactF32(state, spv::OpFAdd, lhs, rhs);
+                const auto virtualRhs = ExactF32(state, spv::OpFSub, sum, lhs);
+                const auto virtualLhs = ExactF32(state, spv::OpFSub, sum, virtualRhs);
+                const auto error = ExactF32(state, spv::OpFAdd, ExactF32(state, spv::OpFSub, lhs, virtualLhs), ExactF32(state, spv::OpFSub, rhs, virtualRhs));
+                return std::pair{sum, error};
+            };
+            const auto high = ExactF32(state, spv::OpFMul, delta, coordinate);
+            const auto low = Glsl(state, f32, GLSLstd450Fma, delta, coordinate, Unary(state, spv::OpFNegate, f32, high));
+            const auto [partial, partialError] = twoSum(high, base);
+            const auto offset = ExactF32(state, spv::OpFSub, partial, fused);
+            const auto [tail, tailError] = twoSum(partialError, low);
+            const auto [head, headError] = twoSum(offset, tail);
+            const auto residual = ExactF32(state, spv::OpFAdd, head, ExactF32(state, spv::OpFAdd, headError, tailError));
+            const auto above = Binary(state, spv::OpFOrdGreaterThan, boolean, residual, ConstantF32(state, 0u));
+            const auto below = Binary(state, spv::OpFOrdLessThan, boolean, residual, ConstantF32(state, 0u));
+            const auto negative = Binary(state, spv::OpINotEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, fusedBits, ConstantU32(state, 0x80000000u)), ConstantU32(state, 0u));
+            const auto truncated = Binary(state, spv::OpBitwiseAnd, u32, fusedBits, ConstantU32(state, 0xffffe000u));
+            const auto oddTruncated = Binary(state, spv::OpINotEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, truncated, ConstantU32(state, 0x2000u)), ConstantU32(state, 0u));
+            const auto away = Binary(state, spv::OpLogicalOr, boolean, Binary(state, spv::OpLogicalOr, boolean, Binary(state, spv::OpLogicalAnd, boolean, above, Unary(state, spv::OpLogicalNot, boolean, negative)), Binary(state, spv::OpLogicalAnd, boolean, below, negative)), Binary(state, spv::OpLogicalAnd, boolean, Unary(state, spv::OpLogicalNot, boolean, Binary(state, spv::OpLogicalOr, boolean, above, below)), oddTruncated));
+            const auto midpointBits = Select(state, u32, away, Binary(state, spv::OpIAdd, u32, truncated, ConstantU32(state, 0x2000u)), truncated);
+            const auto highMagnitude = magnitude(high);
+            const auto productZero = Binary(state, spv::OpLogicalOr, boolean, Binary(state, spv::OpIEqual, boolean, magnitude(delta), ConstantU32(state, 0u)), Binary(state, spv::OpIEqual, boolean, magnitude(coordinate), ConstantU32(state, 0u)));
+            const auto productExact = Binary(state, spv::OpLogicalOr, boolean, productZero, Binary(state, spv::OpUGreaterThanEqual, boolean, highMagnitude, ConstantU32(state, 0x0d800000u)));
+            safe = Binary(state, spv::OpLogicalAnd, boolean, safe, Binary(state, spv::OpLogicalAnd, boolean, inRange, Binary(state, spv::OpLogicalOr, boolean, Unary(state, spv::OpLogicalNot, boolean, midpoint), productExact)));
+            const auto odd = Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpShiftRightLogical, u32, fusedBits, ConstantU32(state, 13u)), ConstantU32(state, 1u));
+            const auto rounded = Binary(state, spv::OpBitwiseAnd, u32, Binary(state, spv::OpIAdd, u32, fusedBits, Binary(state, spv::OpIAdd, u32, ConstantU32(state, 0x0fffu), odd)), ConstantU32(state, 0xffffe000u));
+            fast = Unary(state, spv::OpBitcast, TypeF32(state), Select(state, u32, midpoint, midpointBits, rounded));
+        } else {
+            safe = Binary(state, spv::OpLogicalAnd, boolean, safe, Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpUGreaterThan, boolean, fusedMagnitude, ConstantU32(state, 0x00800000u)), Binary(state, spv::OpULessThan, boolean, fusedMagnitude, ConstantU32(state, 0x7f800000u))));
+        }
+        const auto fastLabel = state.module.AllocateId();
+        const auto exactLabel = state.module.AllocateId();
+        const auto merge = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, safe, fastLabel, exactLabel);
+        EmitLabel(state, fastLabel);
+        state.module.AddFunction(spv::OpReturnValue, fast);
+        EmitLabel(state, exactLabel);
+        state.module.AddFunction(spv::OpReturnValue, state.integerInterpolation ? InterpolateInteger(state, parameters[0], parameters[1], parameters[2], halfResult, mode) : Interpolate(state, parameters[0], parameters[1], parameters[2], halfResult, mode, true));
+        EmitLabel(state, merge);
+        state.module.AddFunction(spv::OpUnreachable);
+    } else {
+        state.module.AddFunction(spv::OpReturnValue, state.integerInterpolation ? InterpolateInteger(state, parameters[0], parameters[1], parameters[2], halfResult, mode) : Interpolate(state, parameters[0], parameters[1], parameters[2], halfResult, mode));
+    }
     state.module.AddFunction(spv::OpFunctionEnd);
     state.interpolateFunctions.emplace(key, id);
     return id;

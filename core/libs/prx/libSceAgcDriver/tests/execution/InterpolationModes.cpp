@@ -342,6 +342,29 @@ void RunRandom(AgcDriver::VulkanDevice& device, bool integer) {
                 char message[240];
                 std::snprintf(message, sizeof(message), "%s (%s), mode 0x%x, random row %u: 0x%08x * 0x%08x + 0x%08x gave 0x%08x, reference 0x%08x",
                     OpNames[op], integer ? "integer" : "Float64", modes[slot], row, input[0], input[1], input[2], actual, expected);
+                if (CountMismatches() && actual != expected && op == 1u) {
+                    const auto half = [](std::uint32_t bits) {
+                        const std::uint32_t sign = (bits >> 16u) & 0x8000u, magnitude = bits & 0x7fffffffu;
+                        if (magnitude > 0x7f800000u) return sign | 0x7e00u | ((magnitude >> 13u) & 0x3ffu);
+                        if (magnitude >= 0x477ff000u) return sign | 0x7c00u;
+                        if (magnitude < 0x33000000u) return sign;
+                        const std::int32_t exponent = static_cast<std::int32_t>(magnitude >> 23u) - 112;
+                        const std::uint32_t mantissa = (magnitude & 0x7fffffu) | 0x800000u;
+                        const std::uint32_t shift = exponent > 0 ? 13u : static_cast<std::uint32_t>(14 - exponent);
+                        const std::uint32_t kept = mantissa >> shift, rest = mantissa & ((1u << shift) - 1u), halfway = 1u << (shift - 1u);
+                        std::uint32_t result = exponent > 0 ? ((static_cast<std::uint32_t>(exponent) << 10u) | (kept & 0x3ffu)) : kept;
+                        if (rest > halfway || (rest == halfway && (kept & 1u) != 0u)) ++result;
+                        return sign | result;
+                    };
+                    static std::uint64_t differing = 0, surviving = 0;
+                    ++differing;
+                    static std::uint64_t survivingNan = 0;
+                    if (half(actual) != half(expected)) {
+                        ++surviving;
+                        if ((actual & 0x7fffffffu) > 0x7f800000u || (expected & 0x7fffffffu) > 0x7f800000u) ++survivingNan;
+                    }
+                    if (differing % 512u == 0u || row + 1u == RandomRows) std::fprintf(stderr, "[mismatch-f16] p2 random differences %llu, still different after the f16 write %llu (NaN on either side %llu)\n", static_cast<unsigned long long>(differing), static_cast<unsigned long long>(surviving), static_cast<unsigned long long>(survivingNan));
+                }
                 if (CountMismatches() && actual != expected && slot == 3u) {
                     static int printed = 0;
                     if (printed++ < 24) std::fprintf(stderr, "[mismatch-row] %s\n", message);
