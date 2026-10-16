@@ -1252,6 +1252,24 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             stop = end;
         }
     }
+#else
+    // POC (idea from MichonGoddijn231849's gta-v/testing, APS5_COLLECT_GRANULE_KIB): a small memoized collect walks
+    // its whole aligned granule, so the neighbouring ranges of the epoch (per-draw constant rings, adjacent
+    // buffers) are memo hits instead of a GetWriteWatch each (APS5_POC_COLLECT_GRANULE_KIB=<power of two>, off by default:
+    // neutral here, 20.46 vs 20.40).
+    static const std::uint64_t granule = [] {
+        const char* text = std::getenv("APS5_POC_COLLECT_GRANULE_KIB");
+        const auto kib = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+        return kib >= 4 && (kib & (kib - 1)) == 0 && kib <= 4096 ? kib * 1024ull : 0ull;
+    }();
+    if (useMemo && granule != 0 && bytes <= granule) {
+        const auto begin = first & ~(granule - 1);
+        const auto end = (stop + granule - 1) & ~(granule - 1);
+        if (end > begin && tracker.covers(begin, end - begin)) {
+            first = begin;
+            stop = end;
+        }
+    }
 #endif
     if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return 0;
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.

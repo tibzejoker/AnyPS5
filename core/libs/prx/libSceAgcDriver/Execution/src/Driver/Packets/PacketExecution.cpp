@@ -409,6 +409,15 @@ void Driver::execute(const Submission& submission) {
     // instead of a drain, so the next chunk is decoded while they record (default; APS5_POC_NO_END_JOB=1 drains).
     static const bool endJob = std::getenv("APS5_POC_NO_END_JOB") == nullptr;
     if (submission.queue == 0 && endJob && submission.rewindTail != nullptr && LabelJobsEnabled() && !submitAtEnd && deferredLabels().labels.empty()) {
+        // POC (idea from MichonGoddijn231849's gta-v/testing, APS5_BATCH_SUBMITS): a chunk whose tail the guest already
+        // released ends nothing the guest observes, so the batch stays open into the tail (labels, waits and the
+        // batch cap still end it). Opt-in APS5_POC_KEEP_CHUNK_BATCH=1: slower here (19.3 vs 20.4), the GPU starts later.
+        static const bool everyChunk = std::getenv("APS5_POC_KEEP_CHUNK_BATCH") == nullptr;
+        const bool released = (std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0;
+        if (!everyChunk && released) {
+            executeRewindTail(submission);
+            return;
+        }
         PushOrderedDrawJob([this] {
             if (!Graphics::Recorder::PendingLabelSince().has_value() && Graphics::Recorder::RecordedWorkSinceSubmit() == 0) return;
             ++submissionCosts(0).endSubmits;
