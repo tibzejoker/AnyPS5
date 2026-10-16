@@ -252,7 +252,7 @@ struct ProcessSampler {
             for (const auto& [address, count] : hot) leaves += count.first;
             if (leaves == 0) continue;
             std::fprintf(file, "thread %lu samples %llu\n", static_cast<unsigned long>(id), static_cast<unsigned long long>(thread.samples));
-            for (std::size_t i = 0; i < hot.size() && i < 40; ++i) {
+            for (std::size_t i = 0; i < hot.size() && i < 400; ++i) {
                 const auto address = hot[i].first;
                 HMODULE module = nullptr;
                 char name[MAX_PATH] = "?";
@@ -272,6 +272,11 @@ void StartProcessSampler() {
         auto sampler = std::make_unique<ProcessSampler>();
         sampler->path = path;
         sampler->self = GetCurrentThreadId();
+        // APS5_SAMPLE_THREADS_DELAY=<seconds> starts sampling that long after launch (e.g. once Story renders).
+        if (const char* delay = std::getenv("APS5_SAMPLE_THREADS_DELAY"); delay != nullptr) {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(std::strtoul(delay, nullptr, 10));
+            while (!token.stop_requested() && std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
         auto flushed = std::chrono::steady_clock::now();
         while (!token.stop_requested()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(2));

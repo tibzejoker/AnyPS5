@@ -249,7 +249,36 @@ static void CancellableSleep(std::uint64_t nanos) {
 
 int APS5_VABI sceKernelUsleep_nid_postfix(KernelUseconds microseconds) {
     TraceSleep(__builtin_return_address(0), microseconds);
+    static const bool timed = std::getenv("APS5_TRACE_USLEEP") != nullptr;
+    if (!timed) {
+        CancellableSleep(static_cast<std::uint64_t>(microseconds) * 1000ULL);
+        return 0;
+    }
+    // Debug aid: wall time spent inside usleep per call site, printed every 10 s ([usleep-time]).
+    static std::mutex mutex;
+    static std::unordered_map<std::uintptr_t, std::uint64_t> spent;
+    static std::unordered_map<std::uintptr_t, std::uint64_t> calls;
+    static std::uint64_t reported = 0;
+    const auto started = std::chrono::steady_clock::now();
     CancellableSleep(static_cast<std::uint64_t>(microseconds) * 1000ULL);
+    const auto ended = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    spent[reinterpret_cast<std::uintptr_t>(__builtin_return_address(0))] += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(ended - started).count());
+    ++calls[reinterpret_cast<std::uintptr_t>(__builtin_return_address(0))];
+    const auto window = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(ended.time_since_epoch()).count() / 10);
+    if (window != reported) {
+        reported = window;
+#ifdef _WIN32
+        const auto image = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+#else
+        const std::uintptr_t image = 0;
+#endif
+        std::fprintf(stderr, "[usleep-time] last 10 s:");
+        for (const auto& [site, ns] : spent) if (ns > 1000000) std::fprintf(stderr, " exe+0x%llx %llu ms x%llu", static_cast<unsigned long long>(site - image), static_cast<unsigned long long>(ns / 1000000), static_cast<unsigned long long>(calls[site]));
+        std::fprintf(stderr, "\n");
+        spent.clear();
+        calls.clear();
+    }
     return 0;
 }
 
