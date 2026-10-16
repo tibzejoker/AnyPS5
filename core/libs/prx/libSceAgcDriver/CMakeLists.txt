@@ -183,6 +183,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FastEmutls.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/SubgroupClock.cpp
@@ -278,6 +279,10 @@ add_shader_recompiler(shader_recompiler_agc_driver libc
         ${agcShaderCacheGuardSources}
 )
 
+if(WIN32)
+    # FastEmutls.cpp serves this module's thread_local objects only: other modules keep libgcc's.
+    target_link_options(libSceAgcDriver PRIVATE "-Wl,--exclude-symbols,__emutls_get_address")
+endif()
 target_link_libraries(libSceAgcDriver PRIVATE
         shader_recompiler_agc_driver
         SDL2-static
