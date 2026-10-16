@@ -96,7 +96,7 @@ private:
         append(key, ImageTableRegistry::GpuResolvedStage(IrShaderStage::Compute));
         // The environment switches that shape the code, read once (getenv takes the CRT's lock and
         // scans the environment: built on every draw stage, it was 45 % of a draw preparation).
-        static const std::uint64_t switches = (std::getenv("APS5_POC_ELIDE_BDA_FAULTS") == nullptr ? 1u : 0u) | (std::getenv("APS5_POC_FAST_F16") != nullptr ? 2u : 0u) | (std::getenv("APS5_POC_EXACT_FMA_MIX") != nullptr ? 4u : 0u) | (std::getenv("APS5_POC_EXACT_MATH") != nullptr ? 8u : 0u) | (std::getenv("APS5_ONE_LANE_LAYOUT") != nullptr ? 16u : 0u) | (std::getenv("APS5_SINGLE_LANE") != nullptr ? 32u : 0u);
+        static const std::uint64_t switches = (std::getenv("APS5_POC_ELIDE_BDA_FAULTS") == nullptr ? 1u : 0u) | (std::getenv("APS5_POC_FAST_F16") != nullptr ? 2u : 0u) | (std::getenv("APS5_POC_EXACT_FMA_MIX") != nullptr ? 4u : 0u) | (std::getenv("APS5_POC_EXACT_MATH") != nullptr ? 8u : 0u) | (std::getenv("APS5_ONE_LANE_LAYOUT") != nullptr ? 16u : 0u) | (std::getenv("APS5_SINGLE_LANE") != nullptr ? 32u : 0u) | (std::getenv("APS5_POC_INTEGER_INTERPOLATE") != nullptr ? 64u : 0u);
         append(key, switches);
         append(key, ImageTableRegistry::GpuResolvedBufferStage(IrShaderStage::Compute));
     }

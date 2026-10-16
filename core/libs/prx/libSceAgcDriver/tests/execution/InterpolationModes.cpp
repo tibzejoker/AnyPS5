@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <limits>
 #include <span>
@@ -19,6 +20,8 @@ namespace {
 
 using namespace ShaderRecompiler;
 using AgcDriver::Graphics::Require;
+
+}
 
 struct Row {
     std::array<std::uint32_t, 9> input;
@@ -30,6 +33,49 @@ constexpr std::array<const char*, 8> ModeNames{"IEEE=0 f32-flush f16-flush", "IE
 constexpr std::array<std::uint32_t, 8> ModeFlags{
     InterpolationFlush32 | InterpolationFlush16, InterpolationFlush32, InterpolationFlush16, 0u,
     InterpolationQuiet | InterpolationFlush32 | InterpolationFlush16, InterpolationQuiet | InterpolationFlush32, InterpolationQuiet | InterpolationFlush16, InterpolationQuiet};
+
+namespace {
+// POC measurement aid (APS5_TEST_COUNT_MISMATCHES=1): count the rows that differ instead of stopping at the first,
+// split into NaN results (either side), results one unit in the last place apart, and others.
+struct MismatchCount {
+    std::uint64_t compared = 0, nan = 0, oneUlp = 0, other = 0, upTo16 = 0, maxUlp = 0;
+    std::array<std::uint64_t, 32> byMode{}, comparedByMode{};
+    ~MismatchCount() {
+        for (std::size_t m = 0; m < byMode.size(); ++m) if (byMode[m] != 0) std::fprintf(stderr, "[mismatch-mode] slot %zu (%s, round16 %zu): %llu of %llu\n", m, ModeNames[m % 8], m / 8, static_cast<unsigned long long>(byMode[m]), static_cast<unsigned long long>(comparedByMode[m]));
+        if (compared != 0) std::fprintf(stderr, "[mismatch] %llu compared: %llu NaN, %llu one ulp, %llu other (%llu within 16 ulp, max %llu)\n", static_cast<unsigned long long>(compared), static_cast<unsigned long long>(nan), static_cast<unsigned long long>(oneUlp), static_cast<unsigned long long>(other), static_cast<unsigned long long>(upTo16), static_cast<unsigned long long>(maxUlp));
+    }
+};
+MismatchCount& Mismatches() {
+    static MismatchCount count;
+    return count;
+}
+bool CountMismatches() {
+    static const bool enabled = std::getenv("APS5_TEST_COUNT_MISMATCHES") != nullptr;
+    return enabled;
+}
+// Returns whether the comparison should go on (counted) instead of failing.
+bool Counted(std::uint32_t actual, std::uint32_t expected, bool half, std::uint32_t slot) {
+    if (!CountMismatches()) return false;
+    auto& count = Mismatches();
+    ++count.compared;
+    ++count.comparedByMode[slot];
+    if (actual == expected) return true;
+    ++count.byMode[slot];
+    const auto isNan = [&](std::uint32_t bits) { return half ? (bits & 0x7fffu) > 0x7c00u : (bits & 0x7fffffffu) > 0x7f800000u; };
+    if (isNan(actual) || isNan(expected)) {
+        ++count.nan;
+        if (count.nan <= 6u) std::fprintf(stderr, "[mismatch-nan] got 0x%08x expected 0x%08x\n", actual, expected);
+    }
+    else if ((actual > expected ? actual - expected : expected - actual) == 1u) ++count.oneUlp;
+    else {
+        ++count.other;
+        if (count.other <= 12u) std::fprintf(stderr, "[mismatch-other] op %s got 0x%08x expected 0x%08x\n", half ? "p2" : "p1", actual, expected);
+        const std::uint64_t distance = actual > expected ? actual - expected : expected - actual;
+        if (distance <= 16u) ++count.upTo16;
+        count.maxUlp = std::max(count.maxUlp, distance);
+    }
+    return true;
+}
 constexpr std::array<const char*, 3> OpNames{"v_interp_p1ll_f16", "v_interp_p2_f16", "v_interp_p1lv_f16"};
 
 constexpr std::array<Row, 32> Rows{{
@@ -158,6 +204,8 @@ void Run(AgcDriver::VulkanDevice& device, std::uint32_t mode, bool integer) {
             const auto expected = Rows[row].expected[mode][op];
             char message[200];
             std::snprintf(message, sizeof(message), "%s (%s), %s, row %u: got 0x%08x, expected 0x%08x", OpNames[op], integer ? "integer" : "Float64", ModeNames[mode], row, actual, expected);
+            if (CountMismatches() && actual != expected) std::fprintf(stderr, "[mismatch-hw] %s\n", message);
+            if (Counted(actual, expected, op == 1u, mode)) continue;
             Require(actual == expected, message);
         }
     }
@@ -294,6 +342,11 @@ void RunRandom(AgcDriver::VulkanDevice& device, bool integer) {
                 char message[240];
                 std::snprintf(message, sizeof(message), "%s (%s), mode 0x%x, random row %u: 0x%08x * 0x%08x + 0x%08x gave 0x%08x, reference 0x%08x",
                     OpNames[op], integer ? "integer" : "Float64", modes[slot], row, input[0], input[1], input[2], actual, expected);
+                if (CountMismatches() && actual != expected && slot == 3u) {
+                    static int printed = 0;
+                    if (printed++ < 24) std::fprintf(stderr, "[mismatch-row] %s\n", message);
+                }
+                if (Counted(actual, expected, op == 1u, slot)) continue;
                 Require(actual == expected, message);
             }
         }
