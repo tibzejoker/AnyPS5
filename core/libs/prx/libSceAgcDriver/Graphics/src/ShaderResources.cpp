@@ -4848,27 +4848,27 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
-    std::array<std::vector<VkDescriptorSetLayoutBinding>, 2> descriptions;
-    std::array<std::map<VkDescriptorType, std::uint32_t>, 2> counts;
-    for (const auto& binding : bindings) {
-        const auto set = setOf(binding);
-        descriptions[set].push_back(binding.layout);
-        counts[set][binding.layout.descriptorType] += (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
-    }
-    const auto sizesOf = [&](std::size_t set) {
-        std::vector<VkDescriptorPoolSize> sizes;
-        for (const auto& [type, count] : counts[set]) {
-            if (count != 0) sizes.push_back({type, count});
+    std::call_once(drawPoolSizesOnce, [&] {
+        std::array<std::map<VkDescriptorType, std::uint32_t>, 2> counts;
+        for (const auto& binding : bindings) {
+            const auto set = setOf(binding);
+            drawSetUsed[set] = true;
+            counts[set][binding.layout.descriptorType] += (binding.flags & VK_DESCRIPTOR_BINDING_VARIABLE_DESCRIPTOR_COUNT_BIT) != 0 ? std::max(1u, static_cast<std::uint32_t>(binding.imageAllocations.size())) : binding.layout.descriptorCount;
         }
-        return sizes;
-    };
+        for (std::size_t set = 0; set < counts.size(); ++set) {
+            for (const auto& [type, count] : counts[set]) {
+                if (count != 0) drawPoolSizes[set].push_back({type, count});
+            }
+        }
+    });
+    const auto sizesOf = [&](std::size_t set) { return drawPoolSizes[set]; };
     const auto variableOf = [&](std::size_t set) { return tableBindings[set] != std::numeric_limits<std::size_t>::max() ? std::optional<std::uint32_t>(std::max(1u, static_cast<std::uint32_t>(bindings[tableBindings[set]].imageAllocations.size()))) : std::nullopt; };
     result->cache = context.descriptorCache;
-    if (!descriptions[0].empty() || splitSets) {
+    if (drawSetUsed[0] || splitSets) {
         result->allocation = result->cache->Allocate(_layout, sizesOf(0), updateAfterBind, variableOf(0));
         Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }
-    if (!descriptions[1].empty() || splitSets) {
+    if (drawSetUsed[1] || splitSets) {
         result->fragmentAllocation = result->cache->Allocate(fragment.layout, sizesOf(1), updateAfterBind, variableOf(1));
         Require(result->fragmentAllocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
     }

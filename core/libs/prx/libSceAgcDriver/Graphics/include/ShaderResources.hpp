@@ -491,6 +491,11 @@ private:
     std::vector<std::uint32_t> layoutKey;
     GuestBufferMemory guestMemory;
     std::size_t maxDrawSnapshotBytes = MaxDrawSnapshotBytes();
+    // The descriptor pool sizes of the draw snapshot sets (fixed by the bindings), computed by the first
+    // PrepareDrawBindings.
+    mutable std::once_flag drawPoolSizesOnce;
+    mutable std::array<std::vector<VkDescriptorPoolSize>, 2> drawPoolSizes;
+    mutable std::array<bool, 2> drawSetUsed{};
     std::unique_ptr<BdaResources> bda;
     bool usesBda = false;
     std::uint64_t addressSpaceSerial = 0;
