@@ -1134,6 +1134,18 @@ ShaderResources::ShaderResources(const Context& context, std::span<const Compile
 
 ShaderResources::ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots) : ShaderResources(context, compute, snapshots, false) {}
 
+ShaderResources::ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots, DeferredDraw) : context(context), guestMemory(context), deferredSnapshots(snapshots), deferredShaders(shaders.begin(), shaders.end()), deferredTarget(target), deferredColorAttachments(colorAttachments), deferredIndexAddress(indexAddress), deferredIndexBytes(indexBytes) {
+    drawBuild = true;
+    lockedBuild = std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) {
+        Require(shader.program != nullptr, "missing compiled shader");
+        return std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; });
+    });
+    if (lockedBuild) return;
+    unlockedPrepare = true;
+    prepareAddressBindings(deferredShaders, snapshots);
+    buildPrepare(deferredShaders, &deferredTarget, colorAttachments, indexAddress, indexBytes);
+}
+
 namespace {
 
 // Whether a compute stage maps registered guest memory through BDA tables (see prepareAddressBindings).
@@ -1667,6 +1679,15 @@ bool UsesImageRegistry(std::span<const std::uint32_t> spirv) {
 
 void ShaderResources::Complete() {
     Require(!completed, "shader resources were already completed");
+    if (drawBuild) {
+        if (lockedBuild) {
+            prepareAddressBindings(deferredShaders, deferredSnapshots);
+            buildPrepare(deferredShaders, &deferredTarget, deferredColorAttachments, deferredIndexAddress, deferredIndexBytes);
+        }
+        buildComplete();
+        forgetDeferredInputs();
+        return;
+    }
     const std::span<const CompiledShader> shaders(&deferredCompute, 1);
     if (lockedBuild) {
         prepareAddressBindings(shaders, deferredSnapshots);
@@ -1682,6 +1703,8 @@ void ShaderResources::forgetDeferredInputs() {
     // build, so they are dropped rather than left dangling.
     deferredCompute = {};
     deferredSnapshots = {};
+    deferredShaders.clear();
+    deferredShaders.shrink_to_fit();
 }
 
 void ShaderResources::build(std::span<const CompiledShader> shaders, const ColorTarget* target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes) {

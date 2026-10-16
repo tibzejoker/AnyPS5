@@ -138,6 +138,10 @@ public:
     // address-based shader (BDA tables) builds entirely in Complete(): its lease acquisition
     // reconciles imports and refreshes mirrors, which needs the lock.
     ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads = 0);
+    // POC: the same two-stage build for a draw (stage A in the draw's preparation, without the lock;
+    // Complete() under it). `shaders` and `snapshots` must outlive Complete().
+    struct DeferredDraw {};
+    ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots, DeferredDraw);
     void Complete();
     bool Completed() const { return completed; }
     ~ShaderResources();
@@ -588,6 +592,12 @@ private:
     // the build (Complete() for a deferred one) is done, and reset then (forgetDeferredInputs).
     CompiledShader deferredCompute{};
     std::span<const GuestMemorySnapshot> deferredSnapshots;
+    // A deferred draw build's stages and target (see the DeferredDraw constructor).
+    std::vector<CompiledShader> deferredShaders;
+    ColorTarget deferredTarget{};
+    std::uint32_t deferredColorAttachments = 0;
+    std::uint64_t deferredIndexAddress = 0;
+    std::size_t deferredIndexBytes = 0;
     // The deferred build is address-based: everything runs in Complete().
     bool lockedBuild = false;
     // Stage A runs without the device lock (a deferred, non-address-based build).

@@ -17,7 +17,14 @@ struct HostImport;
 // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, non-indirect draw
 // built for its draw-cache entry (design_cpu_final M8; null otherwise, and always under
 // APS5_NO_DRAW_RECIPE=1).
-void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr);
+// POC: what a recorded draw decides before its turn, without the device lock (the draw preparation
+// pool): its validation outputs, pipeline stages and vertex input layout, its resource cache key and,
+// for a key the cache does not hold, stage A of its resource build. Draw repeats nothing of it; the
+// cache lookup itself and every proof stay under the lock. Opaque outside Draw.cpp.
+struct PreparedDraw;
+std::shared_ptr<PreparedDraw> PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots);
+bool PrepareDraws();
+void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const std::shared_ptr<PreparedDraw>& prepared = nullptr);
 // Draws and dispatches that bound an earlier build of the same content (resource cache hits) so far.
 std::uint64_t ResourceTemplateHits();
 void NoteResourceTemplateHit();

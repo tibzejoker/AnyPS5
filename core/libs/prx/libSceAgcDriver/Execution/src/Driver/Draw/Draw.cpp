@@ -843,6 +843,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             std::vector<Graphics::GuestMemorySnapshot> snapshots;
             std::shared_ptr<const DrawRecipe> recipe;
             std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
+            std::shared_ptr<Graphics::PreparedDraw> prepared;
             std::uint64_t drawKey = 0;
             std::uint64_t epoch = 0;
             std::uint32_t queue = 0;
@@ -865,6 +866,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         job->drawKey = drawKey;
         job->epoch = GuestMemory::ThreadCollectEpoch();
         job->queue = submission.queue;
+        // POC: the order-independent part of the draw's decisions, made here in parallel with the other
+        // preparations (Graphics::PrepareDraw); the draw thread then only proves and records.
+        if (recipe == nullptr && Graphics::PrepareDraws()) job->prepared = localDevice->PrepareDraw(job->decode->state, job->parameters, job->stages, job->snapshots);
         ServeDrawTurn();
         drawPipeline().Push([this, job] {
             std::shared_lock deviceUse(deviceReplacement);
@@ -884,7 +888,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                     VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
                 }
                 std::shared_ptr<const DrawRecipe> built;
-                localDevice->Draw(job->decode->state, job->parameters, job->stages, job->snapshots, job->recipeStages.empty() ? nullptr : &built);
+                localDevice->Draw(job->decode->state, job->parameters, job->stages, job->snapshots, job->recipeStages.empty() ? nullptr : &built, job->device == localDevice ? job->prepared : nullptr);
                 if (built != nullptr) attachDrawRecipe(job->drawKey, job->recipeStages, std::move(built));
             } catch (const std::exception& error) {
                 static std::atomic<std::uint64_t> failures{0};
