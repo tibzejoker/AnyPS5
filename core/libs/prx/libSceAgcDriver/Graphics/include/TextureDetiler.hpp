@@ -34,6 +34,9 @@ namespace AgcDriver::Graphics {
         std::uint32_t rowBegin = 0;
         std::uint32_t rowEnd = 0;
         std::uint32_t pipeBankXor = 0;
+        // Comp-to-single DCC keys: each element is read from the start of its 256-byte key block
+        // (detile direction, whole mips only).
+        bool singleBlocks = false;
     };
 
     class TextureDetiler {
@@ -56,7 +59,7 @@ namespace AgcDriver::Graphics {
         std::uint32_t CmaskErrors();
 
     private:
-        VkPipeline pipeline(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick, bool image = false);
+        VkPipeline pipeline(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick, bool image = false, bool single = false);
         void release() noexcept;
         VkDescriptorSet allocateSet(bool image = false);
         void checkWindow(const TileMipLayout& layout, const DetileWindow& window, std::uint32_t& columnEnd, std::uint32_t& rowEnd) const;

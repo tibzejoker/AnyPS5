@@ -59,8 +59,8 @@ std::uint32_t BlockBytesFor(TextureTileMode tileMode) {
     throw std::runtime_error("AGC graphics: TextureDetiler encountered an unknown tile mode");
 }
 
-std::uint32_t PipelineKey(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick, bool image) {
-    return (image ? 1u << 18 : 0u) | (thick ? 1u << 17 : 0u) | (retile ? 1u << 16 : 0u) | (static_cast<std::uint32_t>(tileMode) << 8) | elementBytes;
+std::uint32_t PipelineKey(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick, bool image, bool single) {
+    return (single ? 1u << 19 : 0u) | (image ? 1u << 18 : 0u) | (thick ? 1u << 17 : 0u) | (retile ? 1u << 16 : 0u) | (static_cast<std::uint32_t>(tileMode) << 8) | elementBytes;
 }
 
 }
@@ -134,15 +134,16 @@ VkFormat TextureDetiler::ImageElementFormat(std::uint32_t elementBytes) {
     }
 }
 
-VkPipeline TextureDetiler::pipeline(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick, bool image) {
+VkPipeline TextureDetiler::pipeline(TextureTileMode tileMode, std::uint32_t elementBytes, bool retile, bool thick, bool image, bool single) {
     Require(std::has_single_bit(elementBytes) && elementBytes <= 16u, "unsupported element size for texture detiling");
-    const auto key = PipelineKey(tileMode, elementBytes, retile, thick, image);
+    const auto key = PipelineKey(tileMode, elementBytes, retile, thick, image, single);
     for (const auto& entry : pipelines) {
         if (entry.first == key) return entry.second;
     }
     // Constants 0-3 select element size, block size, addressing family and direction; 4-19 carry the
     // per-bit XOR equation for the equation family (2); 20-21 override the block extent in elements.
-    std::array<std::uint32_t, 22> values{elementBytes, BlockBytesFor(tileMode), tileMode == TextureTileMode::kLinear ? 0u : 1u, retile ? 1u : 0u};
+    std::array<std::uint32_t, 23> values{elementBytes, BlockBytesFor(tileMode), tileMode == TextureTileMode::kLinear ? 0u : 1u, retile ? 1u : 0u};
+    values[22] = single ? 1u : 0u;
     if (thick) {
         const auto thickMode = tileMode == TextureTileMode::kStandard4KB ? 0x105u : tileMode == TextureTileMode::kStandard64KB ? 0x109u : tileMode == TextureTileMode::kS64KBX ? 0x119u : tileMode == TextureTileMode::kD64KBX ? 0x11au : 0u;
         Require(thickMode != 0, "3D textures are only detiled thick from SW_4KB_S, SW_64KB_S, SW_64KB_S_X or SW_64KB_D_X");
@@ -165,7 +166,7 @@ VkPipeline TextureDetiler::pipeline(TextureTileMode tileMode, std::uint32_t elem
         moduleInfo.pCode = TEXTURE_DETILE_IMAGE_SPV;
         Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &imageModule), "vkCreateShaderModule");
     }
-    std::array<VkSpecializationMapEntry, 22> entries{};
+    std::array<VkSpecializationMapEntry, 23> entries{};
     for (std::uint32_t index = 0; index < entries.size(); ++index) entries[index] = {index, index * 4u, 4};
     VkSpecializationInfo specialization{};
     specialization.mapEntryCount = static_cast<std::uint32_t>(entries.size());
@@ -203,7 +204,7 @@ void TextureDetiler::Dispatch(VkCommandBuffer commands, TextureTileMode tileMode
     Require(source != VK_NULL_HANDLE && destination != VK_NULL_HANDLE, "texture detiling requires source and destination buffers");
     std::uint32_t columnEnd = 0, rowEnd = 0;
     checkWindow(layout, window, columnEnd, rowEnd);
-    const auto target = pipeline(tileMode, elementBytes, retile, thick);
+    const auto target = pipeline(tileMode, elementBytes, retile, thick, false, window.singleBlocks);
     const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
     const auto sourceDescriptorOffset = sourceOffset - sourceOffset % alignment;
     const auto destinationDescriptorOffset = destinationOffset - destinationOffset % alignment;
@@ -377,7 +378,7 @@ void TextureDetiler::DispatchImage(VkCommandBuffer commands, TextureTileMode til
     Require(ImageElementFormat(elementBytes) != VK_FORMAT_UNDEFINED, "unsupported element size for texture detiling through an image");
     std::uint32_t columnEnd = 0, rowEnd = 0;
     checkWindow(layout, window, columnEnd, rowEnd);
-    const auto target = pipeline(tileMode, elementBytes, retile, false, true);
+    const auto target = pipeline(tileMode, elementBytes, retile, false, true, window.singleBlocks);
     const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
     const auto descriptorOffset = tiledOffset - tiledOffset % alignment;
     const auto base = tiledOffset - descriptorOffset;
