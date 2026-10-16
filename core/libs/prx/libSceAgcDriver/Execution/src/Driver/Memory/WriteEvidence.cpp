@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
 #include <cstring>
@@ -204,6 +205,7 @@ ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, s
 }
 
 ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
+    WaitPendingJobWrites(address, bytes);
     std::uint64_t ValidateCounters::*reason = nullptr;
     PendingView pending;
     pending.Load();

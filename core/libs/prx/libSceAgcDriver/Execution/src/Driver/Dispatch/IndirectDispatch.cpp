@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/IndirectDispatch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -32,6 +33,8 @@ void Driver::dispatchIndirect(QueueState& queue, std::span<const std::uint32_t> 
     else if ((initiator & 0x20u) != 0) path = IndirectThreadDimensions;
     else if (arguments % 4 != 0) path = IndirectMisaligned;
     if (path != IndirectGpu) {
+        // POC: the arguments are read on the CPU, after the work queued before this packet.
+        if (DispatchThreadEnabled() && submission.queue == 0 && !resolvingAhead()) DrainDrawWork();
         if (!resolvingAhead()) {
             const auto& resolved = resolvedAhead();
             if (const auto found = resolved.find(currentPacketOffset()); found != resolved.end() && found->second.indirectArguments == 0 && found->second.packet[0] == 0xc0031500u) {

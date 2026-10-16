@@ -267,6 +267,9 @@ private:
     static void recordQueuedLabelsFromHook();
     void flushBetweenPackets(std::uint32_t queue, std::uint32_t header, bool labelPacket);
     bool preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump);
+    // POC: the current packet is a CP store queued as a draw thread job (StoreJobsEnabled), decided by the
+    // packet loop before its drain check.
+    bool storeJobPacket = false;
     void dumpSampleCounters(std::uint64_t address);
     template <typename TWork>
     static void timed(double WorkerProfile::*bucket, TWork&& work);

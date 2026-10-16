@@ -62,7 +62,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     }
     if (opcode == 0x50 && packet.size() >= 7) {
         if (Pm4::DmaSource(packet) == 0 || Pm4::DmaSource(packet) == 3) Graphics::RequireNoMultisampleTarget(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), packet[6] & 0x3ffffffu, "a DMA copy");
-        if (Pm4::DmaSource(packet) == 2 && Pm4::DmaDestination(packet) != 1) {
+        if (Pm4::DmaSource(packet) == 2 && Pm4::DmaDestination(packet) != 1 && !storeJobPacket) {
             const auto address = packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
             Graphics::NoteDepthMetadataFill(address, packet[6] & 0x3ffffffu, packet[2]);
             Graphics::NoteColorMetadataFill(address, packet[6] & 0x3ffffffu, packet[2]);
@@ -81,7 +81,8 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 const auto queueId = submission.queue;
                 PendingLabelJobs().fetch_add(1, std::memory_order_acq_rel);
                 NotePendingLabel(entry.address, std::span<const std::byte>(entry.bytes.data(), entry.size), true);
-                PushDrawPipeline([this, entry, stamp, queueId] {
+                const auto pendingWrite = NotePendingJobWrite(entry.address, entry.size);
+                PushOrderedDrawJob([this, entry, stamp, queueId, pendingWrite] {
                     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
                     try {
                         std::lock_guard gpuLock(GuestMemory::GpuMutex());
@@ -101,6 +102,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                         ReportFailure(std::current_exception());
                     }
                     NotePendingLabel(entry.address, std::span<const std::byte>(entry.bytes.data(), entry.size), false);
+                    FinishPendingJobWrite(pendingWrite);
                     PendingLabelJobs().fetch_sub(1, std::memory_order_acq_rel);
                 });
                 ++queuedLabels;
@@ -144,7 +146,66 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     }
 
     static const bool cpuStores = std::getenv("APS5_CPU_STORES") != nullptr;
-    if (!drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
+    if (storeJobPacket) {
+        // POC: the store runs on the draw thread behind the work queued before it, as the drained path below
+        // runs it behind the draws it waited for (StoreJobsEnabled). Its source is read there, in order; the
+        // constant RAM of WRITE_CONST_RAM is copied now (a later packet of this worker may rewrite it).
+        const auto target = *Pm4::StoreTarget(packet, 65536);
+        std::vector<std::uint32_t> words(packet.begin(), packet.end());
+        std::vector<std::byte> constants;
+        if (opcode == 0x83) {
+            const auto ram = queue.ConstantRam().subspan(packet[1] / 4, packet[2]);
+            const auto bytes = std::as_bytes(ram);
+            constants.assign(bytes.begin(), bytes.end());
+        }
+        const auto queueId = submission.queue;
+        const auto pendingWrite = NotePendingJobWrite(target.first, target.second);
+        PushOrderedDrawJob([this, words = std::move(words), constants = std::move(constants), target, queueId, pendingWrite] {
+            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
+            try {
+                const auto packet = std::span<const std::uint32_t>(words);
+                const auto opcode = (words[0] >> 8u) & 0xffu;
+                if (opcode == 0x50 && Pm4::DmaSource(packet) == 2) {
+                    Graphics::NoteDepthMetadataFill(target.first, target.second, words[2]);
+                    Graphics::NoteColorMetadataFill(target.first, target.second, words[2]);
+                }
+                std::vector<std::byte> bytes;
+                if (opcode == 0x83) {
+                    bytes = constants;
+                } else {
+                    static const QueueState none{};
+                    const auto store = Pm4::ResolveStore(packet, none, 65536);
+                    if (store) {
+                        const auto resolved = store->Bytes();
+                        bytes.assign(resolved.begin(), resolved.end());
+                    }
+                }
+                if (!bytes.empty()) {
+                    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+                    const auto localDevice = device.Load();
+                    Graphics::StorageTexture::FlushPending(target.first, bytes.size(), nullptr, "packet store", Graphics::PublishScope::PartialUnits);
+                    const auto stamp = ++eventSerial;
+                    const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(target.first, bytes, stamp, queueId) : 4;
+                    if (reason == 0) ++storesOnGpu;
+                    else if (reason == 5) ++storesBehindCompletions;
+                    else if (reason == 1) {
+                        GuestMemory::Write(target.first, bytes, 1);
+                        ++storesOnCpu;
+                    } else {
+                        if (auto* recorder = Graphics::Recorder::Active()) recorder->Sync();
+                        GuestMemory::Write(target.first, bytes, 1);
+                        ++storesOnCpu;
+                    }
+                    noteLabelStore(target.first, bytes, stamp, queueId);
+                    Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
+                }
+            } catch (...) {
+                ReportFailure(std::current_exception());
+            }
+            FinishPendingJobWrite(pendingWrite);
+        });
+        wroteOnGpu = true;
+    } else if (!drainAll && !cpuStores && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83)) {
         constexpr std::size_t gpuStoreLimit = 65536;
         bool drained = true;
         if (const auto store = Pm4::ResolveStore(packet, queue, gpuStoreLimit)) {

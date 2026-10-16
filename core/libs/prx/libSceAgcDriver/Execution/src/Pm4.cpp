@@ -628,6 +628,33 @@ std::optional<StoreWrite> ResolveStore(std::span<const std::uint32_t> packet, co
     }
 }
 
+std::optional<std::pair<std::uint64_t, std::size_t>> StoreTarget(std::span<const std::uint32_t> packet, std::size_t limit) {
+    const auto fits = [limit](std::uint64_t destination, std::size_t bytes) { return bytes != 0 && bytes <= limit && destination % 4 == 0 && bytes % 4 == 0; };
+    switch ((packet[0] >> 8u) & 0xffu) {
+        case 0x40: {
+            if (packet.size() < 6 || copyDataToRegister(packet)) return std::nullopt;
+            const std::size_t bytes = (packet[1] & 0x10000u) != 0 ? 8 : 4;
+            const auto destination = address(packet[4], packet[5]);
+            if (!fits(destination, bytes)) return std::nullopt;
+            return std::make_pair(destination, bytes);
+        }
+        case 0x50: {
+            if (packet.size() < 7 || dmaDestination(packet) == DmaSelectGds || dmaDestination(packet) == DmaSelectNowhere) return std::nullopt;
+            const std::size_t bytes = packet[6] & 0x3ffffffu;
+            const auto destination = address(packet[4], packet[5]);
+            if (!fits(destination, bytes)) return std::nullopt;
+            return std::make_pair(destination, bytes);
+        }
+        case 0x83: {
+            if (packet.size() < 5 || packet[1] / 4 > QueueState::ConstantRamWords || packet[2] > QueueState::ConstantRamWords - packet[1] / 4) return std::nullopt;
+            const std::size_t bytes = static_cast<std::size_t>(packet[2]) * 4;
+            if (bytes == 0 || bytes > limit) return std::nullopt;
+            return std::make_pair(address(packet[3], packet[4]), bytes);
+        }
+        default: return std::nullopt;
+    }
+}
+
 std::uint32_t DmaSource(std::span<const std::uint32_t> packet) {
     return dmaSource(packet);
 }

@@ -214,6 +214,9 @@ unsigned long long CodeOffset(const void* address);
 // calls FlushGpuWrites itself.
 void SetFlushHook(void (*hook)(std::uint64_t address, std::size_t bytes));
 void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes));
+// POC: called before the flush hook for every checked read (the driver waits there for queued draw thread
+// jobs that write the range).
+void SetPendingJobGuard(void (*guard)(std::uint64_t address, std::size_t bytes));
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes);
 // Moves with every ForgetPages call (the libc invalidator: memory unmapped or re-registered): odd
 // while the call stores its page states, moved past it after, so a reader that loads an even

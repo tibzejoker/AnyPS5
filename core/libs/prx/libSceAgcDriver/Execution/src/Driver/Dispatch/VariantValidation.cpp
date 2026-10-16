@@ -69,6 +69,7 @@ bool Driver::syncPendingRuns(std::uint64_t program, std::uint32_t queue, const S
 
 EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue, const DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, std::uint64_t& imagesFlushed, std::uint64_t& runsSynced, std::optional<SampledReadScope>& sampling, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live) {
     if (live != nullptr) live->clear();
+    for (const auto& [begin, end] : variant.runs) WaitPendingJobWrites(begin, static_cast<std::size_t>(end - begin));
     const bool masked = live != nullptr && !variant.dataPositions.empty();
     const DataMask mask{variant.dataPositions, live};
     PendingView pending;

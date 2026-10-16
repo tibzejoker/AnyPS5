@@ -15,11 +15,14 @@
 #include <deque>
 #include <set>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
+
+bool PrepOutstanding();
 
 namespace {
 
@@ -28,6 +31,20 @@ namespace {
 // the GPU mutex). At most APS5_POC_DRAW_THREAD_DEPTH (default 6) draws are in flight; every packet other than a draw, a register write
 // or a WAIT_REG_MEM, the end of a submission and any draw the worker records itself wait for them
 // (DrainDrawPipeline).
+std::atomic<std::thread::id> drawThreadId{};
+
+// POC diagnostic: why the draw thread is idle, every 10 s ([draw-idle]): waiting while preparations of
+// earlier tickets are still running (prep bound) or while none is outstanding (packet worker bound), and the
+// time the worker or the preparations block on a full pipeline.
+struct IdleStats {
+    std::atomic<std::uint64_t> prepNs{0}, workerNs{0}, fullNs{0}, idles{0}, jobs{0};
+    std::atomic<long long> shown{0};
+};
+IdleStats& idleStats() {
+    static IdleStats stats;
+    return stats;
+}
+
 std::size_t DrawThreadDepth() {
     static const std::size_t depth = [] { const char* text = std::getenv("APS5_POC_DRAW_THREAD_DEPTH"); return text != nullptr ? std::max<std::size_t>(1, std::strtoull(text, nullptr, 10)) : std::size_t{6}; }();
     return depth;
@@ -38,7 +55,11 @@ public:
     void Push(std::function<void()> job) {
         std::unique_lock lock(mutex);
         if (!thread.joinable()) thread = std::thread([this] { run(); });
-        space.wait(lock, [&] { return jobs.size() + running < DrawThreadDepth(); });
+        if (jobs.size() + running >= DrawThreadDepth()) {
+            const auto blocked = std::chrono::steady_clock::now();
+            space.wait(lock, [&] { return jobs.size() + running < DrawThreadDepth(); });
+            idleStats().fullNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - blocked).count()), std::memory_order_relaxed);
+        }
         jobs.push_back(std::move(job));
         ++inFlight;
         ready.notify_one();
@@ -51,11 +72,28 @@ public:
 
 private:
     void run() {
+        drawThreadId.store(std::this_thread::get_id(), std::memory_order_release);
         PinWorkerThread("draw thread");
         if (std::getenv("APS5_SAMPLE_DRAW_THREAD") != nullptr) StartWorkerSampler();
         std::unique_lock lock(mutex);
         for (;;) {
-            ready.wait(lock, [&] { return !jobs.empty(); });
+            if (jobs.empty()) {
+                lock.unlock();
+                const bool prep = PrepOutstanding();
+                lock.lock();
+                const auto idleStart = std::chrono::steady_clock::now();
+                ready.wait(lock, [&] { return !jobs.empty(); });
+                const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - idleStart).count());
+                auto& stats = idleStats();
+                (prep ? stats.prepNs : stats.workerNs).fetch_add(ns, std::memory_order_relaxed);
+                stats.idles.fetch_add(1, std::memory_order_relaxed);
+            }
+            {
+                auto& stats = idleStats();
+                stats.jobs.fetch_add(1, std::memory_order_relaxed);
+                const auto window = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+                if (auto last = stats.shown.load(std::memory_order_relaxed); last != window && stats.shown.compare_exchange_strong(last, window)) std::fprintf(stderr, "[draw-idle] last 10 s: %llu jobs, %llu idle periods; idle while preparations ran %.0f ms, while none was outstanding %.0f ms; pushes blocked on a full pipeline %.0f ms\n", static_cast<unsigned long long>(stats.jobs.exchange(0)), static_cast<unsigned long long>(stats.idles.exchange(0)), stats.prepNs.exchange(0) / 1e6, stats.workerNs.exchange(0) / 1e6, stats.fullNs.exchange(0) / 1e6);
+            }
             auto job = std::move(jobs.front());
             jobs.pop_front();
             running = 1;
@@ -153,7 +191,40 @@ struct DrawTurns {
     std::condition_variable changed;
     std::uint64_t issued = 0;
     std::uint64_t finished = 0;
+    // Jobs queued behind preparations still running, by ticket.
+    std::map<std::uint64_t, std::function<void()>> ordered;
 };
+
+// Under turns.mutex: hands the ordered jobs whose turn came to the draw thread.
+void pushOrderedJobs(DrawTurns& turns) {
+    for (auto found = turns.ordered.find(turns.finished); found != turns.ordered.end(); found = turns.ordered.find(turns.finished)) {
+        auto job = std::move(found->second);
+        turns.ordered.erase(found);
+        drawPipeline().Push(std::move(job));
+        ++turns.finished;
+    }
+}
+
+struct PendingJobWrite {
+    std::uint64_t id;
+    std::uint64_t ticket;
+    std::uint64_t begin;
+    std::uint64_t end;
+};
+
+struct PendingJobWrites {
+    std::mutex mutex;
+    std::condition_variable finished;
+    std::vector<PendingJobWrite> writes;
+    std::uint64_t nextId = 1;
+    std::atomic<std::size_t> count{0};
+};
+
+PendingJobWrites& pendingJobWrites() {
+    static auto* writes = new PendingJobWrites();
+    return *writes;
+}
+
 
 DrawTurns& drawTurns() {
     static auto* turns = new DrawTurns();
@@ -205,8 +276,90 @@ void SubmitDrawPrep(std::uint64_t ticket, std::function<void()> job) {
         {
             std::lock_guard lock(turns.mutex);
             ++turns.finished;
+            pushOrderedJobs(turns);
         }
         turns.changed.notify_all();
+    });
+}
+
+// Diagnostic only, called by the draw thread: the packet worker may hold the turns while it pushes ordered
+// jobs into a full pipeline, which only the draw thread drains (taken as "outstanding" then).
+bool PrepOutstanding() {
+    auto& turns = drawTurns();
+    std::unique_lock lock(turns.mutex, std::try_to_lock);
+    return !lock.owns_lock() || turns.finished != turns.issued;
+}
+
+void PushOrderedDrawJob(std::function<void()> job) {
+    static const bool unordered = std::getenv("APS5_POC_UNORDERED_JOBS") != nullptr;
+    if (ParallelPrepThreads() == 0 || unordered) {
+        PushDrawPipeline(std::move(job));
+        return;
+    }
+    auto& turns = drawTurns();
+    {
+        std::lock_guard lock(turns.mutex);
+        turns.ordered.emplace(turns.issued++, std::move(job));
+        pushOrderedJobs(turns);
+    }
+    turns.changed.notify_all();
+}
+
+bool StoreJobsEnabled() {
+    static const bool enabled = LabelJobsEnabled() && std::getenv("APS5_POC_NO_STORE_JOBS") == nullptr;
+    return enabled;
+}
+
+std::uint64_t NotePendingJobWrite(std::uint64_t address, std::size_t bytes) {
+    static const bool guarded = [] {
+        GuestMemory::SetPendingJobGuard(&WaitPendingJobWrites);
+        return true;
+    }();
+    (void)guarded;
+    auto& pending = pendingJobWrites();
+    std::uint64_t ticket = 0;
+    {
+        auto& turns = drawTurns();
+        std::lock_guard lock(turns.mutex);
+        ticket = turns.issued;
+    }
+    std::lock_guard lock(pending.mutex);
+    const auto id = pending.nextId++;
+    pending.writes.push_back({id, ticket, address, address + bytes});
+    pending.count.fetch_add(1, std::memory_order_release);
+    return id;
+}
+
+void FinishPendingJobWrite(std::uint64_t id) {
+    auto& pending = pendingJobWrites();
+    {
+        std::lock_guard lock(pending.mutex);
+        const auto found = std::find_if(pending.writes.begin(), pending.writes.end(), [&](const PendingJobWrite& write) { return write.id == id; });
+        if (found == pending.writes.end()) return;
+        pending.writes.erase(found);
+        pending.count.fetch_sub(1, std::memory_order_release);
+    }
+    pending.finished.notify_all();
+}
+
+void WaitPendingJobWrites(std::uint64_t address, std::size_t bytes) {
+    auto& pending = pendingJobWrites();
+    static const bool noWaits = std::getenv("APS5_POC_NO_JOB_WAITS") != nullptr;
+    if (noWaits || pending.count.load(std::memory_order_acquire) == 0 || bytes == 0) return;
+    // The draw thread runs the jobs in order: one before it has run already, its own is running.
+    if (std::this_thread::get_id() == drawThreadId.load(std::memory_order_acquire)) return;
+    // The jobs take GuestMemory::GpuMutex: a holder cannot wait for them (counted as a gap).
+    if (GuestMemory::GpuMutex().HeldByThisThread()) {
+        static std::atomic<std::uint64_t> gaps{0};
+        if (gaps.fetch_add(1, std::memory_order_relaxed) < 20) std::fprintf(stderr, "[job-writes] read of 0x%llx+0x%zx under the GPU mutex while a queued job writes nearby (not waited)\n", static_cast<unsigned long long>(address), bytes);
+        return;
+    }
+    // A preparation only waits for the jobs queued before its own ticket (a later one waits for it).
+    const auto limit = ticketActive ? currentTicket : ~std::uint64_t{0};
+    const auto end = address + bytes;
+    std::unique_lock lock(pending.mutex);
+    pending.finished.wait(lock, [&] {
+        return std::none_of(pending.writes.begin(), pending.writes.end(), [&](const PendingJobWrite& write) { return write.ticket < limit && write.begin < end && address < write.end; });
     });
 }
 
@@ -275,6 +428,11 @@ void DrainDrawWork() {
 
 bool DrawThreadEnabled() {
     static const bool enabled = std::getenv("APS5_POC_NO_DRAW_THREAD") == nullptr;
+    return enabled;
+}
+
+bool IndirectJobsEnabled() {
+    static const bool enabled = std::getenv("APS5_POC_NO_INDIRECT_JOBS") == nullptr;
     return enabled;
 }
 

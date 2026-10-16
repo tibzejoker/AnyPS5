@@ -11,6 +11,8 @@
 #include <cstring>
 #include <mutex>
 #include <map>
+#include <set>
+#include <cstdlib>
 #include <memory>
 #include <vector>
 #include <stdexcept>
@@ -60,6 +62,7 @@ public:
                 const auto mapped = views.find(cursor & ~(pageBytes - 1));
                 if (mapped != views.end()) {
                     mapped->second.protection = protection;
+                    trackProtection(mapped->first, protection);
                     mapped->second.armed = 0;
                     invalidate(*mapped->second.page);
                 }
@@ -115,6 +118,7 @@ public:
                     }
                     shared->aliases.push_back(base + at);
                     views.emplace(base + at, View{shared, protection, {}, 0, owned, offset + done + at, 0, 0, true, &slot});
+                    trackProtection(base + at, protection);
                     invalidate(*shared);
                 }
                 remember(freshRanges, base, base + runBytes);
@@ -134,6 +138,7 @@ public:
             slot.stored = true;
             shared->aliases.push_back(base);
             views.emplace(base, View{shared, protection, {}, 0, owned, offset + done, 0, 0, false, &slot});
+            trackProtection(base, protection);
             remember(freshRanges, base, base + pageBytes);
             invalidate(*shared);
             done += pageBytes;
@@ -144,6 +149,7 @@ public:
         std::lock_guard lock(mutex);
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
             it->second.protection = protection;
+            trackProtection(it->first, protection);
             it->second.armed = 0;
             invalidate(*it->second.page);
         }
@@ -453,7 +459,37 @@ public:
     }
 
 private:
+    void trackProtection(std::uintptr_t base, DWORD protection) {
+        if (protection == PAGE_NOACCESS) noAccessViews.insert(base);
+        else noAccessViews.erase(base);
+    }
+
+    // Whether every page of [address, end) can be collected: no inaccessible view (noAccessViews, one
+    // search), resident runs skipped whole, and the memory between views committed private memory.
     bool collectable(std::uintptr_t address, std::uintptr_t end) {
+        static const bool slow = std::getenv("APS5_SLOW_COLLECTABLE") != nullptr;
+        if (slow) return collectableSlow(address, end);
+        if (const auto blocked = noAccessViews.lower_bound(address & ~(pageBytes - 1)); blocked != noAccessViews.end() && *blocked < end) return false;
+        for (auto cursor = address; cursor < end;) {
+            if (const auto run = residentRuns.upper_bound(cursor); run != residentRuns.begin() && std::prev(run)->second.end > cursor) {
+                if (!watchResident) return false;
+                cursor = std::min(end, std::prev(run)->second.end);
+                continue;
+            }
+            const auto base = cursor & ~(pageBytes - 1);
+            if (const auto found = views.find(base); found != views.end()) {
+                if (found->second.resident && !watchResident) return false;
+                cursor = std::min(end, base + pageBytes);
+                continue;
+            }
+            const auto stop = privateEnd(cursor);
+            if (stop == 0) return false;
+            cursor = std::min(end, stop);
+        }
+        return true;
+    }
+
+    bool collectableSlow(std::uintptr_t address, std::uintptr_t end) {
         for (auto cursor = address; cursor < end;) {
             const auto base = cursor & ~(pageBytes - 1);
             if (const auto found = views.find(base); found != views.end()) {
@@ -691,6 +727,7 @@ private:
                 view.slot->savedOffset = page - start;
             }
             std::erase(view.page->aliases, page);
+            noAccessViews.erase(found->first);
             views.erase(found);
         }
         forget(freshRanges, start, stop);
@@ -831,6 +868,7 @@ private:
                 const auto found = views.find(cursor);
                 if (found != views.end()) {
                     std::erase(found->second.page->aliases, cursor);
+                    noAccessViews.erase(found->first);
                     views.erase(found);
                     forget(freshRanges, cursor, cursor + pageBytes);
                 }
@@ -890,6 +928,7 @@ private:
     Ranges cleanRanges;
     Ranges freshRanges;
     std::map<std::uintptr_t, View> views;
+    std::set<std::uintptr_t> noAccessViews;
     std::map<std::pair<std::uintptr_t, std::uint64_t>, Physical> physical;
     std::map<std::uintptr_t, Run> residentRuns;
     std::map<std::uintptr_t, std::size_t> splitAliases;

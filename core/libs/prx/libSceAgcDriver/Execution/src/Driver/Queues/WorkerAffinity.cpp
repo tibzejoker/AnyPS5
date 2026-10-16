@@ -3,6 +3,12 @@
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include <cstdlib>
+#include <string>
+
+#ifndef __linux__
+extern "C" __declspec(dllimport) long __stdcall SetThreadDescription(void* thread, const wchar_t* description);
+extern "C" __declspec(dllimport) void* __stdcall GetCurrentThread();
+#endif
 
 namespace AgcDriver::DriverDetail {
 
@@ -22,6 +28,10 @@ std::uint64_t WorkerAffinityMask() {
 
 void PinWorkerThread(const char* role) {
     TracyZone::NameThread(role);
+#ifndef __linux__
+    const std::string text = std::string("agc ") + role;
+    SetThreadDescription(GetCurrentThread(), std::wstring(text.begin(), text.end()).c_str());
+#endif
     const auto mask = WorkerAffinityMask();
     if (mask == 0) return;
     static std::once_flag summary;

@@ -2076,7 +2076,14 @@ void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes)) {
     readGuard.store(guard, std::memory_order_release);
 }
 
+std::atomic<void (*)(std::uint64_t, std::size_t)> pendingJobGuard{nullptr};
+
+void SetPendingJobGuard(void (*guard)(std::uint64_t address, std::size_t bytes)) {
+    pendingJobGuard.store(guard, std::memory_order_release);
+}
+
 void flushFrom(std::uint64_t address, std::size_t bytes, const void* caller) {
+    if (const auto guard = pendingJobGuard.load(std::memory_order_acquire)) guard(address, bytes);
     const auto hook = flushHook.load(std::memory_order_acquire);
     if (hook == nullptr) return;
     const auto previous = std::exchange(flushCaller, caller);

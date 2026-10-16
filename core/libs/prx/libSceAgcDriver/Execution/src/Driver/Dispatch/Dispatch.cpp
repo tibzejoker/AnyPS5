@@ -23,7 +23,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     const auto& snapshot = *registeredShader;
     require(snapshot.type == 0, "compute program refers to a non-compute shader");
     // POC draw thread: queued labels are recorded by this worker, behind the draws in flight.
-    if (DispatchThreadEnabled() && !deferredLabels().labels.empty()) DrainDrawPipeline();
+    if (DispatchThreadEnabled() && !deferredLabels().labels.empty()) DrainDrawWork();
     const auto userCount = (readRegister(queue.shader, 0x213) >> 1u) & 0x1fu;
     std::vector<std::uint32_t> userData;
     for (std::uint32_t i = 0; i < userCount; ++i) {
@@ -61,7 +61,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         packet = resolved;
         indirectArguments = ahead.indirectArguments;
     } else if (indirectArguments != 0 && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) {
-
+        // POC: the arguments are read on the CPU, after the work queued before this packet.
+        if (DispatchThreadEnabled() && submission.queue == 0 && !resolving) DrainDrawWork();
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
         resolved = Pm4::ReadDispatchArguments(indirectArguments, packet[4]);
@@ -83,7 +84,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             if (const auto fill = Graphics::MatchMemoryValueFill(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads, {packet[1], packet[2], packet[3]})) Graphics::NoteMemoryValueFill(*fill);
         }
         // POC draw thread: the fill and copy HLE write guest memory on the CPU, after the draws in flight.
-        if (DispatchThreadEnabled() && (matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute))) DrainDrawPipeline();
+        if (DispatchThreadEnabled() && (matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute))) DrainDrawWork();
         if (!partialLastGroup && fillBuffer(queue, submission.queue, packet, std::span(snapshot.code).subspan(codeOffset), userData, compute, localDevice)) {
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
             return;
@@ -356,7 +357,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         std::fprintf(stderr, "[dispatch-io] shader 0x%llx%s\n", static_cast<unsigned long long>(address), words.c_str());
     }
 
-    if (DispatchThreadEnabled() && submission.queue == 0 && indirectArguments == 0 && !fromAhead && deferredLabels().labels.empty()) {
+    if (DispatchThreadEnabled() && submission.queue == 0 && (indirectArguments == 0 || IndirectJobsEnabled()) && !fromAhead && deferredLabels().labels.empty()) {
         if (writeEvidenceEnabled() || traceCapSync()) noteWrittenBuffers(address, submission.queue, compiled);
         struct Job {
             std::shared_ptr<VulkanDevice> device;
@@ -368,6 +369,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             std::array<std::uint32_t, 3> groups{};
             std::uint64_t threads = 0;
             std::uint64_t address = 0;
+            std::uint64_t indirectArguments = 0;
             std::uint64_t epoch = 0;
             std::uint32_t queue = 0;
             bool dataHit = false;
@@ -386,6 +388,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         job->groups = groups;
         job->threads = dispatchThreads;
         job->address = address;
+        job->indirectArguments = indirectArguments;
         job->epoch = GuestMemory::ThreadCollectEpoch();
         job->queue = submission.queue;
         job->dataHit = dataHit;
@@ -402,7 +405,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto prepare = [this, job, early] {
             auto localDevice = job->device;
             if (auto current = device.Load(); current != nullptr && current != localDevice) localDevice = std::move(current);
-            if (job->cached && job->keep != nullptr && !stampValidate()) early->recipeHit = localDevice->PrepareRecipe(job->keep->recipe.load(std::memory_order_acquire), false);
+            if (job->cached && job->keep != nullptr && !stampValidate()) early->recipeHit = localDevice->PrepareRecipe(job->keep->recipe.load(std::memory_order_acquire), job->indirectArguments != 0);
             if (early->recipeHit == nullptr || VulkanDevice::VerifyRecipes()) early->prepared = localDevice->PrepareDispatch(*job->compiled, job->snapshots, job->threads);
             early->done = true;
         };
@@ -415,7 +418,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
             try {
                 std::shared_ptr<RecipeHit> recipeHit;
                 if (early->done) recipeHit = std::move(early->recipeHit);
-                else if (job->cached && job->keep != nullptr && !stampValidate()) recipeHit = localDevice->PrepareRecipe(job->keep->recipe.load(std::memory_order_acquire), false);
+                else if (job->cached && job->keep != nullptr && !stampValidate()) recipeHit = localDevice->PrepareRecipe(job->keep->recipe.load(std::memory_order_acquire), job->indirectArguments != 0);
                 auto* const attachTo = stampValidate() ? nullptr : job->keep != nullptr ? job->keep.get() : job->attach.get();
                 std::shared_ptr<const Recipe> builtRecipe;
                 bool first = true;
@@ -429,11 +432,15 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                     recordLabelsForPacket(localDevice.get(), job->queue);
                     if (recipeHit != nullptr) {
                         VulkanDevice::IndirectOutcome outcome{0, 0};
-                        if (localDevice->DispatchRecipe(compiled, job->groups[0], job->groups[1], job->groups[2], 0, job->address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, job->dataHit) == RecipeOutcome::Rebuild) {
+                        if (localDevice->DispatchRecipe(compiled, job->groups[0], job->groups[1], job->groups[2], job->indirectArguments, job->address, recipeHit, outcome, VulkanDevice::VerifyRecipes() ? prepared : nullptr, job->dataHit) == RecipeOutcome::Rebuild) {
                             recipeHit = nullptr;
-                            VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, false);
+                            VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, job->indirectArguments != 0);
                             continue;
                         }
+                        if (job->indirectArguments != 0) countIndirect(outcome.cpuReason, outcome.argumentReadMs);
+                    } else if (job->indirectArguments != 0) {
+                        const auto outcome = localDevice->DispatchIndirect(compiled, job->indirectArguments, job->snapshots, job->address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr);
+                        countIndirect(outcome.cpuReason, outcome.argumentReadMs);
                     } else {
                         localDevice->Dispatch(compiled, job->groups[0], job->groups[1], job->groups[2], job->snapshots, job->address, std::move(prepared), attachTo != nullptr ? &builtRecipe : nullptr);
                     }
@@ -444,7 +451,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                             builtRecipe = std::move(own);
                         }
                         attachTo->recipe.store(std::move(builtRecipe), std::memory_order_release);
-                        VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, false);
+                        VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, job->indirectArguments != 0);
                     }
                     break;
                 }
@@ -490,6 +497,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         throw std::runtime_error(where + std::string(error.what()));
     };
     phaseTiming.Phase(PhaseSnapshots);
+    // POC: recorded here, on the packet worker, behind the work queued before this packet.
+    if (DispatchThreadEnabled() && submission.queue == 0) DrainDrawWork();
 
     std::shared_ptr<RecipeHit> recipeHit;
     if (cached && keepVariant != nullptr && !stampValidate()) {

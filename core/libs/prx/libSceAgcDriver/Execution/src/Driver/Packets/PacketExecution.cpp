@@ -137,6 +137,7 @@ void Driver::execute(const Submission& submission) {
                 VulkanDevice::ReportRecipeLine();
             }
         }
+        storeJobPacket = submission.queue == 0 && StoreJobsEnabled() && (opcode == 0x40 || opcode == 0x50 || opcode == 0x83) && !Pm4::Predicated(header) && deferredLabels().labels.empty() && Pm4::StoreTarget(packet, 65536).has_value();
         if (submission.queue == 0 && DrawThreadEnabled()) {
             // EVENT_WRITE (but a counter sample), ACQUIRE_MEM, PFP_SYNC_ME, SET_BASE and SET_UCONFIG_REG_INDEX do
             // nothing the draws in flight must precede; a RELEASE_MEM / WRITE_DATA label without an end-of-pipe
@@ -153,7 +154,8 @@ void Driver::execute(const Submission& submission) {
                 continue;
             }
             const bool waitWithLabels = pendingWait == PendingLabelWait::Overlaps;
-            const bool keepsDraws = !waitWithLabels && (quietEvent || labelJob || (opcode == 0x15 && DispatchThreadEnabled()) || Pm4::DrawOpcode(opcode) || Pm4::IndirectRegisterOpcode(opcode) || opcode == 0x69 || opcode == 0x76 || opcode == 0x79 || opcode == 0x68 || opcode == 0x10 || opcode == 0x2a || opcode == 0x2f || opcode == 0x26 || opcode == 0x13 || opcode == 0x3c);
+            if (opcode == 0x3c && !waitWithLabels && !Pm4::Predicated(header) && packet.size() >= 4) WaitPendingJobWrites(packet[2] | (static_cast<std::uint64_t>(packet[3]) << 32u), Pm4::WaitAwaitedBytes(packet));
+            const bool keepsDraws = !waitWithLabels && (quietEvent || labelJob || storeJobPacket || ((opcode == 0x15 || (opcode == 0x16 && IndirectJobsEnabled())) && DispatchThreadEnabled()) || Pm4::DrawOpcode(opcode) || Pm4::IndirectRegisterOpcode(opcode) || opcode == 0x69 || opcode == 0x76 || opcode == 0x79 || opcode == 0x68 || opcode == 0x10 || opcode == 0x2a || opcode == 0x2f || opcode == 0x26 || opcode == 0x13 || opcode == 0x3c);
             if (!keepsDraws || header == FlipPacketHeader || header == RenderingWaitPacketHeader) {
                 // POC: which packets drain the draw work, and the time they wait ([drain] every 10 s).
                 static std::array<std::atomic<std::uint64_t>, 257> counts{};
@@ -404,10 +406,10 @@ void Driver::execute(const Submission& submission) {
     static const bool keepEnd = std::getenv("APS5_POC_DRAW_THREAD_KEEP_END") != nullptr;
     const bool nextQueued = submission.queue == 0 && !submitAtEnd && submission.rewindTail == nullptr && workerQueued() != nullptr && workerQueued()->load(std::memory_order_acquire) != 0;
     // POC: the end of a queue 0 submission is a draw thread job (its submit runs behind the draws in flight)
-    // instead of a drain, so the next chunk is decoded while they record (APS5_POC_END_JOB=1; no gain measured).
-    static const bool endJob = std::getenv("APS5_POC_END_JOB") != nullptr;
-    if (submission.queue == 0 && endJob && LabelJobsEnabled() && !submitAtEnd && deferredLabels().labels.empty()) {
-        PushDrawPipeline([this] {
+    // instead of a drain, so the next chunk is decoded while they record (default; APS5_POC_NO_END_JOB=1 drains).
+    static const bool endJob = std::getenv("APS5_POC_NO_END_JOB") == nullptr;
+    if (submission.queue == 0 && endJob && submission.rewindTail != nullptr && LabelJobsEnabled() && !submitAtEnd && deferredLabels().labels.empty()) {
+        PushOrderedDrawJob([this] {
             if (!Graphics::Recorder::PendingLabelSince().has_value() && Graphics::Recorder::RecordedWorkSinceSubmit() == 0) return;
             ++submissionCosts(0).endSubmits;
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::End);
