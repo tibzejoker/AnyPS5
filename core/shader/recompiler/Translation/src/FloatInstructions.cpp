@@ -40,11 +40,19 @@ bool TranslationContext::packedFloat16(const RdnaInstruction& inst, IrOpcode opc
         return bits;
     };
     const auto minMaxLane = [&](bool high) { return minMaxF16Bits(opcode == IrOpcode::FPMax32, laneBits(sourceAt(inst, 0u), high), laneBits(sourceAt(inst, 1u), high)); };
-    const bool native = nativeFloat16 && inst.destination.omod == 0u && (opcode == IrOpcode::FPAdd32 || opcode == IrOpcode::FPMul32);
+    // POC fast math (APS5_POC_EXACT_MATH=1 restores the exact path): packed FMA on the host's fused f16
+    // FMA, and NaN results with the host's payload instead of RDNA's propagation of the input NaN.
+    static const bool fastMath = std::getenv("APS5_POC_EXACT_MATH") == nullptr;
+    const bool nativeFma = fastMath && opcode == IrOpcode::FPFma32 && (accumulator || inst.sourceCount == 3u);
+    const bool native = nativeFloat16 && inst.destination.omod == 0u && (opcode == IrOpcode::FPAdd32 || opcode == IrOpcode::FPMul32 || nativeFma);
     const auto nativeResult = [&]() {
         const auto packed = [&](const RdnaOperand& operand) { return packU16Lanes(laneBits(operand, false), laneBits(operand, true)); };
         const IrU32 lhs = packed(sourceAt(inst, 0u));
         const IrU32 rhs = packed(sourceAt(inst, 1u));
+        if (opcode == IrOpcode::FPFma32) {
+            const IrU32 third = packed(accumulator ? accumulatorOperand(inst) : sourceAt(inst, 2u));
+            return IrU32(ir.Emit(IrOpcode::FPFma16x2, IrType::U32, {&lhs.Value(), &rhs.Value(), &third.Value()}));
+        }
         return IrU32(ir.Emit(opcode == IrOpcode::FPAdd32 ? IrOpcode::FPAdd16x2 : IrOpcode::FPMul16x2, IrType::U32, {&lhs.Value(), &rhs.Value()}));
     };
     IrU32 result = quietSnan ? packU16Lanes(minMaxLane(false), minMaxLane(true)) : native ? nativeResult() : packHalf2x16(translateLane(false), translateLane(true));
@@ -78,6 +86,7 @@ bool TranslationContext::packedFloat16(const RdnaInstruction& inst, IrOpcode opc
                 }
                 lane = IrU32(ir.Select(overflow.Value(), ir.BitwiseOr(ir.BitwiseAnd(lane.Value(), ir.Constant(0x8000u)), ir.Constant(0x7bffu)), lane.Value()));
             }
+            if (fastMath && native && !quietSnan) return lane;
             if (quietSnan) {
                 lane = IrU32(ir.Select(isNan(bits[0]).Value(), bits[1].Value(), lane.Value()));
                 lane = IrU32(ir.Select(isNan(bits[1]).Value(), bits[0].Value(), lane.Value()));

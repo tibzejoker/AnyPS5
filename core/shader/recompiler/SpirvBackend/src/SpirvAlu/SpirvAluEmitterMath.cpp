@@ -1424,7 +1424,7 @@ static std::uint32_t EmitNativeF32ToF16BitsRte(SpirvEmitterState& state, std::ui
     const auto pair = state.module.AllocateId();
     state.module.AddFunction(spv::OpCompositeConstruct, state.module.Type(spv::OpTypeVector, f16, 2u), pair, half, state.module.Constant(spv::OpConstant, f16, 0u));
     const auto bits = Unary(state, spv::OpBitcast, u32, pair);
-    static const bool fast = std::getenv("APS5_POC_FAST_F16") != nullptr;
+    static const bool fast = std::getenv("APS5_POC_FAST_F16") != nullptr || std::getenv("APS5_POC_EXACT_MATH") == nullptr;
     if (fast) return bits;
     const auto source = Unary(state, spv::OpBitcast, u32, value);
     const auto magnitude = Binary(state, spv::OpBitwiseAnd, u32, source, ConstantU32(state, 0x7fffffffu));
@@ -1451,6 +1451,14 @@ std::uint32_t EmitFPMul16x2(SpirvEmitterState& state, std::uint32_t arg0, std::u
     const auto f16x2 = TypeF16x2(state);
     const auto product = Binary(state, spv::OpFMul, f16x2, Unary(state, spv::OpBitcast, f16x2, arg0), Unary(state, spv::OpBitcast, f16x2, arg1));
     return Unary(state, spv::OpBitcast, TypeU32(state), Exact(state, product));
+}
+
+std::uint32_t EmitFPFma16x2(SpirvEmitterState& state, std::uint32_t arg0, std::uint32_t arg1, std::uint32_t arg2) {
+    const auto f16x2 = TypeF16x2(state);
+    const auto cast = [&](std::uint32_t value) { return Unary(state, spv::OpBitcast, f16x2, value); };
+    const auto fused = state.module.AllocateId();
+    state.module.AddFunction(spv::OpExtInst, f16x2, fused, GlslStd450(state), GLSLstd450Fma, cast(arg0), cast(arg1), cast(arg2));
+    return Unary(state, spv::OpBitcast, TypeU32(state), Exact(state, fused));
 }
 
 std::uint32_t EmitF32ToF16BitsRte(SpirvEmitterState& state, std::uint32_t value) {

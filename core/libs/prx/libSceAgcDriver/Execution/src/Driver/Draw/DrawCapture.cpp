@@ -5,7 +5,11 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <algorithm>
 #include <cstdlib>
+#include <mutex>
+#include <set>
+#include <vector>
 #include <cstring>
 
 namespace AgcDriver::DriverDetail {
@@ -56,7 +60,20 @@ ShaderRecompiler::RecompileResult Driver::materializeDrawStage(std::size_t i, st
     if (dumpTarget != 0) {
 
         const auto slot0 = (static_cast<std::uint64_t>(readRegister(queue.context, 0x390)) << 40u) | (static_cast<std::uint64_t>(readRegister(queue.context, 0x318)) << 8u);
-        if ((graphics.hasColorTarget && graphics.color.address == dumpTarget) || slot0 == dumpTarget || program.binary.codeAddress == dumpTarget) static_cast<void>(dumpRequest(program.binary.codeAddress, request));
+        // A comma-separated list of program addresses dumps each listed program once.
+        static const std::vector<std::uint64_t> listed = [] {
+            std::vector<std::uint64_t> addresses;
+            for (const char* text = std::getenv("APS5_DUMP_DRAW_SHADERS"); text != nullptr && *text != 0;) {
+                char* end = nullptr;
+                addresses.push_back(std::strtoull(text, &end, 16));
+                text = end != nullptr && *end == ',' ? end + 1 : nullptr;
+            }
+            return addresses;
+        }();
+        static std::mutex dumpedMutex;
+        static std::set<std::uint64_t> dumped;
+        const bool inList = listed.size() > 1 && std::find(listed.begin(), listed.end(), program.binary.codeAddress) != listed.end() && [&] { std::lock_guard lock(dumpedMutex); return dumped.insert(program.binary.codeAddress).second; }();
+        if (inList || (graphics.hasColorTarget && graphics.color.address == dumpTarget) || slot0 == dumpTarget || program.binary.codeAddress == dumpTarget) static_cast<void>(dumpRequest(program.binary.codeAddress, request));
     }
     if (dumpSlot1 != 0) {
         const auto value = [&](std::uint32_t offset) -> std::uint64_t { const auto it = queue.context.find(offset); return it == queue.context.end() ? 0u : it->second; };
