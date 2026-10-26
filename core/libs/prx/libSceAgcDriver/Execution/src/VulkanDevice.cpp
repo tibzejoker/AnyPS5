@@ -394,6 +394,7 @@ struct VulkanDevice::State {
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
     bool float16DenormPreserve = false;
+    bool coupledF16F64Denorms = false;
     bool float32FlushToZeroCandidate = false;
     bool float32FlushToZero = false;
     bool float16WidenNans = false;
@@ -1471,8 +1472,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->capabilities.push_back(spv::CapabilityRoundingModeRTE);
         state->capabilities.push_back(spv::CapabilityDenormPreserve);
     }
+    state->coupledF16F64Denorms = floatControls.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_32_BIT_ONLY && floatControls.shaderDenormPreserveFloat16 == VK_TRUE && floatControls.shaderDenormPreserveFloat64 == VK_TRUE && std::getenv("APS5_COUPLED_F16_F64_DENORMS") != nullptr;
     state->float16DenormPreserve = floatControls.shaderDenormPreserveFloat16 == VK_TRUE &&
-        floatControls.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
+        (floatControls.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL || state->coupledF16F64Denorms);
+    if (state->coupledF16F64Denorms) std::fprintf(stderr, "[float-controls] f16 and f64 denormals share one mode on this device: DenormPreserve 16 and 64 are declared together\n");
     const auto float32Flush = Float32FlushControlFor(driverId, floatControls.shaderDenormFlushToZeroFloat32, floatControls.denormBehaviorIndependence);
     state->float32FlushToZeroCandidate = float32Flush.probe && std::getenv("APS5_NO_HW_F32_FLUSH") == nullptr;
     if (state->float32FlushToZeroCandidate && float32Flush.declared) state->capabilities.push_back(spv::CapabilityDenormFlushToZero);
@@ -1728,7 +1731,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     enabled.shaderFloat64 = available.shaderFloat64 && floatControls.shaderSignedZeroInfNanPreserveFloat64;
     if (enabled.shaderFloat64) state->capabilities.push_back(spv::CapabilityFloat64);
     state->float64DenormPreserve = enabled.shaderFloat64 && floatControls.shaderDenormPreserveFloat64 == VK_TRUE &&
-        floatControls.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL;
+        (floatControls.denormBehaviorIndependence == VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_ALL || state->coupledF16F64Denorms);
     if (state->float64DenormPreserve && std::find(state->capabilities.begin(), state->capabilities.end(), static_cast<std::uint32_t>(spv::CapabilityDenormPreserve)) == state->capabilities.end()) state->capabilities.push_back(spv::CapabilityDenormPreserve);
     enabled.vertexPipelineStoresAndAtomics = VK_TRUE;
     enabled.fragmentStoresAndAtomics = VK_TRUE;
@@ -3930,6 +3933,7 @@ ShaderRecompiler::SpirvTarget VulkanDevice::Target() const {
     target.fusedExactArithmetic = state->fusedExactArithmetic;
     target.float32DenormPreserve = state->float32DenormPreserve;
     target.float16WidenNans = state->float16WidenNans;
+    target.coupledF16F64Denorms = state->coupledF16F64Denorms;
     target.float16NarrowNans = state->float16NarrowNans;
     return target;
 }
