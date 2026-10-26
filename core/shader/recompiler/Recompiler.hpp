@@ -351,6 +351,8 @@ struct SpirvTarget {
     bool deviceScopeLdsMemoryBarriers = false;
     bool ldsLockFences = false;
     bool fragmentBarycentricBuiltins = false;
+    bool float16WidenNans = false;
+    bool float16NarrowNans = false;
 };
 
 struct BindingLayout {
