@@ -355,6 +355,8 @@ private:
         append(key, value.pixelFunctionStorageDwords);
         append(key, value.deviceScopeLdsMemoryBarriers);
         append(key, value.ldsLockFences);
+        append(key, value.float16WidenNans);
+        append(key, value.float16NarrowNans);
     }
 };
 
